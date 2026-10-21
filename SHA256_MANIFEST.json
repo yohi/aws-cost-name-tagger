@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "version": "v3.6 Safety Hold",
+  "source_v35_outer_sha256": "1a88b2d9986bb767306ef107b323a4ee65f82eeaa5bba1915ac15afd37110172",
+  "files": [
+    {
+      "path": ".gitignore",
+      "sha256": "521857aea232eb698cc31b0d641f7da933fc364cf73188941cb0a3ca77800bf1",
+      "bytes": 181
+    },
+    {
+      "path": "README.md",
+      "sha256": "446ceb7a8bb6dcc17106144b5b4fd33416a4f2901130d4ac72c04e2dd345a0fa",
+      "bytes": 8104
+    },
+    {
+      "path": "SAFETY_REVIEW_RESULT.md",
+      "sha256": "7d2dcf43cacbc223dd5fa5dd072726a6e2c501eeaa6659ead3dadb92a5c6d771",
+      "bytes": 2025
+    },
+    {
+      "path": "aws_cost_name_tagger_v3.py",
+      "sha256": "12d823dcc364595cd2fed0ee6f2eddb0426290c8dea3a535dcc40163968e99fb",
+      "bytes": 65157
+    },
+    {
+      "path": "example_report_FORMAT_ONLY.csv",
+      "sha256": "e5fdb141b16f64fec100513485e2c6dea68c353e949d241364e674aee104ea65",
+      "bytes": 493
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "f5d031d13711845adbc95d4e5f63badfbcfec1e85997db9568811fd482a31d91",
+      "bytes": 439
+    },
+    {
+      "path": "test_aws_cost_name_tagger_v3.py",
+      "sha256": "c1d640e78b2a405ab1ebc548472b9e6c5fb946de7d6b1b464e082c00ae9855a0",
+      "bytes": 53052
+    },
+    {
+      "path": "test_results.txt",
+      "sha256": "ff07b2cd9a4f748b901867d29b64971fdd48621b9898fa9b09cf621af357e93e",
+      "bytes": 749
+    },
+    {
+      "path": "uv_lock_attempt.txt",
+      "sha256": "c445a2856d577a034e82231215c7038bedff8761f9cb9b7f3ce0a55341385ee0",
+      "bytes": 300
+    }
+  ]
+}

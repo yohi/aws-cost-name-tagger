@@ -1,0 +1,2 @@
+utc,account,mode,result,resource_arn,kind,region,resource_id,name_state,name_key_present,name_raw_value,name_before,name_proposed,name_after,effective_usage_cost_usd,confidence,proposal_id,detail
+2026-10-21T00:00:00+00:00,000000000000,dryrun,dryrun_not_modified,arn:aws:ec2:ap-northeast-1:000000000000:volume/vol-0123456789abcdef0,volume,ap-northeast-1,vol-0123456789abcdef0,EMPTY,True,,,demo-prd-web-ec2-ebs-xvda-abcdef0,,3.00,high,DEMO-ONLY,Sample only; empty Name read; NOT an AWS change

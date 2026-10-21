@@ -1,0 +1,5 @@
+Using CPython 3.13.5 interpreter at: /usr/bin/python3
+  × No solution found when resolving dependencies:
+  ╰─▶ Because there is no version of boto3[crt]==1.43.116 and your project
+      depends on boto3[crt]==1.43.116, we can conclude that your project's
+      requirements are unsatisfiable.

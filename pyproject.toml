@@ -1,0 +1,14 @@
+[project]
+name = "aws-cost-name-tagger"
+version = "0.3.6"
+description = "CUR-driven AWS Name tag proposals with strict Name ABSENT/EMPTY/NONEMPTY states; review-only safety hold"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "boto3[crt]==1.43.116",
+]
+
+# The tool is a standalone script: uv installs dependencies but does not
+# attempt to build or install this repository as a Python package.
+[tool.uv]
+package = false
