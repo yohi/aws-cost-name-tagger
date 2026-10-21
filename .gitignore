@@ -12,3 +12,5 @@ review_plan.json
 ebs_review_plan.json
 
 *.audit.jsonl
+
+cur/*
