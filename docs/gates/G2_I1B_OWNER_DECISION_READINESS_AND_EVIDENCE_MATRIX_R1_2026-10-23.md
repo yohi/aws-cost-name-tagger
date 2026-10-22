@@ -35,6 +35,78 @@
 
 各行はさらに`expected_items`、`observed_items`、`api_call_count`、`pages`、`termination_reason`、`evidence_sha256`、`context_id`、`unknowns`を記録する。件数0を「不存在」と断定できるのは、有効なscopeで終端まで検索した範囲に限る。
 
+
+## 2A. A04×A06 SCP/RCPの適用判定契約（R1-003）
+
+適用性は`actor × action × resource`の粒度で判定する。各レコードに次の**必須フィールド**を持たせる。`service_linked_role`は真偽または未証明`null`。除外・サービス非対応と、証拠不足によるUNKNOWNは別の状態とする。
+
+```json
+{
+  "principal_type": "ROLE|USER|ROOT|SERVICE_LINKED_ROLE|FEDERATED|AWS_SERVICE|UNKNOWN",
+  "principal_account": null,
+  "account_role": "MANAGEMENT|MEMBER|DELEGATED_ADMIN_MEMBER|EXTERNAL|UNKNOWN",
+  "service_linked_role": null,
+  "resource_account": null,
+  "resource_service": null,
+  "action": null,
+  "scp_applicable": "APPLICABLE|EXEMPT|UNKNOWN",
+  "rcp_applicable": "APPLICABLE|EXEMPT|NOT_SUPPORTED|UNKNOWN",
+  "exception_reason": null,
+  "evidence_id": [],
+  "effective_write_reachability": "UNKNOWN"
+}
+```
+
+`exception_reason`はEXEMPT/NOT_SUPPORTEDなら必須。`evidence_id`にはIAM Role/SLR識別根拠、Organizations管理/委任管理account情報、対象Resource所有account、SCP/RCPの有効状態と階層attachment、対象サービスの公式サポート根拠を結ぶ。欠落時はUNKNOWNであり、推測で`scp_applicable=false`を埋めない。
+
+| 合成Actor/Resource反例 | `scp_applicable` | `rcp_applicable` | 正しい解釈 |
+|---|---|---|---|
+| 管理アカウントのRole→管理アカウントResource | EXEMPT | EXEMPT | 両ガードレールを誤適用しない |
+| 管理アカウントのRole→RCP対象の**メンバー**Resource | EXEMPT | APPLICABLE | RCPは要求者でなく資源アカウントを基準とする |
+| メンバーRole→対応するメンバーResource | APPLICABLE | APPLICABLE | 権限/明示Deny等を別評価 |
+| 委任管理**メンバー**Role→対応メンバーResource | APPLICABLE | APPLICABLE | 委任管理という名目だけで除外しない |
+| **Service-linked role**→対応メンバーResource | EXEMPT | EXEMPT | SCP/RCPでは制限できない。role trust・service callerも調査 |
+| メンバーRole→**RCP非対応サービス** | APPLICABLE | NOT_SUPPORTED | RCPでwriter不可能としない |
+| Principal/SLR/Resource所有者/サービス対応の根拠不明 | UNKNOWN | UNKNOWN | A06 writer候補を消さずOPEN |
+
+RCPは管理アカウントResourceには適用されず、対象は対応サービスのメンバーResource（外部principalからの呼出しにも適用され得る）。SCPは管理アカウントprincipalとSLRを除外。**ガードレール除外は実効ALLOWと同義ではない**。他のIAM/boundary/session/resource policy・trust・denyなどを引き続き検証する。
+
+**実装開始前の必須反例テスト:** 合成SCPがName書込をdenyしていても、管理AccountのRoleやSLRを`IMPOSSIBLE_WRITER`にしない。管理AccountのresourceやRCP非対応serviceへRCP denyを誤適用しない。一方、管理RoleからメンバーResourceへの書き込み経路ではRCP適用を省かない。UNKNOWNのactorはA06台帳に残す。本PRは設計のみでテスト実装なし。
+
+## 2B. A05-Trailの時系列証拠／coverage契約（R1-004）
+
+```json
+{
+  "account": null,
+  "region": null,
+  "trail_arn": null,
+  "approved_window": {"start_utc": null, "end_utc": null},
+  "current_selector_snapshot": null,
+  "historical_selector_evidence": [],
+  "trail_config_change_events": [],
+  "logging_disabled_intervals": [],
+  "validation_disabled_intervals": [],
+  "digest_chain_segments": [],
+  "digest_chain_breaks": [],
+  "delivery_gap_intervals": [],
+  "delivery_retry_evidence": [],
+  "source_evidence_ids": [],
+  "historical_coverage_status": "UNKNOWN",
+  "limitations": ["Current selectors and BEGIN/END do not prove historical event capture"]
+}
+```
+
+- 取得可能なCloudTrail管理イベントや既存変更記録から、`CreateTrail`/`UpdateTrail`/`PutEventSelectors`/`PutInsightSelectors`/`StartLogging`/`StopLogging`、log file validationの切替、Trail削除/再作成を収集し**時系列の設定変更を再構成**する。変更履歴の取得能力自体が部分的なら「変更がなかった」とは推定しない。
+- digestの連鎖は`連続区間`を単位に証明する。CloudTrailのlog file validation無効化、StopLogging、Trail削除、配信先bucket障害等によるdigest断絶、遅延・再配送・順序入替を区別する。現在の`GetTrailStatus`にDeliveryErrorがなくても過去に欠損がないとは断言しない。
+- 各区間で設定履歴・S3 original gzip/digest・署名チェーン・ログのeventTime/region/account・配送/retentionを対応付け、未確認区間を`PARTIAL`/`UNKNOWN`とする。矛盾があるとき`INCONSISTENT`。**現在のEventSelector/IsLoggingとBEGIN/END一致だけでは過去全期間`COMPLETE`禁止**。
+- 反例：過去の3日間にStopLoggingまたはselector変更を否定できなければ、その区間の`Name更新0件`主張は禁止。
+
+## 2C. Owner Grantの実行中失効契約（R1-006）
+
+各SDKリクエスト**直前**に署名/承認元のGrant状態・取消・満了時刻・固定コードHEAD・承認済plan SHA・principal/context・paramsをチェックする（最初のSTS、ページ2以降、retry、Context切替、BEGIN/END含む）。参照元に到達不能、時計の信用不足、状態不明でも`STOP_GRANT`、**後続AWS API呼出しゼロ**。
+
+すでに送信済みのin-flightリクエストは後から巻き戻せる保証がないため、失効時の応答と既取得RAWは`UNAUTHORIZED_AFTER_REVOKE`という**内部保全ラベル**で未承認seal・隔離し、共有不可。再開には新しいOwner決裁・新規snapshot IDと独立確認が必須。これは設計上の要求であり、現PRには取消実装もOwner Grantも存在しない。
+
 ## 3. 権限取得前の決裁未確定項目（**未署名**）
 
 次の項目が揃うまでは、**AWSに1回も接続しない**。
@@ -71,6 +143,13 @@
 8. **No secrets/no real AWS on CI:** テストはシークレット不要、ネットワーク遮断、依存固定、カバレッジ計測とSonarCloud連携。実AWS統合検証のGrantとは完全分離する。
 9. **Attack surface:** 外部JSONや非信頼fixtureを任意Pythonオブジェクトへ変換しない。I1の`deepcopy`は内部合成fixture限定。プロセス・環境変数・任意endpoint/SDK hookを未信頼に与えない。
 10. **Formal review:** これらの全テストPASSでもG2 VERIFICATIONやG1条件付き書込安全性は成立しない。独立レビュー結果を具体的HEAD/plan fingerprintにのみ紐付ける。
+
+11. **S3 API/IAM:** SDK `ListObjectsV2`↔IAM `s3:ListBucket`を正しく紐付け、SDK Operation `ListBucket`は拒否。Bucket/Prefix/ContinuationToken/MaxKeys/Window/ObjectKey/bytesがGrant外ならAPIを出さない。`GetObject`・SSE-KMSは別Grant。
+12. **Organization EDS:** P1のLake=0件・P2-LakeのGrantなし→`UNKNOWN`。P2-Lake管理/正当な委任管理コンテキストの別行が揃うまで`NOT_CONFIGURED`禁止。
+13. **A04×A06反例:** 管理Account principal、SLR、管理資源、RCP非対応サービス、管理principal→メンバー資源、管理と異なるメンバーdelegated roleを検証。Unknown writerを消さない。
+14. **Trail過去区間:** Selector変更、StopLogging、digest断絶、配信欠損・再配送を合成し、現在設定とBEGIN/ENDが同じでもhistorical coverageをCOMPLETEにしない。
+15. **IAM Filter:** 5種別以外、部分ページ、DefaultVersionIdとPolicy ARN不一致、Policy本文未取得を`PARTIAL/UNKNOWN`にする。
+16. **Grant実行中失効:** 1ページ目完了後にOwner取消/満了/取消照会不能/planやHEAD不一致→2ページ目以降AWS API0、未承認RAW seal、別Grantなしの再開禁止。in-flightは取消可能と主張しない。
 
 ## 5. Independent Design Review依頼内容
 
