@@ -16,9 +16,23 @@
 | POSIX O_NOFOLLOW／出力ファイル権限 | v3.5から維持 |
 | 既知の複数ファイル公開の非原子性 | 残留。SIGKILL／電源断では部分公開の可能性 |
 | 原子的 ABSENT-or-EMPTY-only AWS書き込み | **NOT PROVEN / BLOCKED** |
-| AWS上のEmpty Name件数 | **NOT MEASURED**（新しいdryrunが必要） |
-| 指定Boto3+CRT環境／uv.lock | **未検証**（オフラインでは生成できず） |
+| AWS上のEmpty Name件数 | 提出された2026-10-21のdryrun結果は対象118件中**EMPTY 0件**。対象外リソースを含む全件調査／AWS独立確認ではない |
+| 指定Boto3+CRT環境／uv.lock | **GitHub ActionsでPASS**。Boto3 `1.43.116` / CRT import / `uv sync --locked` / 現行テスト76/76（2実行方式） / マニフェスト11件一致（2026-10-22） |
 
 **テスト:** 既存60件のうち旧仕様の2件を更新し、状態分類・EBS/RDS/CloudFront・UNKNOWN・CSV・候補ID・Safety Holdの10件を追加。結果は `test_results.txt` に記録。テストはモックとローカルファイルのみで、実AWSのEmptyタグ件数は推計していない。
 
 **重要:** Nameを付与するAPIは実装していないため、既存の非空Nameを実際に上書きしない条件付きタグ更新を証明したわけではありません。将来の書き込みGateは別途独立審査が必要です。
+
+## GitHub管理移行の追補（2026-10-22）
+
+本ファイルの元の検証記録は **v3.6 ZIP作成時点のオフライン検証** を示すもので、`test_results.txt` / `uv_lock_attempt.txt` も履歴記録です。ZIP作成後、このリポジトリに `uv.lock`（Boto3 `1.43.116`）が追加されました。
+
+- `feature/uv-locked-ci-and-docs` で `.github/workflows/ci.yml` を新設。`uv sync --locked`、Boto3/CRT import、マニフェストSHA-256・サイズ検査、2通りの単体テスト実行をCIの必須確認とします。
+- AWS認証・AWS変更・タグ書き込みはワークフローに含めません。`write_name()` と `apply()` は常時拒否を維持。
+- 配布ZIP作成時の70件PASSは既存Boto3 `1.43.18` 環境の結果。GitHub版はテストが76件に増えており、指定Boto3環境での**76/76 PASSをGitHub Actions Run #39702373325で確認済み**。
+- 提出されたv3.6の高額90件・EBS28件のdryrun出力は、`ABSENT 58`、`NONEMPTY 60`、`EMPTY 0`、`UNKNOWN 0`。変更結果は提出レポート上0件。これ自体はAWS実環境やCloudTrailを独立に検証した証拠ではありません。
+- SHA-256マニフェストの更新では `uv.lock` とCI workflowを管理対象に追加し、元の歴史的な結果ファイルは改変せず保持します。
+
+**Gate状態は不変:** 安全なABSENT-or-EMPTY-only書き込みの原子的保証は `NOT PROVEN`、**Safety Hold / AWS WRITE BLOCKED** です。
+
+CI成功の証跡： [Safety Hold CI / 2026-10-22](https://github.com/yohi/aws-cost-name-tagger/actions/runs/39702373325)（SHA `14c85392083cf5affb3af78d465edc205dccf4b2`、マニフェスト11件一致、2通りとも76/76 PASS）。この証跡はCI実行時点のGitHub HEADに対するもので、AWS実環境でのタグ変更機能の検証ではありません。

@@ -1,0 +1,67 @@
+name: Safety Hold CI
+
+on:
+  push:
+    branches:
+      - master
+      - "feature/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    name: Locked dependency and offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install pinned dependencies
+        run: uv sync --locked
+
+      - name: Verify pinned boto3 and CRT
+        run: |
+          uv run --locked python -c 'import boto3, awscrt; assert boto3.__version__ == "1.43.116", boto3.__version__; print("boto3:", boto3.__version__)'
+
+      - name: Validate SHA-256 manifest
+        run: |
+          uv run --locked python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("SHA256_MANIFEST.json").read_text(encoding="utf-8"))
+          files = manifest["files"]
+          assert len({entry["path"] for entry in files}) == len(files), "duplicate manifest path"
+          for entry in files:
+              path = Path(entry["path"])
+              assert path.is_file(), f"missing: {path}"
+              content = path.read_bytes()
+              assert hashlib.sha256(content).hexdigest() == entry["sha256"], f"SHA-256 mismatch: {path}"
+              assert len(content) == entry["bytes"], f"size mismatch: {path}"
+          for required in ("uv.lock", ".github/workflows/ci.yml"):
+              assert required in {entry["path"] for entry in files}, f"not listed: {required}"
+          print(f"SHA256 manifest PASS ({len(files)} files)")
+          PY
+
+      - name: Unit tests (module runner)
+        run: uv run --locked python -m unittest -q test_aws_cost_name_tagger_v3
+
+      - name: Unit tests (direct script runner)
+        run: uv run --locked python test_aws_cost_name_tagger_v3.py

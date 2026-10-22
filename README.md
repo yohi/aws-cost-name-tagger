@@ -47,13 +47,13 @@
 
 - Python 3.10以降、`uv`、対話型 `aws login --remote` を利用する場合は対応AWS CLI。
 - `pyproject.toml`: `boto3[crt]==1.43.116`。
-- `uv.lock` は同梱できていません。指定版の新規インストールは未検証。インターネット接続可能な環境で初回 `uv lock`、`uv sync --locked` を実行してください。
+- **このGitHubリポジトリには `uv.lock` をコミット済み**で、`boto3[crt]==1.43.116` がロックされています。元のv3.6配布ZIPには `uv.lock` が含まれていません。2026-10-22にGitHub Actionsで指定環境の **76/76 テストPASS（2通り）** を確認しました。
 
 ```bash
 # 以下のコマンドはリポジトリのルートディレクトリで実行します。
-uv lock
 uv sync --locked
 uv run --locked python -m unittest -v test_aws_cost_name_tagger_v3
+uv run --locked python test_aws_cost_name_tagger_v3.py
 ```
 
 ## 実行例（AWS読み取り専用）
@@ -93,5 +93,17 @@ uv run --locked python aws_cost_name_tagger_v3.py run \
 
 - Nameのプレフィックス自体が誤っている可能性や、共有リソースが複数プロダクトで使われる可能性は残ります。提案は製品帰属の証明ではありません。
 - `write_name()` / `apply` は意図的に使用不可です。原子的な「Name未存在時のみタグ追加」が各サービスで保証できる書き込み設計は**未承認・未実装**です。
-- `uv.lock` と指定依存環境によるテスト、実AWS上でのv3.6統合実行は未実施です。
+- 配布ZIP作成時点では指定依存環境による検証が未実施でした。GitHubでは `uv.lock` を追加し、固定依存環境での実行をCIで検証します。`test_results.txt` と `uv_lock_attempt.txt` は**配布ZIP作成時の履歴記録**であり、GitHub上での現状を示すものではありません。
+- 2026-10-21の提出dryrunレポート（高額90件＋EBS28件）は `ABSENT` 58件・`NONEMPTY` 60件・`EMPTY` 0件でした。**提出データの整合性確認であり、AWSへの独立再接続・CloudTrail検証ではありません。**
 - v3.4/v3.5の既存レポートはv3.6へ自動変換しません。特に従来の承認候補・候補IDは流用しないでください。
+
+## GitHub Actions（Safety Hold CI）
+
+`.github/workflows/ci.yml` は `master`、`feature/**` へのpush、Pull Request、手動実行で起動します。AWS認証情報や実AWSへの接続は不要で、**すべてモック／ローカルのテスト**です。
+
+1. Python 3.12 と uv を準備し、`uv sync --locked` で依存関係を固定してインストール。
+2. Boto3 `1.43.116` とAWS CRTをimportして依存バージョンを確認。
+3. `SHA256_MANIFEST.json` に記載されたファイルのSHA-256とサイズを確認（`uv.lock` とCI workflowも含む）。
+4. `uv run --locked python -m unittest -q test_aws_cost_name_tagger_v3` および直接実行でSafety Holdを含む現行76件のテストを検証（追加テスト数はリポジトリの更新により変わります）。
+
+**CIの実行結果は[GitHub Actions Run #39702373325](https://github.com/yohi/aws-cost-name-tagger/actions/runs/39702373325)で確認済みです。** このRunでは依存関係固定、Boto3/CRT、マニフェスト11ファイル、両実行方法のテスト76/76がすべてPASSしました。依存関係の更新が必要な場合は、別変更で `uv lock` を実行して `uv.lock` とマニフェストを更新します。Safety Holdの解除やタグ書き込みは行いません。
