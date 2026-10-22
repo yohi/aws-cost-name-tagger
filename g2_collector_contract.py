@@ -64,6 +64,8 @@ class Probe:
 
 
 def _time(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ContractError("Event window must be a UTC string")
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
