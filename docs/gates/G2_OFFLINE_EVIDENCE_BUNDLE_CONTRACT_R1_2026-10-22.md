@@ -114,14 +114,14 @@ G2_EVIDENCE_BUNDLE_<UTC_TIMESTAMP>/
 |---|---|---|---|
 | G2-A01 | 主体・グループ・Role・全IAM policy | `GetAccountAuthorizationDetails`、不足分は`GetPolicy`＋`GetPolicyVersion`／`GetRolePolicy`／`GetUserPolicy`／`GetGroupPolicy` | ロール、ユーザー、グループ、inlineとmanaged、default version、Resource、Condition、Allow/Denyを全件記録 |
 | G2-A02 | グループ継承・role trust・AssumeRole可能経路 | `ListGroupsForUser`、`GetRole`、IAM principal policies | 条件付き経路と外部ID・Principalを明記。Principalの相互到達性は別途検証 |
-| G2-A02a | IAM Identity CenterのPermission Set→Account→IAM Role→User/Group | `ListInstances`、`ListPermissionSets`、`DescribePermissionSet`、`GetInlinePolicyForPermissionSet`、`ListManagedPoliciesInPermissionSet`、`ListCustomerManagedPolicyReferencesInPermissionSet`、`ListAccountsForProvisionedPermissionSet`、`ListAccountAssignments`、Identity Store `DescribeUser` / `DescribeGroup` / `ListGroupMemberships` | 対象アカウントのAssignment、PrincipalId↔User/Group、Permission Set版／Provisioned Roleを連結。インスタンスや権限が取得できない、STS session policy／session tags／外部フェデレーションが解決できない場合は`UNKNOWN` |
+| G2-A02a | IAM Identity CenterのPermission Set→Account→IAM Role→User/Group | `ListInstances`、`ListPermissionSets`、`DescribePermissionSet`、`GetInlinePolicyForPermissionSet`、`ListManagedPoliciesInPermissionSet`、`ListCustomerManagedPolicyReferencesInPermissionSet`、`ListAccountsForProvisionedPermissionSet`、`ListAccountAssignments`、Identity Store `DescribeUser` / `DescribeGroup` / `ListGroupMemberships` | 対象アカウントのAssignment、PrincipalId↔User/Group、Permission Set設定ハッシュ／アカウントへのプロビジョニング状態／Provisioned Roleを連結。インスタンスや権限が取得できない、STS session policy／session tags／外部フェデレーションが解決できない場合は`UNKNOWN` |
 | G2-A03 | Organizations管理構造・SCP/RCP | `DescribeOrganization`、`ListParents`、`ListPoliciesForTarget`、`DescribePolicy` 等 | 管理アカウント／委任管理権限が必要なら未取得として分離。ターゲットへの継承を証明 |
 | G2-A04 | セッション・境界・リソースポリシー | IAM boundary情報、対象サービスの`Get*Policy`等 | 条件の欠落も記録。実効権限の単純な集合和を禁止 |
 | G2-A05 | 実タグ変更履歴（3経路を独立取得） | **Event History:** `LookupEvents`。**Trail→S3:** `GetTrail` / `GetEventSelectors` / `GetTrailStatus` で設定照合し、アクセス許可がある場合のみ`ListObjectsV2` / `GetObject` で配信済みログ原本を取得。**既存CloudTrail Lake:** `ListEventDataStores` / `GetEventDataStore` で存在・設定を確認（Queryの開始は別途承認） | 経路ごとに取得可能性、リージョン・アカウント・期間・eventCategory・イベントソース・取得件数・ページ終端・権限拒否／欠損／遅延を固定し、Event IDと元sourceを保持して重複排除後、対象58候補に照合。未取得経路を網羅済みと主張しない |
 | G2-A06 | 全writer候補の自動化構成 | CloudFormation stacks、EventBridge Rules/Scheduler、Lambda設定、Step Functions、CodeBuild等の**設定だけ** | リソースの列挙・詳細取得の両方。コード実行・secret取得なし |
 | G2-A07 | Nameで駆動するABAC／副作用 | Policy本文、EventBridgeパターン、アプリ設定の非機密メタデータ。API Gateway REST APIとStage双方のタグ、および継承条件 | `Name`を条件・入力・連携キーに使う場所のリスト。REST API→Stageの継承タグがABACへ影響するか確認し、未取得はUNKNOWN |
 | G2-A08 | Name候補の現在値・関連根拠 | 元のv3.6 dryrunプラン＋各サービスのタグ読み取りAPI。API GatewayはStageと親REST APIを区別 | `ABSENT/EMPTY/NONEMPTY/UNKNOWN` を区別。ARN/リージョン/親関係を固定。API Gateway `GetTags`は継承タグを返さないため、Stage直接タグとREST API由来のABAC上の継承タグを**別列**で保存。継承タグはCost Explorerのコスト配分タグに使えない |
-| G2-A09 | 収集の完全性・時間整合性 | STS照合、リージョン一覧、ページネーション・APIログ、SHA256SUMS、およびIAM／SCP／Nameタグ等の開始・終了時の独立再読取 | アカウント一致と予定範囲の完走。policy default version／document hash、Assignment、SCP対象／版、対象Name／ARNを前後で比較し、不一致は`INCONSISTENT`。確認不能は`UNKNOWN`。AccessDeniedを成功として隠さない |
+| G2-A09 | 収集の完全性・時間整合性 | STS照合、リージョン一覧、ページネーション・APIログ、SHA256SUMS、およびIAM／SCP／Nameタグ等の開始・終了時の独立再読取 | アカウント一致と予定範囲の完走。policy default version／document hash、Permission Set設定・Assignment、SCP対象／版、対象Name／ARNを前後で比較し、不一致は`INCONSISTENT`。確認不能は`UNKNOWN`。AccessDeniedを成功として隠さない |
 
 **FND-002：CloudTrailの独立3ソース・完全性契約**
 
@@ -141,7 +141,7 @@ G2_EVIDENCE_BUNDLE_<UTC_TIMESTAMP>/
 
 ### FND-004：収集中の構成変更／時間整合性の判定
 
-- **BEGINチェック:** STS、IAM Role・User・Groupと接続ポリシーの参照、managed policyの`DefaultVersionId`と本文SHA-256、inline policyハッシュ、Identity Center Assignment、SCP/RCP継承範囲、対象ARN・Name状態・親関連を時刻付きで採取する。
+- **BEGINチェック:** STS、IAM Role・User・Groupと接続ポリシーの参照、managed policyの`DefaultVersionId`と本文SHA-256、inline policyハッシュ、Identity Center Permission Set設定・Assignment、SCP/RCP継承範囲、対象ARN・Name状態・親関連を時刻付きで採取する。
 - **ENDチェック:** 同じ識別子・バージョン・ドキュメントハッシュ・状態を可能な限り再取得しBEGINと比較する。途中で取得した各オブジェクトにも収集時刻・版を付ける。CloudTrail等で期間中の関連変更が判明した場合は差分の根拠を保存する。
 - **変更検出:** 前後で不一致／取得中に変更が観測された項目があれば`INCONSISTENT`としてGate判定を止める。未取得／AccessDenied／ページ未完／比較不可は`UNKNOWN`または`PARTIAL`にし、整合と推定しない。矛盾した結果を混在したまま`COMPLETE`にしない。
 - **限界:** BEGIN/ENDの一致だけでは中間での変更・復元（ABA）を排除できず、複数サービス横断の単一時点・原子的snapshotにはならない。検査済みフィールドについて一貫した観測ができた場合だけ`CONSISTENT_WITHIN_CHECKED_FIELDS`を使用。
@@ -175,7 +175,7 @@ G2_EVIDENCE_BUNDLE_<UTC_TIMESTAMP>/
 ## 6. 成功／失敗基準と実行権限
 
 - **Evidence capture READY** = 主体照合・スコープ・最小権限・非公開保管・ログ・エラー記録・停止条件が明確。
-- **Evidence capture COMPLETE** = 必須項目で保護されたRAW原本と派生物双方のハッシュ・変換履歴が検証され、各source/region/期間/イベント種別/ページ網羅が満たされ、時間整合性が`CONSISTENT_WITHIN_CHECKED_FIELDS`（限定的意味）であること。必須範囲に`INCONSISTENT` / `UNKNOWN` / `PARTIAL` / `ACCESS_DENIED`があれば原則COMPLETEとしない。例外的な補完証拠の採用には独立レビューが必要。
+- **Evidence capture COMPLETE** = 必須項目について保護されたRAW原本のハッシュを検証し、マスキング済み派生物を作成した場合はそのハッシュ・変換履歴も検証し、各source/region/期間/イベント種別/ページ網羅が満たされ、時間整合性が`CONSISTENT_WITHIN_CHECKED_FIELDS`（限定的意味）であること。必須範囲に`INCONSISTENT` / `UNKNOWN` / `PARTIAL` / `ACCESS_DENIED`があれば原則COMPLETEとしない。例外的な補完証拠の採用には独立レビューが必要。
 - **G2 VERIFIED** = 独立レビュアーが全writerの権限・実行/変更経路・現在のName利用副作用を対象候補ごとに検証。収集完了だけでは達成しない。
 - **G1依存** = `G1 NOT PROVEN`である限り、`G2 VERIFIED`でもタグの書き込みGateを通せない。
 - `AccessDenied`、Identity Center割当未取得、pagination未完了、Trail原本やLakeの欠落、組織管理アカウントの証拠なし、外部自動化・CloudTrailの不足、RAW保護不能、スナップショット不整合は**OPEN**として扱う。
