@@ -21,7 +21,8 @@ FORBIDDEN_OS_ATTRS = frozenset({
     "system", "popen", "fork", "forkpty", "spawnl", "spawnle",
     "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp",
     "spawnvpe", "execv", "execve", "execl", "execle", "execlp",
-    "execlpe", "execvp", "execvpe",
+    "execlpe", "execvp", "execvpe", "posix_spawn", "posix_spawnp",
+    "startfile",
 })
 
 
@@ -32,13 +33,26 @@ def check_ast(source: str) -> list[str]:
     except SyntaxError:
         return ["Invalid Python syntax"]
     violations: list[str] = []
-    for node in ast.walk(tree):
+    nodes = list(ast.walk(tree))
+    os_module_aliases = {"os"}
+    os_function_aliases: dict[str, str] = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "os":
+                    os_module_aliases.add(alias.asname or "os")
+        elif isinstance(node, ast.ImportFrom) and node.module == "os":
+            for alias in node.names:
+                if alias.name in FORBIDDEN_OS_ATTRS:
+                    os_function_aliases[alias.asname or alias.name] = alias.name
+
+    for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".", 1)[0] in FORBIDDEN_ROOTS:
                     violations.append(f"L{node.lineno}: forbidden import")
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            if node.level or node.module.split(".", 1)[0] in FORBIDDEN_ROOTS:
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or (node.module and node.module.split(".", 1)[0] in FORBIDDEN_ROOTS):
                 violations.append(f"L{node.lineno}: forbidden import-from")
         elif isinstance(node, ast.Call):
             call = node.func
@@ -46,8 +60,11 @@ def check_ast(source: str) -> list[str]:
                 violations.append(f"L{node.lineno}: dynamic code/import forbidden")
             elif (isinstance(call, ast.Attribute)
                   and isinstance(call.value, ast.Name)
-                  and call.value.id == "os"
+                  and call.value.id in os_module_aliases
                   and call.attr in FORBIDDEN_OS_ATTRS):
+                violations.append(f"L{node.lineno}: process creation forbidden")
+            elif (isinstance(call, ast.Name)
+                  and call.id in os_function_aliases):
                 violations.append(f"L{node.lineno}: process creation forbidden")
     return violations
 

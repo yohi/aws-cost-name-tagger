@@ -14,6 +14,9 @@ class OfflineStaticGuardTests(unittest.TestCase):
             with self.subTest(src=src):
                 self.assertTrue(guard.check_ast(src))
 
+    def test_relative_import_without_module_rejected(self):
+        self.assertTrue(guard.check_ast("from . import helper"))
+
     def test_dynamic_import_and_exec_rejected(self):
         for src in ('__import__("socket")', "import importlib",
                     'from importlib import import_module',
@@ -23,7 +26,12 @@ class OfflineStaticGuardTests(unittest.TestCase):
 
     def test_process_execution_rejected(self):
         for src in ("import subprocess", 'os.system("curl")', "os.popen('echo ok')",
-                    'os.execve("/bin/echo", [], {})'):
+                    'os.execve("/bin/echo", [], {})',
+                    "import os as operating_system\noperating_system.system('echo ok')",
+                    "import os\nfrom os import system as run_command\nrun_command('echo ok')",
+                    "from os import posix_spawn as launch\nlaunch('cmd', [], [])",
+                    "import os\nos.posix_spawnp('cmd', [], [])",
+                    "import os\nos.startfile('file')"):
             with self.subTest(src=src):
                 self.assertTrue(guard.check_ast(src))
 
