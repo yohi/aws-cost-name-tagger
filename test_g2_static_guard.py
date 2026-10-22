@@ -31,8 +31,14 @@ class OfflineStaticGuardTests(unittest.TestCase):
         self.assertTrue(guard.check_ast("def invalid(:\n"))
 
     def test_guard_refuses_arbitrary_file_to_scan(self):
-        self.assertEqual(guard.main([]), 2)
+        self.assertEqual(guard.main([]), 1)
         self.assertEqual(guard.main(["unknown.py"]), 1)
+        self.assertEqual(guard.main(["/tmp/untrusted/g2_evidence.py",
+                                     "g2_collector_contract.py"]), 1)
+        self.assertEqual(guard.main(["../g2_evidence.py",
+                                     "g2_collector_contract.py"]), 1)
+        self.assertEqual(guard.main(["g2_evidence.py",
+                                     "g2_collector_contract.py"]), 0)
 
 
 if __name__ == "__main__":
