@@ -25,7 +25,8 @@ def fixtures(account=ACCOUNT, regions=(REGION,), iam_begin=None, iam_end=None):
     }
     for probe in c.build_plan(ACCOUNT, regions, START, END):
         key = (probe.service, probe.operation, probe.region)
-        if key not in scripts:
+        if key not in {("sts", "GetCallerIdentity", "global"),
+                       ("iam", "GetAccountAuthorizationDetails", "global")}:
             scripts.setdefault(key, []).append({"NextToken": None})
     return scripts
 
@@ -49,6 +50,7 @@ class I1MockOnlyTests(unittest.TestCase):
         self.assertEqual(len(port.calls), 12)
         self.assertGreater(len(result["not_collected"]), 6)
         self.assertTrue(all(p["provenance"] == "SYNTHETIC_FIXTURE_ONLY" for p in result["probes"]))
+        self.assertTrue(all(p["status"] == "SIMULATED_PAGE_TERMINATED" for p in result["probes"]))
 
     def test_wrong_account_aborts_before_other_operations(self):
         port = c.FixturePort(fixtures(account=OTHER))
