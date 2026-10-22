@@ -1,0 +1,10 @@
+AWS Cost Name Tagger v3.6 SAFETY HOLD offline verification (2026-10-21 JST)
+Source: v3.5 Safety Hold sha256 1a88b2d9986bb767306ef107b323a4ee65f82eeaa5bba1915ac15afd37110172
+Python -m unittest -q test_aws_cost_name_tagger_v3: 70/70 PASS
+Python test_aws_cost_name_tagger_v3.py: 70/70 PASS
+uv run --no-project --python /opt/pyvenv/bin/python python -m unittest -q test_aws_cost_name_tagger_v3: 70/70 PASS
+Actual installed Boto3: 1.43.18 (not pinned boto3[crt]==1.43.116)
+uv lock --offline: FAILED (pin not present in available offline cache); uv.lock not generated
+AWS network access / AWS mutations: NOT EXECUTED / ZERO
+Write_name/apply Safety Hold: MAINTAINED
+Report publication multi-file atomicity on hard crash: NOT GUARANTEED (existing residual)
