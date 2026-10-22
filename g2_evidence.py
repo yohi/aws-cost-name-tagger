@@ -507,6 +507,61 @@ def export_shared(bundle: Path, output: Path, approval_file: Path, confirm_revie
             "sha256": digest(output.read_bytes()), "redaction_independently_verified": False}
 
 
+def authorized_cli_workspace(args: argparse.Namespace) -> None:
+    """Constrain every CLI file path to the operator-controlled private workspace.
+
+    The workspace comes from the process environment, not from request/CLI input.
+    Library functions also enforce integrity, no-Git and no-overwrite boundaries.
+    """
+    configured = os.environ.get("G2_EVIDENCE_WORKSPACE")
+    if not configured:
+        raise EvidenceError("G2_EVIDENCE_WORKSPACE is required for CLI access")
+    root_input = Path(configured)
+    if not root_input.is_absolute() or root_input.is_symlink():
+        raise EvidenceError("Workspace must be an absolute, non-symlink directory")
+    root = root_input.resolve(strict=True)
+    require_outside_git(root)
+    if not root.is_dir() or (os.name == "posix" and root.stat().st_mode & 0o077):
+        raise EvidenceError("Workspace must be a private directory (0700)")
+
+    def confined(path: Path, area: str, suffixes: tuple[str, ...]) -> Path:
+        base = root / area
+        if base.is_symlink() or not base.is_dir():
+            raise EvidenceError(f"Workspace must pre-create private {area}/")
+        if os.name == "posix" and base.stat().st_mode & 0o077:
+            raise EvidenceError("Workspace subdirectory is not private")
+        # Only one child in the expected area; reject relative paths, traversal,
+        # symlinks and any alias resolving to an unexpected location.
+        if not path.is_absolute() or path.is_symlink() or not path.name:
+            raise EvidenceError("CLI paths must be absolute and non-symlink")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", path.name):
+            raise EvidenceError("Invalid CLI filename")
+        resolved = path.resolve(strict=False)
+        if resolved.parent != base.resolve(strict=True) or path.suffix not in suffixes:
+            raise EvidenceError(f"CLI path is outside the dedicated {area}/")
+        return resolved
+
+    # Bundle is a DIRECTORY with no required filename extension; ordinary files
+    # have tightly constrained suffixes and dedicated, non-overlapping areas.
+    if args.command in ("init", "ingest", "verify", "recover", "export-shared"):
+        bundle = args.bundle
+        if not bundle.is_absolute() or bundle.is_symlink():
+            raise EvidenceError("Bundle path must be absolute and non-symlink")
+        parent = (root / "bundles").resolve(strict=True)
+        resolved = bundle.resolve(strict=False)
+        if (resolved.parent != parent or
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", bundle.name)):
+            raise EvidenceError("Bundle must be a direct child of workspace/bundles/")
+        args.bundle = resolved
+    if args.command == "ingest":
+        args.source_file = confined(args.source_file, "incoming", (".json", ".jsonl"))
+    if args.command == "export-shared":
+        args.approval_file = confined(args.approval_file, "approvals", (".json",))
+        args.zip_path = confined(args.zip_path, "exports", (".zip",))
+    if args.command == "verify-shared":
+        args.zip_path = confined(args.zip_path, "exports", (".zip",))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -537,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("zip_path", type=Path)
     args = parser.parse_args(argv)
     try:
+        authorized_cli_workspace(args)
         if args.command == "init":
             init_bundle(args.bundle, args.account, args.baseline)
             result = {"status": "INITIALIZED_OFFLINE_ONLY"}
