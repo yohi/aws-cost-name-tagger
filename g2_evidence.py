@@ -248,11 +248,10 @@ def checksum_lines(entries: list[dict]) -> bytes:
 
 def ingest(bundle: Path, source_file: Path, evidence_id: str, name: str,
            source: str, api: str, region: str, pages: int, pagination_complete: bool) -> None:
+    verify_bundle(bundle)  # fail closed on any pending or inconsistent import
     raw = private_root(bundle)
     manifest_path = bundle / "02_ACQUISITION_MANIFEST.json"
     manifest = read_json(manifest_path)
-    if manifest.get("capture_mode") != "OFFLINE_IMPORT_ONLY" or manifest.get("snapshot_atomic") is not False:
-        raise EvidenceError("Invalid offline manifest")
     if not EVIDENCE_RE.fullmatch(evidence_id) or not FILENAME_RE.fullmatch(name):
         raise EvidenceError("Invalid evidence ID or output filename")
     if source not in SOURCES or not re.fullmatch(r"[a-z0-9-]+:(List|Get|Describe|Lookup|BatchGet)[A-Za-z0-9]+", api):
@@ -278,10 +277,23 @@ def ingest(bundle: Path, source_file: Path, evidence_id: str, name: str,
             "raw_sha256": digest(data), "raw_bytes": len(data),
             "derived_sha256": None, "transform_log_ref": None,
             "limitations": IMMUTABLE_LIMITATIONS}
-    write_private(dest, data)
+    validate_entry(item)
     updated = entries + [item]
-    replace_private(manifest_path, json_bytes({**manifest, "files": updated}))
-    replace_private(bundle / "03_SHA256SUMS.txt", checksum_lines(updated))
+    new_manifest = json_bytes({**manifest, "files": updated})
+    new_sums = checksum_lines(updated)
+    old_manifest = manifest_path.read_bytes()
+    old_sums = (bundle / "03_SHA256SUMS.txt").read_bytes()
+    journal = {"schema_version": "g2-ingest-journal-1",
+               "before_manifest_sha256": digest(old_manifest),
+               "after_manifest_sha256": digest(new_manifest),
+               "before_sums_sha256": digest(old_sums),
+               "after_sums_sha256": digest(new_sums), "record": item}
+    # Exclusive journal establishes a detectable transaction boundary.
+    write_private(bundle / JOURNAL_NAME, json_bytes(journal))
+    write_private(dest, data)
+    replace_private(manifest_path, new_manifest)
+    replace_private(bundle / "03_SHA256SUMS.txt", new_sums)
+    (bundle / JOURNAL_NAME).unlink()
 
 
 def verify_bundle(bundle: Path, *, allow_pending: bool = False) -> dict:
@@ -324,6 +336,66 @@ def verify_bundle(bundle: Path, *, allow_pending: bool = False) -> dict:
         raise EvidenceError("SHA256SUMS does not match manifest")
     return {"status": "INTEGRITY_VERIFIED_ONLY", "captured_files": len(entries),
             "g2_gate": "NOT_VERIFIED", "snapshot_consistency": "NOT_ATTEMPTED"}
+
+def recover_bundle(bundle: Path) -> dict:
+    private_root(bundle)
+    pending = bundle / JOURNAL_NAME
+    if not pending.exists() and not pending.is_symlink():
+        verify_bundle(bundle)
+        return {"status": "NO_PENDING_INGEST"}
+    journal = read_json(pending)
+    expect_keys(journal, JOURNAL_KEYS, "ingest journal")
+    if journal.get("schema_version") != "g2-ingest-journal-1":
+        raise EvidenceError("Unexpected journal schema")
+    for field in ("before_manifest_sha256", "after_manifest_sha256",
+                  "before_sums_sha256", "after_sums_sha256"):
+        if not isinstance(journal.get(field), str) or not SHA_RE.fullmatch(journal[field]):
+            raise EvidenceError("Malformed journal digest")
+    item = journal["record"]
+    validate_entry(item)
+    manifest_file = bundle / "02_ACQUISITION_MANIFEST.json"
+    sums_file = bundle / "03_SHA256SUMS.txt"
+    scope = read_json(bundle / "01_SCOPE.json")
+    manifest = read_json(manifest_file)
+    validate_offline_manifest(manifest, scope)
+    current_sha = digest(manifest_file.read_bytes())
+    before, after = journal["before_manifest_sha256"], journal["after_manifest_sha256"]
+    if current_sha == before:
+        original = manifest
+    elif current_sha == after and manifest["files"] and manifest["files"][-1] == item:
+        original = {**manifest, "files": manifest["files"][:-1]}
+        if digest(json_bytes(original)) != before:
+            raise EvidenceError("Recovery prior state does not match journal")
+    else:
+        raise EvidenceError("Manifest changed outside journal transaction")
+    next_entries = original["files"] + [item]
+    after_manifest = json_bytes({**original, "files": next_entries})
+    before_sums = checksum_lines(original["files"])
+    after_sums = checksum_lines(next_entries)
+    if (digest(after_manifest) != after
+            or digest(before_sums) != journal["before_sums_sha256"]
+            or digest(after_sums) != journal["after_sums_sha256"]
+            or sums_file.read_bytes() not in (before_sums, after_sums)):
+        raise EvidenceError("Recovery checksum or record mismatch")
+    source = bundle / item["raw_path"]
+    if not source.exists() and not source.is_symlink():
+        if current_sha != before or sums_file.read_bytes() != before_sums:
+            raise EvidenceError("RAW absent after state update; manual quarantine required")
+        verify_bundle(bundle, allow_pending=True)
+        pending.unlink()
+        return {"status": "ROLLED_BACK_NO_RAW"}
+    check_private(source)
+    data = source.read_bytes()
+    if digest(data) != item["raw_sha256"] or len(data) != item["raw_bytes"]:
+        raise EvidenceError("RAW byte mismatch; manual quarantine required")
+    inspect_json(data, source.suffix)
+    if current_sha == before:
+        replace_private(manifest_file, after_manifest)
+    if sums_file.read_bytes() != after_sums:
+        replace_private(sums_file, after_sums)
+    verify_bundle(bundle, allow_pending=True)
+    pending.unlink()
+    return {"status": "RECOVERED_ROLL_FORWARD", "g2_gate": "NOT_VERIFIED"}
 
 def safe_shared_name(value: str) -> bool:
     if not isinstance(value, str):
@@ -434,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--region", required=True)
     p.add_argument("--pages", type=int, default=0)
     p.add_argument("--pagination-complete", action="store_true")
+    p = commands.add_parser("recover", help="Explicitly reconcile an interrupted ingest journal")
+    p.add_argument("bundle", type=Path)
     p = commands.add_parser("verify", help="Verify local raw SHA-256, size, paths, permissions")
     p.add_argument("bundle", type=Path)
     p = commands.add_parser("export-shared", help="Export only SHA-approved redacted_shared files")
@@ -452,6 +526,8 @@ def main(argv: list[str] | None = None) -> int:
             ingest(args.bundle, args.source_file, args.id, args.name, args.source,
                    args.api, args.region, args.pages, args.pagination_complete)
             result = {"status": "OFFLINE_IMPORTED_UNVERIFIED"}
+        elif args.command == "recover":
+            result = recover_bundle(args.bundle)
         elif args.command == "verify":
             result = verify_bundle(args.bundle)
         elif args.command == "export-shared":
