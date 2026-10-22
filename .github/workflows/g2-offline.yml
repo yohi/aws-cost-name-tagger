@@ -27,24 +27,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Forbid AWS SDK imports in offline evidence module
-        run: |
-          python - <<'PY'
-          import ast
-          from pathlib import Path
-
-          for path in ("g2_evidence.py", "g2_collector_contract.py"):
-              tree = ast.parse(Path(path).read_text(encoding="utf-8"))
-              forbidden = ("boto3", "botocore", "awscrt", "socket",
-                           "requests", "urllib", "subprocess")
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.Import):
-                      assert not any(alias.name.startswith(forbidden) for alias in node.names)
-                  elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                      assert not node.module.startswith(forbidden), node.module
-          print("No AWS SDK or network imports in either G2 offline module")
-          PY
+      - name: Scan offline modules using the shared static guard
+        run: python g2_static_guard.py g2_evidence.py g2_collector_contract.py
 
       - name: G2 offline evidence tests (standard-library only)
         run: |
-          python -m unittest -v test_g2_evidence test_g2_collector_contract
+          python -m unittest -v test_g2_evidence test_g2_collector_contract test_g2_static_guard
+
+      - name: Run G2 tests with networking disabled (Docker)
+        run: |
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            --volume "${{ github.workspace }}:/workspace:ro" \
+            --workdir /workspace \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env AWS_EC2_METADATA_DISABLED=true \
+            python:3.12-slim-bookworm \
+            python -m unittest -q test_g2_evidence test_g2_collector_contract test_g2_static_guard
