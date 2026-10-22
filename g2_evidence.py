@@ -105,9 +105,17 @@ def replace_private(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def require_outside_git(path: Path) -> None:
+    # Git worktrees have .git as either a directory or a file.
+    destination = path.resolve(strict=False)
+    if any((parent / ".git").exists() for parent in (destination, *destination.parents)):
+        raise EvidenceError("Private evidence and archives must be outside every Git worktree")
+
+
 def init_bundle(bundle: Path, account: str, baseline: str) -> None:
     if not ACCOUNT_RE.fullmatch(account) or not BASELINE_RE.fullmatch(baseline):
         raise EvidenceError("Expected 12-digit account and 40-character Git commit SHA")
+    require_outside_git(bundle)
     if bundle.exists() or bundle.is_symlink():
         raise EvidenceError("Bundle already exists; never overwrite an existing snapshot")
     bundle.mkdir(mode=0o700, parents=False)
@@ -277,6 +285,7 @@ def export_shared(bundle: Path, output: Path, approval_file: Path, confirm_revie
         approved[path] = data
     if sum(map(len, approved.values())) > MAX_SHARED_TOTAL:
         raise EvidenceError("Total shared output too large")
+    require_outside_git(output)
     if output.exists() or output.is_symlink():
         raise EvidenceError("Refusing to overwrite existing ZIP")
     if not output.parent.is_dir():
