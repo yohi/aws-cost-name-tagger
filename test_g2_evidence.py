@@ -388,6 +388,53 @@ class G2OfflineBundleTests(unittest.TestCase):
         with self.assertRaises(g2.EvidenceError):
             g2.verify_shared(archive)
 
+    def cli_workspace(self):
+        root = self.root / "workspace"
+        root.mkdir(mode=0o700)
+        for name in ("bundles", "incoming", "approvals", "exports"):
+            (root / name).mkdir(mode=0o700)
+        return root
+
+    def test_cli_refuses_execution_without_trusted_workspace(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(g2.main(["verify", str(self.bundle)]), 2)
+
+    def test_cli_only_reads_and_writes_confined_workspace_paths(self):
+        root = self.cli_workspace()
+        target = root / "bundles" / "test_bundle"
+        inside = root / "incoming" / "source.json"
+        inside.write_text('{"synthetic":true}')
+        outside = self.root / "outside.json"
+        outside.write_text('{"private":true}')
+        with mock.patch.dict(os.environ, {"G2_EVIDENCE_WORKSPACE": str(root)}):
+            self.assertEqual(g2.main(["init", str(target), "--account", ACCOUNT,
+                                       "--baseline", BASELINE]), 0)
+            self.assertEqual(g2.main(["ingest", str(target), str(inside),
+                                       "--id", "G2-A01", "--name", "demo.json",
+                                       "--source", "IAM", "--api", "iam:ListRoles",
+                                       "--region", "global"]), 0)
+            self.assertEqual(g2.main(["verify", str(target)]), 0)
+            self.assertEqual(g2.main(["ingest", str(target), str(outside),
+                                       "--id", "G2-A01", "--name", "outside.json",
+                                       "--source", "IAM", "--api", "iam:ListRoles",
+                                       "--region", "global"]), 2)
+            self.assertEqual(g2.main(["verify-shared", str(self.root / "outside.zip")]), 2)
+            self.assertEqual(g2.main(["init", str(self.root / "not_allowed"),
+                                       "--account", ACCOUNT, "--baseline", BASELINE]), 2)
+        self.assertFalse((target / "raw_secure" / "outside.json").exists())
+
+    def test_cli_rejects_symlink_to_another_workspace_area(self):
+        root = self.cli_workspace()
+        legitimate = root / "incoming" / "actual.json"
+        legitimate.write_text("{}")
+        alias = root / "incoming" / "symlink.json"
+        alias.symlink_to(legitimate)
+        with mock.patch.dict(os.environ, {"G2_EVIDENCE_WORKSPACE": str(root)}):
+            self.assertEqual(g2.main(["ingest", str(root / "bundles" / "missing"),
+                                       str(alias), "--id", "G2-A01", "--name", "x.json",
+                                       "--source", "IAM", "--api", "iam:ListRoles",
+                                       "--region", "global"]), 2)
+
     def test_raw_dir_world_readable_rejected(self):
         if os.name == "posix":
             (self.bundle / "raw_secure").chmod(0o755)
