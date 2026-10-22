@@ -23,7 +23,7 @@ FORBIDDEN_JSON_KEYS = {"secretaccesskey", "sessiontoken", "clientsecret", "priva
 MAX_FILE = 64 * 1024 * 1024
 MAX_SHARED_TOTAL = 64 * 1024 * 1024
 MAX_SHARED_FILES = 50
-SHARED_RE = re.compile(r"redacted_shared/[A-Za-z0-9][A-Za-z0-9_.-]*\\.(?:json|jsonl)\\Z", re.ASCII)
+SHARED_RE = re.compile(r"redacted_shared/[A-Za-z0-9][A-Za-z0-9_.-]*\.(?:json|jsonl)\Z", re.ASCII)
 IMMUTABLE_LIMITATIONS = ["AWS API was not executed by this tool",
                          "Completeness and source authenticity are not proven"]
 MANIFEST_KEYS = {
@@ -139,6 +139,83 @@ def require_outside_git(path: Path) -> None:
         raise EvidenceError("Private evidence and archives must be outside every Git worktree")
 
 
+def expect_keys(obj: dict, keys: set[str], label: str) -> None:
+    if not isinstance(obj, dict) or set(obj) != keys:
+        raise EvidenceError(f"Unexpected {label} fields")
+
+
+def valid_utc(value: object) -> bool:
+    if not isinstance(value, str) or not value.endswith("+00:00"):
+        return False
+    try:
+        return datetime.fromisoformat(value).utcoffset() == timezone.utc.utcoffset(None)
+    except ValueError:
+        return False
+
+
+def validate_entry(item: dict) -> None:
+    expect_keys(item, ENTRY_KEYS, "evidence record")
+    name = item.get("raw_path")
+    if (not isinstance(name, str) or not name.startswith("raw_secure/")
+            or not FILENAME_RE.fullmatch(name[len("raw_secure/"):])):
+        raise EvidenceError("Unsafe raw path")
+    evidence = item.get("evidence_id")
+    if (not isinstance(evidence, str) or not EVIDENCE_RE.fullmatch(evidence)
+            or item.get("source") not in SOURCES):
+        raise EvidenceError("Invalid evidence metadata")
+    api = item.get("api")
+    if not isinstance(api, str) or not re.fullmatch(
+            r"[a-z0-9-]+:(List|Get|Describe|Lookup|BatchGet)[A-Za-z0-9]+", api):
+        raise EvidenceError("Invalid read-only API metadata")
+    region = item.get("region")
+    if not isinstance(region, str) or not re.fullmatch(
+            r"(global|[a-z]{2}-[a-z]+-[0-9])", region):
+        raise EvidenceError("Invalid region")
+    if (type(item.get("pages")) is not int or item["pages"] < 0
+            or type(item.get("pagination_complete")) is not bool
+            or type(item.get("raw_bytes")) is not int
+            or not 0 <= item["raw_bytes"] <= MAX_FILE
+            or not isinstance(item.get("raw_sha256"), str)
+            or not SHA_RE.fullmatch(item["raw_sha256"])):
+        raise EvidenceError("Malformed evidence length, digest or pagination")
+    if (item.get("derived_path") is not None or item.get("derived_sha256") is not None
+            or item.get("transform_log_ref") is not None
+            or item.get("scope") != "USER_SUPPLIED_UNVERIFIED"
+            or item.get("started_at_utc") is not None
+            or not valid_utc(item.get("completed_at_utc"))
+            or item.get("status") != "PARTIAL"
+            or item.get("provenance") != "OFFLINE_USER_SUPPLIED_UNVERIFIED"
+            or item.get("limitations") != IMMUTABLE_LIMITATIONS):
+        raise EvidenceError("Offline provenance or status must remain unverified")
+
+
+def validate_offline_manifest(manifest: dict, scope: dict) -> None:
+    expect_keys(manifest, MANIFEST_KEYS, "manifest")
+    expect_keys(scope, {"account_id", "source_baseline_sha", "capture_mode"}, "scope")
+    account = manifest.get("account_id")
+    baseline = manifest.get("source_baseline_sha")
+    if (not isinstance(account, str) or not ACCOUNT_RE.fullmatch(account)
+            or not isinstance(baseline, str) or not BASELINE_RE.fullmatch(baseline)
+            or scope != {"account_id": account, "source_baseline_sha": baseline,
+                         "capture_mode": "OFFLINE_IMPORT_ONLY"}):
+        raise EvidenceError("Scope or baseline mismatch")
+    if (manifest.get("schema_version") != "g2-evidence-1.1"
+            or manifest.get("snapshot_atomic") is not False
+            or manifest.get("snapshot_started_at_utc") is not None
+            or manifest.get("snapshot_completed_at_utc") is not None
+            or manifest.get("snapshot_consistency_status") != "NOT_ATTEMPTED"
+            or manifest.get("snapshot_consistency_evidence") != []
+            or manifest.get("collector_principal_arn") is not None
+            or manifest.get("read_only_assertion") != "REQUIRES_INDEPENDENT_VERIFICATION"
+            or manifest.get("capture_mode") != "OFFLINE_IMPORT_ONLY"):
+        raise EvidenceError("I0 cannot certify snapshot, collector or authorization")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise EvidenceError("Malformed manifest entries")
+    for entry in entries:
+        validate_entry(entry)
+
+
 def init_bundle(bundle: Path, account: str, baseline: str) -> None:
     if not ACCOUNT_RE.fullmatch(account) or not BASELINE_RE.fullmatch(baseline):
         raise EvidenceError("Expected 12-digit account and 40-character Git commit SHA")
@@ -207,48 +284,46 @@ def ingest(bundle: Path, source_file: Path, evidence_id: str, name: str,
     replace_private(bundle / "03_SHA256SUMS.txt", checksum_lines(updated))
 
 
-def verify_bundle(bundle: Path) -> dict:
+def verify_bundle(bundle: Path, *, allow_pending: bool = False) -> dict:
     raw = private_root(bundle)
-    manifest = read_json(bundle / "02_ACQUISITION_MANIFEST.json")
-    scope = read_json(bundle / "01_SCOPE.json")
-    if manifest.get("schema_version") != "g2-evidence-1.1" or manifest.get("snapshot_atomic") is not False:
-        raise EvidenceError("Bad schema or atomic snapshot assertion")
-    if manifest.get("capture_mode") != "OFFLINE_IMPORT_ONLY" or manifest.get("snapshot_consistency_status") != "NOT_ATTEMPTED":
-        raise EvidenceError("Offline tool cannot certify snapshot consistency")
-    if manifest.get("account_id") != scope.get("account_id") or manifest.get("source_baseline_sha") != scope.get("source_baseline_sha"):
-        raise EvidenceError("Scope mismatch")
-    entries = manifest.get("files")
-    if not isinstance(entries, list):
-        raise EvidenceError("Malformed file list")
+    pending = bundle / JOURNAL_NAME
+    if pending.exists() or pending.is_symlink():
+        if not allow_pending:
+            raise EvidenceError("Pending ingest must be explicitly recovered")
+        check_private(pending)
+    manifest_path = bundle / "02_ACQUISITION_MANIFEST.json"
+    scope_path = bundle / "01_SCOPE.json"
+    sums_path = bundle / "03_SHA256SUMS.txt"
+    for path in (bundle / "00_READ_FIRST.md", manifest_path, scope_path, sums_path):
+        check_private(path)
+    manifest = read_json(manifest_path)
+    scope = read_json(scope_path)
+    validate_offline_manifest(manifest, scope)
+    entries = manifest["files"]
     actual = set()
     for child in raw.iterdir():
-        regular_file(child)
+        check_private(child)
         actual.add(f"raw_secure/{child.name}")
-        if os.name == "posix" and (child.stat().st_mode & 0o077):
-            raise EvidenceError("Evidence file is group/world accessible")
     expected = set()
     for entry in entries:
-        name = entry.get("raw_path", "")
-        if not isinstance(name, str) or not name.startswith("raw_secure/") or not FILENAME_RE.fullmatch(name[11:]):
-            raise EvidenceError("Unsafe manifest raw path")
-        if name in expected or not SHA_RE.fullmatch(entry.get("raw_sha256", "")):
-            raise EvidenceError("Duplicate path or invalid digest")
+        name = entry["raw_path"]
+        if name in expected:
+            raise EvidenceError("Duplicate evidence path")
         expected.add(name)
-        data = (bundle / name).read_bytes() if (bundle / name).is_file() and not (bundle / name).is_symlink() else None
-        if data is None or digest(data) != entry["raw_sha256"] or len(data) != entry.get("raw_bytes"):
+        source = bundle / name
+        check_private(source)
+        if source.stat().st_size > MAX_FILE:
+            raise EvidenceError("RAW evidence exceeds size limit")
+        data = source.read_bytes()
+        if digest(data) != entry["raw_sha256"] or len(data) != entry["raw_bytes"]:
             raise EvidenceError("Evidence bytes changed")
-        if entry.get("status") != "PARTIAL" or entry.get("provenance") != "OFFLINE_USER_SUPPLIED_UNVERIFIED":
-            raise EvidenceError("Offline import must remain unverified and partial")
-        inspect_json(data, Path(name).suffix)
+        inspect_json(data, source.suffix)
     if actual != expected:
         raise EvidenceError("Untracked or missing raw evidence")
-    sums_path = bundle / "03_SHA256SUMS.txt"
-    regular_file(sums_path)
     if sums_path.read_bytes() != checksum_lines(entries):
         raise EvidenceError("SHA256SUMS does not match manifest")
     return {"status": "INTEGRITY_VERIFIED_ONLY", "captured_files": len(entries),
             "g2_gate": "NOT_VERIFIED", "snapshot_consistency": "NOT_ATTEMPTED"}
-
 
 def safe_shared_name(value: str) -> bool:
     if not isinstance(value, str):
