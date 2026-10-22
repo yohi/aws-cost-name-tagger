@@ -1,6 +1,6 @@
 # G2 Evidence Acquisition — I0 Offline Foundation
 
-**Status:** IMPLEMENTED FOR OFFLINE INPUT ONLY / NO AWS CONNECTION / NOT AN EXECUTION GRANT  
+**Status:** I0 REVIEW REMEDIATION R1 — IMPLEMENTED FOR OFFLINE INPUT ONLY / NO AWS CONNECTION / NOT AN EXECUTION GRANT  
 **Date:** 2026-10-22 JST  
 **Baseline:** `master d4b3ec819fb70dab1e15b355143b78a93210904d`  
 **Normative design:** `docs/gates/G2_OFFLINE_EVIDENCE_BUNDLE_CONTRACT_R1_2026-10-22.md` (contents R1.1)
@@ -17,11 +17,14 @@ A local import does **not** certify that supplied files originated from AWS or t
 |---|---|---|
 | `init` | Create private bundle directory (0700) and empty manifest | `NOT_ATTEMPTED` |
 | `ingest` | Import manually supplied JSON / JSONL into `raw_secure/` with SHA-256, byte length and evidence metadata | `PARTIAL`; unverified provenance |
-| `verify` | Cross-check raw files against manifest and SHA256SUMS; reject unexpected files, modified bytes, symlinks, over-broad local permissions | `INTEGRITY_VERIFIED_ONLY` |
+| `verify` | Cross-check raw files, strictly pinned Manifest/Scope/entry schema and SHA256SUMS; reject unexpected files, modified bytes, symlinks, unsafe Git moves and broad permissions | `INTEGRITY_VERIFIED_ONLY` |
+| `recover` | Explicitly reconcile an interrupted `ingest` journal: validated rollback if RAW was never written or exact-byte roll-forward if RAW is intact | Never certifies evidence or silently deletes corrupted RAW |
 | `export-shared` | Produce a fresh ZIP exclusively from externally reviewed, digest-approved files in `redacted_shared/` | No independent redaction/security certification |
-| `verify-shared` | Check ZIP CRC and entries; fail on `raw_secure/`, other directories, traversal, duplicates, symlinks and oversized members | ZIP structure only |
+| `verify-shared` | Strict canonical entry paths, CRC, ordinary-file types, comments and extra fields, archive size, and byte-for-byte canonical ZIP reserialization; reject unapproved hidden headers/trailers | ZIP structure only |
 
-**Defensive restrictions:** No output bundles or share ZIPs within any detectable Git working tree (including worktrees with a `.git` file); no archive overwrites; raw files and manifest created with mode 0600. Paths and source API names are constrained; simple key-based scanner rejects credential-like fields before local JSON/JSONL import and before optional JSON share export. **This scanner is not a comprehensive secret detector.** Only use pre-screened sources; stop if prohibited secrets may be present. Encryption at rest, retention, access-control policy, source authenticity and actual approval authenticity are external obligations.
+**Defensive restrictions:** Every bundle operation rechecks that it is outside any detectable Git worktree (including worktrees with a `.git` file). ZIP output uses atomic no-clobber linking to avoid a race with another creator. Private files are opened with exclusive 0600 permissions at creation; verification rechecks RAW and metadata permissions. ZIP paths must use one canonical spelling; comments, extra fields, non-regular files and hidden ZIP prefix/trailer data are rejected. Paths and source API names are constrained; a key-based scanner rejects credential-like fields before local JSON/JSONL import and optional JSON share export. **This scanner is not a comprehensive secret detector.** Only use pre-screened sources; stop if prohibited secrets may be present. Encryption at rest, retention, access-control policy, source authenticity and actual approval authenticity remain external obligations.
+
+**Interrupted ingest protocol (FND-006):** `ingest` preflights `verify`, creates a protected exclusive `04_INGEST_PENDING.json` journal containing old/new manifest and SHA256SUMS hashes and a single evidence record, then writes RAW, Manifest and SHA256SUMS in order. An interruption leaves the journal and `verify` refuses to proceed. Only an explicit `recover` verifies the journal's old/new hashes: if RAW never arrived and old metadata is intact it drops the pending journal; if RAW is intact it deterministically rolls metadata forward. Corruption, unexpected metadata, or a partial RAW refuses recovery and preserves evidence for manual quarantine. This is a **fail-closed process-interruption protocol**, not a cross-file ACID transaction or proof of storage durability during power loss. Do not delete or overwrite a journal to bypass validation.
 
 ## Local example (synthetic data only)
 
@@ -40,6 +43,9 @@ python g2_evidence.py ingest /tmp/g2-demo-20261022 /tmp/g2-example.json \
   --region global --pages 1 --pagination-complete
 
 python g2_evidence.py verify /tmp/g2-demo-20261022
+
+# Only if verify reports a pending interrupted ingest:
+# python g2_evidence.py recover /tmp/g2-demo-20261022
 ```
 
 The `--api`, `--pages` and `--pagination-complete` values are user-reported metadata; they do not verify that an AWS call happened. The example data must **never** be used as production IAM evidence.
@@ -72,7 +78,7 @@ python g2_evidence.py export-shared /tmp/g2-demo-20261022 \
 python g2_evidence.py verify-shared /tmp/g2-demo-share.zip
 ```
 
-The approval file is **self-declared metadata**, not a digital signature. Operator review and secure transfer policy remain mandatory. `verify-shared` cannot detect confidential text under permitted filenames; the response expressly returns `content_redaction_verified: false`.
+The approval file must be stored as a private (0600 on POSIX), non-symlink file. It is **self-declared metadata**, not a digital signature. Operator review and secure transfer policy remain mandatory. `verify-shared` cannot detect confidential text under permitted filenames; the response expressly returns `content_redaction_verified: false`.
 
 ### What is not implemented in I0
 
@@ -84,10 +90,12 @@ The approval file is **self-declared metadata**, not a digital signature. Operat
 
 ## Tests and CI
 
-`python -m unittest -v test_g2_evidence` runs the offline security regression suite; `.github/workflows/g2-offline.yml` runs it with only Python's standard library and an explicit AST check against AWS SDK imports. The original v3.6 Safety Hold CI and `SHA256_MANIFEST.json` baseline are not modified. The legacy manifest protects its original fixed v3.6 file set; it is **not** a checksum attestation for the new G2 files.
+`python -m unittest -v test_g2_evidence` runs the offline security regression suite (including independent-review FND-001..006 regressions); `.github/workflows/g2-offline.yml` runs it with only Python's standard library and an explicit AST check against AWS SDK imports. The original v3.6 Safety Hold CI and `SHA256_MANIFEST.json` baseline are not modified. The legacy manifest protects its original fixed v3.6 file set; it is **not** a checksum attestation for the new G2 files.
 
 ## Gate positions
 
 `G1 NOT PROVEN` / `G2 EVIDENCE ACQUISITION NOT EXECUTED` / `G2 NOT VERIFIED` / `G3/G4 NOT COMPLETED` / `G5/G6 NOT APPROVED` / **AWS WRITE BLOCKED / Safety Hold maintained**.
+
+This foundation remains **REVISION_REQUIRED until a fresh independent review** accepts the remediation and the external SonarCloud Quality Gate is investigated. GitHub Actions unit tests do not substitute for the SonarCloud Security Rating. The specific SonarCloud issue rule and location have not been retrieved through the available GitHub read interface; its failure is not assumed to have been fixed by these changes.
 
 This foundation should undergo independent review before being relied upon for custody of real sensitive evidence.
