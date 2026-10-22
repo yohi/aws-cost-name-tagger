@@ -30,13 +30,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "b1fdaeebf10c2959e5a10c04996e9689b2fa7993d0b901cebb5539aec3c6543b",
-      "bytes": 9843
+      "sha256": "cb8193ba470bc48cededd5b15b56f1943c3002a9c186cf3be628a624f2a9237c",
+      "bytes": 10094
     },
     {
       "path": "SAFETY_REVIEW_RESULT.md",
-      "sha256": "e36a8d8e4424a36b2706ff4e2fb09f2a5ef45b764442101bbc9869092dc3a9bc",
-      "bytes": 3623
+      "sha256": "ee40eb809f7da20d92636a72d3867601e80db82fbfa4f80697f9510ababff532",
+      "bytes": 4103
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
