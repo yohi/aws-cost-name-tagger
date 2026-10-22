@@ -163,6 +163,60 @@ class AlgorithmTests(unittest.TestCase):
             self.assertEqual(len(items),1)
             self.assertEqual(items[0]['effective_usage_cost_usd'],25.0)
 
+    def test_cur_month_inference_uses_all_rows(self):
+        cols=['bill_billing_period_start_date','line_item_usage_account_id','line_item_line_item_type',
+              'line_item_resource_id','line_item_unblended_cost','product_region_code',
+              'line_item_product_code','line_item_currency_code']
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'mixed-periods.csv.gz'
+            with gzip.open(p,'wt',encoding='utf-8',newline='') as f:
+                w=csv.writer(f);w.writerow(cols)
+                w.writerow(['2026-09-01',ACCOUNT,'Usage',VOLUME,'9',REGION,'AmazonEC2','USD'])
+                w.writerow(['2026-10-01',ACCOUNT,'Usage',INSTANCE,'12',REGION,'AmazonEC2','USD'])
+            month,items=t.cur_candidates([str(p)],None,1,100,ACCOUNT)
+        self.assertEqual(month,'2026-10')
+        self.assertEqual([item['locator'] for item in items],[INSTANCE])
+
+    def test_cur_without_rows_requires_explicit_month(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'empty.csv.gz'
+            with gzip.open(p,'wt',encoding='utf-8',newline='') as f:
+                csv.writer(f).writerow(['bill_billing_period_start_date'])
+            with self.assertRaisesRegex(ValueError,'no billing rows.*--month'):
+                t.cur_candidates([str(p)],None,1,100,ACCOUNT)
+
+    def test_plan_rejects_empty_and_unknown_kind_filters(self):
+        for kinds in (' , ', 'volume,unknown'):
+            with self.subTest(kinds=kinds), tempfile.TemporaryDirectory() as tmp:
+                args=type('Args',(),{'cur':['unused.csv.gz'],'month':'2026-10','account':ACCOUNT,
+                    'min_cost':1,'max_resources':10,'kinds':kinds,'output':str(Path(tmp)/'p.json')})()
+                with patch.object(t,'cur_candidates') as cur:
+                    with self.assertRaisesRegex(ValueError,'kind'):
+                        t.plan(args,session=object())
+                    cur.assert_not_called()
+
+    def test_plan_trims_kind_filters_and_drops_empty_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args=type('Args',(),{'cur':['unused.csv.gz'],'month':'2026-10','account':ACCOUNT,
+                'min_cost':1,'max_resources':10,'kinds':' volume, ,snapshot ','output':str(Path(tmp)/'p.json')})()
+            session=FakeSession({'sts':FakeSTS(),'iam':FakeIAM()})
+            with patch.object(t,'cur_candidates',return_value=('2026-10',[])) as cur, \
+                 patch.object(t,'assert_account'), \
+                 patch.object(t,'Investigator'):
+                t.plan(args,session=session)
+            self.assertEqual(cur.call_args.kwargs['kind_filter'],{'volume','snapshot'})
+
+    def test_plan_preflights_outputs_before_reading_cur_or_aws(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/'p.json'
+            output.touch()
+            args=type('Args',(),{'cur':['unused.csv.gz'],'month':'2026-10','account':ACCOUNT,
+                'min_cost':1,'max_resources':10,'kinds':None,'output':str(output)})()
+            with patch.object(t,'cur_candidates',return_value=('2026-10',[])) as cur:
+                with self.assertRaises(SystemExit):
+                    t.plan(args,session=object())
+                cur.assert_not_called()
+
     def test_apply_yes_writes_only_after_matching_live_recheck(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan=Path(tmp)/'p.json';review=Path(tmp)/'review.csv';log=Path(tmp)/'audit.json'
@@ -420,6 +474,19 @@ class InteractiveV3Tests(unittest.TestCase):
                         'product_region_code','line_item_product_code','line_item_currency_code'])
             w.writerow(['2026-10-01',ACCOUNT,'Usage',VOLUME,'10','','',REGION,'AmazonEC2','USD'])
         return Namespace(**d)
+
+    def test_y_mode_preflights_review_outputs_before_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args=self.args(tmp,mode='y')
+            Path(tmp,'p.selected.csv').touch()
+            session=FakeSession({'sts':FakeSTS(),'iam':FakeIAM()})
+            with patch.object(t,'offer_remote_login',return_value=True), \
+                 patch.object(t,'build_session',return_value=session), \
+                 patch.object(t,'choose_mode',return_value='y'), \
+                 patch.object(t,'plan') as plan:
+                with self.assertRaises(SystemExit):
+                    t.run_interactive(args)
+                plan.assert_not_called()
 
     def test_identity_prints_role_and_fails_closed_on_wrong_account(self):
         fake=FakeSession({'sts':FakeSTS(), 'iam':FakeIAM()})

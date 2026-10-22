@@ -14,3 +14,5 @@ ebs_review_plan.json
 *.audit.jsonl
 
 cur/*
+private-reports/
+.*.stage-*/

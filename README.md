@@ -50,7 +50,7 @@
 - `uv.lock` は同梱できていません。指定版の新規インストールは未検証。インターネット接続可能な環境で初回 `uv lock`、`uv sync --locked` を実行してください。
 
 ```bash
-cd aws_cost_name_tagger_v3_6_safety
+# 以下のコマンドはリポジトリのルートディレクトリで実行します。
 uv lock
 uv sync --locked
 uv run --locked python -m unittest -v test_aws_cost_name_tagger_v3

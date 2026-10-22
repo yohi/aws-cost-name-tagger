@@ -74,6 +74,11 @@ def suffix_name(base: str, *parts: str) -> str:
 
 
 NAME_CANDIDATE_STATES = ("ABSENT", "EMPTY")
+SUPPORTED_KINDS = frozenset((
+    "instance", "volume", "snapshot", "eni", "eip", "nat", "endpoint",
+    "rds_cluster", "rds_instance", "opensearch", "elbv2", "apigw_stage",
+    "cloudfront", "athena_workgroup", "log_group", "lambda", "wafv2", "s3_bucket",
+))
 
 
 def tagmap(tags) -> dict:
@@ -199,8 +204,11 @@ def cur_candidates(files: list[str], month: str | None, min_cost: float, max_res
         with gzip.open(filename, "rt", newline="", encoding="utf-8-sig") as stream:
             reader = csv.DictReader(stream)
             for row in reader:
-                periods.add(row["bill_billing_period_start_date"][:7])
-                break
+                period = row.get("bill_billing_period_start_date", "")[:7]
+                if period:
+                    periods.add(period)
+    if month is None and not periods:
+        raise ValueError("CUR input contains no billing rows; specify --month")
     active_month = month or max(periods)
     aggregates = defaultdict(float)
     provenance = defaultdict(lambda: {"services": set(), "billing_rows": 0, "currency": set()})
@@ -983,8 +991,12 @@ def run_interactive(args):
         print("N: 中止しました。AWSタグ・ローカル計画は未変更です。")
         return
     print(f"選択されたモード: {selected}")
-    doc = plan(args, session=session, extra_mode="dryrun" if selected == "dryrun" else None)
     out = Path(args.output)
+    if selected == "y":
+        preflight_outputs([out.with_suffix(".selected.csv"),
+                           out.with_suffix(".audit.jsonl"),
+                           out.with_suffix(".audit.csv")])
+    doc = plan(args, session=session, extra_mode="dryrun" if selected == "dryrun" else None)
     if selected == "dryrun":
         print(f"DRYRUN_REPORT={out.with_suffix('.result.csv')} | writes=0 | AWS変更なし")
         return
@@ -1010,7 +1022,6 @@ def run_interactive(args):
         elif approval not in ("", "n"):
             raise SystemExit("Invalid approval input; no AWS changes")
     preview = out.with_suffix(".selected.csv")
-    preflight_outputs([preview, out.with_suffix(".audit.jsonl"), out.with_suffix(".audit.csv")])
     with private_output(preview, newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=["approved", "proposal_id", "kind", "locator", "region", "name_state", "name_key_present", "name_raw_value", "proposed_name"])
         writer.writeheader()
@@ -1095,7 +1106,21 @@ def write_review_csv(path: Path, records: list[dict]):
 def plan(args, session=None, *, extra_mode=None):
     if not re.fullmatch(r"\d{12}",args.account):raise SystemExit("--account must be 12 digits")
     if not args.cur:raise SystemExit("Provide at least one --cur .csv.gz file")
-    month,candidates=cur_candidates(args.cur,args.month,args.min_cost,args.max_resources,args.account,kind_filter=set(args.kinds.split(",")) if args.kinds else None)
+    out=Path(args.output)
+    review=out.with_suffix(".review.csv")
+    report=out.with_suffix(".report.csv")
+    result=out.with_suffix(".result.csv")
+    destinations=[out, review, report] + ([result] if extra_mode == "dryrun" else [])
+    preflight_outputs(destinations)
+    kind_filter = None
+    if args.kinds is not None:
+        kind_filter = {kind.strip() for kind in args.kinds.split(",") if kind.strip()}
+        if not kind_filter:
+            raise ValueError("--kinds must include at least one supported kind")
+        unknown = kind_filter - SUPPORTED_KINDS
+        if unknown:
+            raise ValueError(f"Unsupported --kinds value(s): {', '.join(sorted(unknown))}")
+    month,candidates=cur_candidates(args.cur,args.month,args.min_cost,args.max_resources,args.account,kind_filter=kind_filter)
     session = session or build_session(args.profile)
     assert_account(session,args.account)
     investigator=Investigator(session,args.account, retries=3)
@@ -1118,12 +1143,6 @@ def plan(args, session=None, *, extra_mode=None):
             rec.update(status="manual_review",confidence="none",
                        evidence=f"Proposed Name collision in batch: {rec['proposed_name']}",proposed_name="")
             rec["proposal_id"]=proposal_key(rec)
-    out=Path(args.output)
-    review=out.with_suffix(".review.csv")
-    report=out.with_suffix(".report.csv")
-    result=out.with_suffix(".result.csv")
-    destinations=[out, review, report] + ([result] if extra_mode == "dryrun" else [])
-    preflight_outputs(destinations)
     doc={"schema_version":2,"generated_at_utc":datetime.now(timezone.utc).isoformat(),"account":args.account,"period":month,
          "metric":"Usage/DiscountedUsage(RI effective)/SavingsPlanCoveredUsage(SP effective); excludes one-time fees, unallocated and no-resource charges",
          "min_cost_usd":args.min_cost,"count":len(records),"records":records}
