@@ -96,6 +96,12 @@ Page ledger必須レコード候補:
 {
   "schema": "g2-collector-page-ledger-proposal-1",
   "plan_sha256": null,
+  "grant_id": null,
+  "grant_checked_at_utc": null,
+  "grant_expires_at_utc": null,
+  "grant_revocation_state": "NOT_VERIFIED",
+  "grant_validation_evidence_id": null,
+  "collector_commit_sha": null,
   "context_id": null,
   "expected_account": "456720798575",
   "observed_account": null,
@@ -104,6 +110,9 @@ Page ledger必須レコード候補:
   "source": null,
   "evidence_id": null,
   "operation": null,
+  "sdk_operation": null,
+  "iam_actions_required": [],
+  "approved_request_scope_fingerprint": null,
   "request_fingerprint_sha256": null,
   "request_id": null,
   "page_index": null,
@@ -164,7 +173,7 @@ Page ledger必須レコード候補:
 
 **R1-005（IAM Filter）:** A01 `GetAccountAuthorizationDetails`はFilter5種類を明示して全ページを照合。PolicyARN→DefaultVersionId→本文SHAと付与関係を再照合する。欠落種別または取得不能policyは`PARTIAL/UNKNOWN`。
 
-**R1-006（Grant取消）:** 全SDKリクエスト直前でGrant有効期限・Owner取消・plan/HEAD・principal/contextを検証。取消後または検証不能なら`STOP_GRANT`、後続API0、未承認RAW隔離。途中リクエストを無条件に巻き戻せるとは主張しない。
+**R1-006（Grant取消）:** 全SDKリクエスト直前でGrant有効期限・Owner取消・plan/HEAD・principal/contextを検証し、その判定時刻・Grant ID・失効状態・証拠IDをpage ledgerにも記録。取消後または検証不能なら`STOP_GRANT`、後続API0、未承認RAW隔離。途中リクエストを無条件に巻き戻せるとは主張しない。
 
 **本R2の状態:** 6件は`RESOLVED_IN_PROPOSAL`であり、独立レビュアーによる正式な`RESOLVED`は未実施。R2修正で設計GateやAWS実行Grantは自動成立しない。
 
