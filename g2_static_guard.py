@@ -53,22 +53,29 @@ def check_ast(source: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    paths = argv if argv is not None else sys.argv[1:]
-    if not paths:
-        print("Must specify the G2 offline modules", file=sys.stderr)
-        return 2
+    # CLI flags may select/order the known modules, but can never choose paths.
+    supplied = argv if argv is not None else sys.argv[1:]
+    expected = ("g2_evidence.py", "g2_collector_contract.py")
+    if len(supplied) != len(expected) or set(supplied) != set(expected):
+        print("Only the two fixed G2 offline modules may be scanned", file=sys.stderr)
+        return 1
+    source_dir = Path(__file__).resolve().parent
+    # These are constant, source-controlled filenames, never built from CLI input.
+    fixed_paths = (
+        source_dir / "g2_evidence.py",
+        source_dir / "g2_collector_contract.py",
+    )
     errors = []
-    for name in paths:
-        path = Path(name)
-        if path.name not in ("g2_evidence.py", "g2_collector_contract.py") or not path.is_file():
-            errors.append("Unexpected scan target")
+    for path in fixed_paths:
+        if path.is_symlink() or not path.is_file():
+            errors.append("Missing or symlinked fixed source")
             continue
         errors.extend(check_ast(path.read_text(encoding="utf-8")))
     if errors:
         for msg in errors:
             print(msg, file=sys.stderr)
         return 1
-    print(f"G2 static import/code guard PASS ({len(paths)} modules)")
+    print("G2 static import/code guard PASS (2 fixed modules)")
     return 0
 
 
