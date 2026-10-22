@@ -37,6 +37,13 @@ class G2OfflineBundleTests(unittest.TestCase):
             self.assertEqual(self.bundle.stat().st_mode & 0o077, 0)
             self.assertEqual((self.bundle / "raw_secure").stat().st_mode & 0o077, 0)
 
+    def test_git_worktree_destination_rejected(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        with self.assertRaises(g2.EvidenceError):
+            g2.init_bundle(repo / "private", ACCOUNT, BASELINE)
+
     def test_no_overwrite_init(self):
         with self.assertRaises(g2.EvidenceError):
             g2.init_bundle(self.bundle, ACCOUNT, BASELINE)
