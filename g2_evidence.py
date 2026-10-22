@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -24,6 +23,25 @@ FORBIDDEN_JSON_KEYS = {"secretaccesskey", "sessiontoken", "clientsecret", "priva
 MAX_FILE = 64 * 1024 * 1024
 MAX_SHARED_TOTAL = 64 * 1024 * 1024
 MAX_SHARED_FILES = 50
+SHARED_RE = re.compile(r"redacted_shared/[A-Za-z0-9][A-Za-z0-9_.-]*\\.(?:json|jsonl)\\Z", re.ASCII)
+IMMUTABLE_LIMITATIONS = ["AWS API was not executed by this tool",
+                         "Completeness and source authenticity are not proven"]
+MANIFEST_KEYS = {
+    "schema_version", "account_id", "source_baseline_sha",
+    "snapshot_started_at_utc", "snapshot_completed_at_utc",
+    "snapshot_atomic", "snapshot_consistency_status",
+    "snapshot_consistency_evidence", "collector_principal_arn",
+    "read_only_assertion", "capture_mode", "files",
+}
+ENTRY_KEYS = {
+    "evidence_id", "source", "raw_path", "derived_path", "api", "region",
+    "scope", "started_at_utc", "completed_at_utc", "pages",
+    "pagination_complete", "status", "provenance", "raw_sha256",
+    "raw_bytes", "derived_sha256", "transform_log_ref", "limitations",
+}
+JOURNAL_KEYS = {"schema_version", "before_manifest_sha256", "after_manifest_sha256",
+                "before_sums_sha256", "after_sums_sha256", "record"}
+JOURNAL_NAME = "04_INGEST_PENDING.json"
 
 
 class EvidenceError(ValueError):
@@ -47,19 +65,26 @@ def regular_file(path: Path) -> None:
         raise EvidenceError(f"Not a regular, non-symlink file: {path}")
 
 
+def check_private(path: Path) -> None:
+    regular_file(path)
+    if os.name == "posix" and (path.stat().st_mode & 0o077):
+        raise EvidenceError("Private metadata must not be group/world accessible")
+
+
 def private_root(bundle: Path) -> Path:
+    require_outside_git(bundle)
     if bundle.is_symlink() or not bundle.is_dir():
         raise EvidenceError("Bundle directory missing or symlink")
     raw = bundle / "raw_secure"
-    if raw.is_symlink() or not raw.is_dir():
-        raise EvidenceError("raw_secure directory missing or symlink")
-    if os.name == "posix" and ((bundle.stat().st_mode & 0o077) or (raw.stat().st_mode & 0o077)):
-        raise EvidenceError("Bundle and raw_secure must not be group/world accessible")
+    for directory in (bundle, raw, bundle / "redacted_shared", bundle / "analysis"):
+        if directory.is_symlink() or not directory.is_dir():
+            raise EvidenceError("Bundle directory missing or symlink")
+        if os.name == "posix" and (directory.stat().st_mode & 0o077):
+            raise EvidenceError("Private bundle directory must not be group/world accessible")
     return raw
 
-
 def read_json(path: Path) -> dict:
-    regular_file(path)
+    check_private(path)
     obj = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(obj, dict):
         raise EvidenceError("Expected a JSON object")
@@ -90,6 +115,8 @@ def write_private(path: Path, data: bytes) -> None:
     with path.open("xb") as out:
         os.chmod(path, 0o600)
         out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
 
 
 def replace_private(path: Path, data: bytes) -> None:
@@ -173,7 +200,7 @@ def ingest(bundle: Path, source_file: Path, evidence_id: str, name: str,
             "status": "PARTIAL", "provenance": "OFFLINE_USER_SUPPLIED_UNVERIFIED",
             "raw_sha256": digest(data), "raw_bytes": len(data),
             "derived_sha256": None, "transform_log_ref": None,
-            "limitations": ["AWS API was not executed by this tool", "Completeness and source authenticity are not proven"]}
+            "limitations": IMMUTABLE_LIMITATIONS}
     write_private(dest, data)
     updated = entries + [item]
     replace_private(manifest_path, json_bytes({**manifest, "files": updated}))
@@ -224,36 +251,43 @@ def verify_bundle(bundle: Path) -> dict:
 
 
 def safe_shared_name(value: str) -> bool:
-    parts = PurePosixPath(value).parts
-    return (len(parts) == 2 and parts[0] == "redacted_shared" and
-            bool(FILENAME_RE.fullmatch(parts[1])) and not value.startswith("/") and "\\" not in value)
+    if not isinstance(value, str):
+        return False
+    return bool(SHARED_RE.fullmatch(value) and PurePosixPath(value).as_posix() == value)
 
 
 def verify_shared(archive: Path) -> dict:
     regular_file(archive)
     total = 0
     with zipfile.ZipFile(archive) as z:
+        if z.comment:
+            raise EvidenceError("ZIP archive comment forbidden")
         infos = z.infolist()
         if not infos or len(infos) > MAX_SHARED_FILES:
             raise EvidenceError("Empty or oversized shared archive")
         seen = set()
         for i in infos:
             name = i.filename
-            if not safe_shared_name(name) or name in seen:
-                raise EvidenceError("Unsafe, duplicate or non-shared ZIP entry")
-            if ((i.external_attr >> 16) & 0o170000) == stat.S_IFLNK:
-                raise EvidenceError("Symlink in archive")
+            canonical = PurePosixPath(name).as_posix()
+            if not safe_shared_name(name) or canonical != name or canonical in seen:
+                raise EvidenceError("Unsafe, noncanonical or duplicate shared ZIP entry")
+            if i.comment or i.extra:
+                raise EvidenceError("ZIP member comments and extra fields forbidden")
+            mode = i.external_attr >> 16
+            if i.create_system != 3 or stat.S_IFMT(mode) != stat.S_IFREG or i.is_dir():
+                raise EvidenceError("ZIP member must be an explicit regular file")
+            if i.compress_type != zipfile.ZIP_DEFLATED or (i.flag_bits & 0x1):
+                raise EvidenceError("Unsupported or encrypted ZIP member")
             if i.file_size > MAX_FILE:
                 raise EvidenceError("Large ZIP member")
             total += i.file_size
             if total > MAX_SHARED_TOTAL:
                 raise EvidenceError("Shared archive size limit")
-            seen.add(name)
+            seen.add(canonical)
         if z.testzip() is not None:
             raise EvidenceError("ZIP CRC failure")
     return {"status": "ZIP_STRUCTURE_VERIFIED_ONLY", "files": len(seen),
             "raw_secure_included": False, "content_redaction_verified": False}
-
 
 def export_shared(bundle: Path, output: Path, approval_file: Path, confirm_reviewed: bool) -> dict:
     verify_bundle(bundle)
@@ -296,7 +330,10 @@ def export_shared(bundle: Path, output: Path, approval_file: Path, confirm_revie
     try:
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for name, data in sorted(approved.items()):
-                z.writestr(name, data)
+                member = zipfile.ZipInfo(name)
+                member.create_system = 3
+                member.external_attr = (stat.S_IFREG | 0o600) << 16
+                z.writestr(member, data, compress_type=zipfile.ZIP_DEFLATED)
         verify_shared(tmp)
         os.replace(tmp, output)
     finally:
