@@ -358,6 +358,28 @@ class G2OfflineBundleTests(unittest.TestCase):
             g2.recover_bundle(self.bundle)
         self.assertTrue((self.bundle / g2.JOURNAL_NAME).exists())
 
+    def test_private_files_are_0600_at_creation(self):
+        if os.name != "posix":
+            self.skipTest("POSIX permissions required")
+        for path in self.bundle.iterdir():
+            if path.is_file():
+                with self.subTest(path=path.name):
+                    self.assertEqual(path.stat().st_mode & 0o077, 0)
+        raw = self.capture()
+        self.assertEqual(raw.stat().st_mode & 0o077, 0)
+
+    def test_concurrent_zip_destination_creation_is_not_overwritten(self):
+        approval = self.approval({"sanitized.json": b'{"count":3}'})
+        destination = self.root / "new.zip"
+        original_link = g2.os.link
+        def concurrent_file(src, dst):
+            Path(dst).write_bytes(b"another operation")
+            return original_link(src, dst)
+        with mock.patch.object(g2.os, "link", side_effect=concurrent_file):
+            with self.assertRaises(FileExistsError):
+                g2.export_shared(self.bundle, destination, approval, True)
+        self.assertEqual(destination.read_bytes(), b"another operation")
+
     def test_raw_dir_world_readable_rejected(self):
         if os.name == "posix":
             (self.bundle / "raw_secure").chmod(0o755)
