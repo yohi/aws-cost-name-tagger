@@ -380,6 +380,10 @@ def recover_bundle(bundle: Path) -> dict:
             or digest(after_sums) != journal["after_sums_sha256"]
             or sums_file.read_bytes() not in (before_sums, after_sums)):
         raise EvidenceError("Recovery checksum or record mismatch")
+    for metadata_file in (manifest_file, sums_file):
+        tmp = metadata_file.with_name(metadata_file.name + ".tmp")
+        if not tmp.is_symlink() and tmp.is_file():
+            tmp.unlink()
     source = bundle / item["raw_path"]
     if not source.exists() and not source.is_symlink():
         if current_sha != before or sums_file.read_bytes() != before_sums:
@@ -466,6 +470,8 @@ def export_shared(bundle: Path, output: Path, approval_file: Path, confirm_revie
     shared_dir = bundle / "redacted_shared"
     if shared_dir.is_symlink() or not shared_dir.is_dir():
         raise EvidenceError("Shared directory missing or symlink")
+    manifest = read_json(bundle / "02_ACQUISITION_MANIFEST.json")
+    raw_digests = {entry["raw_sha256"] for entry in manifest["files"]}
     approved = {}
     for item in entries:
         path = item.get("path", "")
@@ -478,6 +484,8 @@ def export_shared(bundle: Path, output: Path, approval_file: Path, confirm_revie
         data = source.read_bytes()
         if digest(data) != item["sha256"]:
             raise EvidenceError("Approval digest mismatch")
+        if item["sha256"] in raw_digests:
+            raise EvidenceError("Shared item matches RAW evidence")
         if source.suffix in (".json", ".jsonl"):
             inspect_json(data, source.suffix)
         approved[path] = data

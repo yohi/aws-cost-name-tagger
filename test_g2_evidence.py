@@ -144,6 +144,17 @@ class G2OfflineBundleTests(unittest.TestCase):
         with self.assertRaises(g2.EvidenceError):
             g2.export_shared(self.bundle, self.root / "shared.zip", approval, False)
 
+    def test_export_rejects_approved_copy_of_any_raw_evidence(self) -> None:
+        # Given multiple RAW records and an approved, renamed copy of the second.
+        self.capture()
+        raw = self.capture(name="other.json", content={"private": "second-record"})
+        approval = self.approval({"renamed.json": raw.read_bytes()})
+        dest = self.root / "shared.zip"
+        # When exporting, then RAW bytes must be rejected before ZIP creation.
+        with self.assertRaises(g2.EvidenceError):
+            g2.export_shared(self.bundle, dest, approval, True)
+        self.assertFalse(dest.exists())
+
     def test_unapproved_sanitized_file_is_not_exported(self):
         approval = self.approval({"approved.json": b'{"count":2}'})
         (self.bundle / "redacted_shared" / "not_approved.json").write_text('{"other":true}')
@@ -343,6 +354,58 @@ class G2OfflineBundleTests(unittest.TestCase):
             g2.verify_bundle(self.bundle)
         self.assertEqual(g2.recover_bundle(self.bundle)["status"], "ROLLED_BACK_NO_RAW")
         self.assertEqual(g2.verify_bundle(self.bundle)["captured_files"], 0)
+
+    def test_recovery_removes_stale_regular_metadata_temps(self) -> None:
+        with mock.patch.object(g2, "replace_private", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.capture()
+        temps = [self.bundle / (name + ".tmp") for name in
+                 ("02_ACQUISITION_MANIFEST.json", "03_SHA256SUMS.txt")]
+        for temp in temps:
+            g2.write_private(temp, b"incomplete metadata")
+        self.assertEqual(g2.recover_bundle(self.bundle)["status"], "RECOVERED_ROLL_FORWARD")
+        self.assertTrue(all(not temp.exists() for temp in temps))
+        self.assertEqual(g2.verify_bundle(self.bundle)["captured_files"], 1)
+
+    def test_recovery_preserves_unsafe_metadata_temps(self) -> None:
+        with mock.patch.object(g2, "replace_private", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.capture()
+        target = self.root / "untouched.json"
+        target.write_bytes(b"untouched")
+        manifest_temp = self.bundle / "02_ACQUISITION_MANIFEST.json.tmp"
+        sums_temp = self.bundle / "03_SHA256SUMS.txt.tmp"
+        for temp in (manifest_temp, sums_temp):
+            with self.subTest(temp=temp.name):
+                temp.symlink_to(target)
+                with self.assertRaises(g2.EvidenceError):
+                    g2.recover_bundle(self.bundle)
+                self.assertTrue(temp.is_symlink())
+                self.assertEqual(target.read_bytes(), b"untouched")
+                temp.unlink()
+                temp.mkdir()
+                with self.assertRaises(g2.EvidenceError):
+                    g2.recover_bundle(self.bundle)
+                self.assertTrue(temp.is_dir())
+                temp.rmdir()
+        self.assertTrue((self.bundle / g2.JOURNAL_NAME).exists())
+
+    def test_recovery_preserves_temps_when_journal_digests_are_invalid(self) -> None:
+        with mock.patch.object(g2, "replace_private", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.capture()
+        pending = self.bundle / g2.JOURNAL_NAME
+        journal = g2.read_json(pending)
+        journal["after_manifest_sha256"] = "0" * 64
+        pending.write_bytes(g2.json_bytes(journal))
+        temps = [self.bundle / (name + ".tmp") for name in
+                 ("02_ACQUISITION_MANIFEST.json", "03_SHA256SUMS.txt")]
+        for temp in temps:
+            g2.write_private(temp, b"preserve for inspection")
+        with self.assertRaises(g2.EvidenceError):
+            g2.recover_bundle(self.bundle)
+        for temp in temps:
+            self.assertEqual(temp.read_bytes(), b"preserve for inspection")
 
     def test_interrupted_raw_corruption_blocks_recovery(self):
         original_replace = g2.replace_private
