@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from g2_evidence import inspect_json
@@ -76,16 +76,17 @@ def _time(value: str) -> datetime:
 
 
 def build_plan(account: str, regions: tuple[str, ...],
-               start_utc: str, end_utc: str) -> tuple[Probe, ...]:
+               start_utc: str, end_utc: str, as_of_utc: str) -> tuple[Probe, ...]:
     """Build explicit bounded read-only probes; never infer region coverage."""
     if not isinstance(account, str) or not ACCOUNT.fullmatch(account):
         raise ContractError("Invalid account")
     if (not regions or len(regions) > MAX_REGIONS or len(set(regions)) != len(regions)
             or any(not isinstance(r, str) or not REGION.fullmatch(r) for r in regions)):
         raise ContractError("Explicit distinct AWS regions required")
-    start, end = _time(start_utc), _time(end_utc)
-    if not start < end or (end - start).total_seconds() > 90 * 86400:
-        raise ContractError("Explicit bounded event period of at most 90 days required")
+    start, end, as_of = _time(start_utc), _time(end_utc), _time(as_of_utc)
+    if (not start < end or start < as_of - timedelta(days=90)
+            or end > as_of):
+        raise ContractError("Event History window must be within the 90 days before as_of_utc")
     queries = [
         Probe("iam_authorization", "G2-A01", "IAM", "iam",
               "GetAccountAuthorizationDetails", "global",
@@ -115,28 +116,87 @@ def build_plan(account: str, regions: tuple[str, ...],
     return tuple(queries)
 
 
-class FixturePort:
-    """Exactly this class is accepted. Has no network or SDK capability."""
+def fixture_key(service: str, operation: str, region: str,
+                arguments: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Exact request identity, including Filter, time window, and pagination token."""
+    if (service, operation) not in ALLOWED_OPERATIONS or not isinstance(arguments, dict):
+        raise ContractError("Not an allowed synthetic read request")
+    try:
+        serialized = json.dumps(arguments, sort_keys=True, separators=(",", ":"),
+                                ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ContractError("Malformed fixture request") from exc
+    return service, operation, region, serialized
 
-    def __init__(self, responses: dict[tuple[str, str, str], list[object]]) -> None:
+
+class FixturePort:
+    """No network capability. Fixture responses are matched on the *full* request."""
+
+    def __init__(self, responses: dict[tuple[str, str, str, str], list[object]]) -> None:
         self._responses = copy.deepcopy(responses)
         self.calls: list[tuple[str, str, str, dict[str, Any]]] = []
 
     def call(self, service: str, operation: str, region: str,
              arguments: dict[str, Any]) -> dict[str, Any]:
-        if (service, operation) not in ALLOWED_OPERATIONS:
-            raise ContractError("Non-allowlisted operation")
+        key = fixture_key(service, operation, region, arguments)
         self.calls.append((service, operation, region, copy.deepcopy(arguments)))
-        key = (service, operation, region)
         queue = self._responses.get(key, [])
         if not queue:
-            raise FixtureFailure("No synthetic response registered")
+            raise FixtureFailure("No fixture for exact request arguments or token")
         item = queue.pop(0)
         if isinstance(item, (FixtureFailure, FixtureAccessDenied)):
             raise item
         if not isinstance(item, dict):
             raise ContractError("Fixture response must be an object")
         return copy.deepcopy(item)
+
+
+COLLECTIONS = {
+    ("organizations", "ListParents"): "Parents",
+    ("organizations", "ListPoliciesForTarget"): "Policies",
+    ("sso-admin", "ListInstances"): "Instances",
+    ("cloudtrail", "ListTrails"): "Trails",
+    ("cloudtrail", "LookupEvents"): "Events",
+    ("cloudtrail", "ListEventDataStores"): "EventDataStores",
+}
+IAM_LISTS = ("UserDetailList", "GroupDetailList", "RoleDetailList", "Policies")
+
+
+def validate_response(service: str, operation: str, request: dict[str, Any],
+                      page: dict[str, Any]) -> None:
+    """Required top-level AWS API collection shapes, not full AWS model validation."""
+    if not isinstance(page, dict):
+        raise ContractError("Fixture response must be an object")
+    if (service, operation) == ("sts", "GetCallerIdentity"):
+        account = page.get("Account")
+        if not isinstance(account, str) or not ACCOUNT.fullmatch(account):
+            raise ContractError("Malformed synthetic identity")
+    elif (service, operation) == ("organizations", "DescribeOrganization"):
+        org = page.get("Organization")
+        if not isinstance(org, dict) or not isinstance(org.get("Id"), str) or not org["Id"]:
+            raise ContractError("Missing organization identity")
+    elif (service, operation) == ("iam", "GetAccountAuthorizationDetails"):
+        if type(page.get("IsTruncated")) is not bool:
+            raise ContractError("Missing or invalid IAM IsTruncated")
+        if not any(k in page for k in IAM_LISTS):
+            raise ContractError("IAM collections all missing")
+        for field in IAM_LISTS:
+            if field in page and (not isinstance(page[field], list)
+                                  or any(not isinstance(x, dict) for x in page[field])):
+                raise ContractError("Invalid IAM collection")
+    else:
+        field = COLLECTIONS.get((service, operation))
+        if field is None:
+            raise ContractError("Unrecognized synthetic response schema")
+        collection = page.get(field)
+        if not isinstance(collection, list) or any(not isinstance(x, dict) for x in collection):
+            raise ContractError("Missing or malformed API result collection")
+        if (service, operation) == ("organizations", "ListPoliciesForTarget"):
+            expected = request.get("Filter")
+            if any(x.get("Type") != expected for x in collection):
+                raise ContractError("Policy type does not match requested SCP/RCP filter")
+    if "NextToken" in page and page["NextToken"] is not None and not isinstance(page["NextToken"], str):
+        raise ContractError("Non-string pagination token")
 
 
 def _safe_bytes(page: dict[str, Any]) -> bytes:
@@ -161,6 +221,7 @@ def _execute(port: FixturePort, probe: Probe) -> dict[str, Any]:
         try:
             page = port.call(probe.service, probe.operation, probe.region, request)
             payload = _safe_bytes(page)
+            validate_response(probe.service, probe.operation, request, page)
         except FixtureAccessDenied:
             status, reason = "ACCESS_DENIED", "SYNTHETIC_DENIAL"
             break
@@ -201,23 +262,24 @@ def _execute(port: FixturePort, probe: Probe) -> dict[str, Any]:
 
 
 def run_simulation(port: FixturePort, account: str, regions: tuple[str, ...],
-                   start_utc: str, end_utc: str) -> dict[str, Any]:
+                   start_utc: str, end_utc: str, as_of_utc: str) -> dict[str, Any]:
     """No AWS calls or I0 data writes. Fail identity before all other probes."""
     if type(port) is not FixturePort:
         raise ContractError("Only the exact synthetic FixturePort is accepted")
-    plan = build_plan(account, regions, start_utc, end_utc)
+    plan = build_plan(account, regions, start_utc, end_utc, as_of_utc)
 
     def identity() -> tuple[bool, str | None]:
         try:
             data = port.call("sts", "GetCallerIdentity", "global", {})
             _safe_bytes(data)
+            validate_response("sts", "GetCallerIdentity", {}, data)
         except (FixtureAccessDenied, FixtureFailure, ContractError):
             return False, None
         return data.get("Account") == account, data.get("Account")
 
     valid_start, observed = identity()
     if not valid_start:
-        return {"status": "ABORTED_IDENTITY", "expected_account": account,
+        return {"status": "ABORTED_IDENTITY", "as_of_utc": as_of_utc, "expected_account": account,
                 "observed_account": observed, "probes": [], "g2_gate": "NOT_VERIFIED",
                 "snapshot_atomic": False, "aws_calls": 0}
     probes = [_execute(port, p) for p in plan]
@@ -235,6 +297,7 @@ def run_simulation(port: FixturePort, account: str, regions: tuple[str, ...],
         consistency = "SIMULATED_IAM_MATCH_ONLY"
     return {
         "status": "MOCK_ONLY_PARTIAL_COVERAGE",
+        "as_of_utc": as_of_utc,
         "expected_account": account, "observed_account": observed,
         "probes": probes, "begin_end_iam": {"begin": first_iam["status"],
                                           "end": end_iam["status"],
