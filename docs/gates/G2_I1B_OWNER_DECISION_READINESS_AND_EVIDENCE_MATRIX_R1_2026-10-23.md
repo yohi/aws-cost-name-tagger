@@ -151,11 +151,24 @@ RCPは管理アカウントResourceには適用されず、対象は対応サー
 15. **IAM Filter:** 5種別以外、部分ページ、DefaultVersionIdとPolicy ARN不一致、Policy本文未取得を`PARTIAL/UNKNOWN`にする。
 16. **Grant実行中失効:** 1ページ目完了後にOwner取消/満了/取消照会不能/planやHEAD不一致→2ページ目以降AWS API0、未承認RAW seal、別Grantなしの再開禁止。in-flightは取消可能と主張しない。
 
+## 4A. R1 Finding Closure Tracker（R2提案上の状態）
+
+| Finding | Major/Minor | R2の証拠箇所 | 現時点の判定 |
+|---|---|---|---|
+| R1-001 | Major | 参照設計`2 SDK↔IAM Action表、S3 request bound、受入試験11 | RESOLVED_IN_PROPOSAL |
+| R1-002 | Major | 参照設計`2 P1/P2-Lake別行、A05-Lake-Organization、受入試験12 | RESOLVED_IN_PROPOSAL |
+| R1-003 | Major | 本表`2AのActor×Resource適用判定表、A04×A06、受入試験13 | RESOLVED_IN_PROPOSAL |
+| R1-004 | Major | 本表`2Bの時系列coverage、参照設計`8、受入試験14 | RESOLVED_IN_PROPOSAL |
+| R1-005 | Minor | A01 Filter5種類とDefaultVersionId・本文ハッシュ照合、受入試験15 | RESOLVED_IN_PROPOSAL |
+| R1-006 | Minor | 本表`2Cおよび参照設計page ledgerのGrant再検証、受入試験16 | RESOLVED_IN_PROPOSAL |
+
+**正式クローズではない。** 著者側がR2の是正を記述したことと、過去の独立レビュアーまたは新規レビュアーによる`RESOLVED`判定は別である。現Gateは`R1 REVISION_REQUIRED / R2 INDEPENDENT_REVIEW_PENDING`。
+
 ## 5. Independent Design Review依頼内容
 
 独立レビュアーには次を要求する。
 
-- G2 R1.1原文と本R1の**正規スコープ差分**（勝手な認可拡張・候補API不足・Source漏れ）、P1〜P4のIAM principalと実行権限分離を追跡する。
+- G2 R1.1原文と本R2の**正規スコープ差分**（勝手な認可拡張・候補API不足・Source漏れ）、P1〜P4とP2-LakeのIAM principalと実行権限分離を追跡する。
 - 具体的に不足するAPI・condition・resource-level IAM対応、CloudTrail 3ソースでの非原子的なcoverage、Identity Center Permission Set/Group/Roleマッピング、OU/root SCP/RCP継承を反証可能なFindingとして示す。
 - RAW保存と公開ZIPの安全性、認証情報漏洩、失敗・中断、将来のOwner署名と実行者の分離を評価する。
 - **提出判定は`ACCEPTABLE_IN_DESIGN`または`REVISION_REQUIRED`等の設計に限る**。`AWS GRANT APPROVED`／`G2 VERIFIED`を自動付与しない。
