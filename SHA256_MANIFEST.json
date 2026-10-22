@@ -4,19 +4,14 @@
   "source_v35_outer_sha256": "1a88b2d9986bb767306ef107b323a4ee65f82eeaa5bba1915ac15afd37110172",
   "files": [
     {
+      "path": ".github/workflows/ci.yml",
+      "sha256": "1e9a7adf698631fbe9b35f2329445f08430915c92d3c07828f7c761b1c95aa5b",
+      "bytes": 2137
+    },
+    {
       "path": ".gitignore",
       "sha256": "521857aea232eb698cc31b0d641f7da933fc364cf73188941cb0a3ca77800bf1",
       "bytes": 181
-    },
-    {
-      "path": "README.md",
-      "sha256": "446ceb7a8bb6dcc17106144b5b4fd33416a4f2901130d4ac72c04e2dd345a0fa",
-      "bytes": 8104
-    },
-    {
-      "path": "SAFETY_REVIEW_RESULT.md",
-      "sha256": "7d2dcf43cacbc223dd5fa5dd072726a6e2c501eeaa6659ead3dadb92a5c6d771",
-      "bytes": 2025
     },
     {
       "path": "aws_cost_name_tagger_v3.py",
@@ -34,6 +29,16 @@
       "bytes": 439
     },
     {
+      "path": "README.md",
+      "sha256": "b1fdaeebf10c2959e5a10c04996e9689b2fa7993d0b901cebb5539aec3c6543b",
+      "bytes": 9843
+    },
+    {
+      "path": "SAFETY_REVIEW_RESULT.md",
+      "sha256": "e36a8d8e4424a36b2706ff4e2fb09f2a5ef45b764442101bbc9869092dc3a9bc",
+      "bytes": 3623
+    },
+    {
       "path": "test_aws_cost_name_tagger_v3.py",
       "sha256": "c1d640e78b2a405ab1ebc548472b9e6c5fb946de7d6b1b464e082c00ae9855a0",
       "bytes": 53052
@@ -47,6 +52,12 @@
       "path": "uv_lock_attempt.txt",
       "sha256": "c445a2856d577a034e82231215c7038bedff8761f9cb9b7f3ce0a55341385ee0",
       "bytes": 300
+    },
+    {
+      "path": "uv.lock",
+      "sha256": "d965d0dda31681a2a7d523f62e50edd3900ca80a4abd3de96353b89fcca09021",
+      "bytes": 15896
     }
-  ]
+  ],
+  "repository_note": "GitHub feature branch: includes committed uv.lock and Safety Hold CI; test_results.txt and uv_lock_attempt.txt retain historical ZIP-era results."
 }
