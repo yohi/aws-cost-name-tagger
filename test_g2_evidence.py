@@ -380,6 +380,14 @@ class G2OfflineBundleTests(unittest.TestCase):
                 g2.export_shared(self.bundle, destination, approval, True)
         self.assertEqual(destination.read_bytes(), b"another operation")
 
+    def test_shared_zip_with_appended_hidden_bytes_rejected(self):
+        approval = self.approval({"sanitized.json": b'{"count":4}'})
+        archive = self.root / "shared.zip"
+        g2.export_shared(self.bundle, archive, approval, True)
+        archive.write_bytes(archive.read_bytes() + b"UNAPPROVED_TRAILING_DATA")
+        with self.assertRaises(g2.EvidenceError):
+            g2.verify_shared(archive)
+
     def test_raw_dir_world_readable_rejected(self):
         if os.name == "posix":
             (self.bundle / "raw_secure").chmod(0o755)
