@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -407,6 +408,8 @@ def safe_shared_name(value: str) -> bool:
 
 def verify_shared(archive: Path) -> dict:
     regular_file(archive)
+    if archive.stat().st_size > MAX_SHARED_TOTAL + MAX_SHARED_FILES * 1024:
+        raise EvidenceError("Shared ZIP archive exceeds bounded input size")
     total = 0
     with zipfile.ZipFile(archive) as z:
         if z.comment:
@@ -435,6 +438,18 @@ def verify_shared(archive: Path) -> dict:
             seen.add(canonical)
         if z.testzip() is not None:
             raise EvidenceError("ZIP CRC failure")
+        # Rebuild exact canonical bytes to reject hidden data in local headers,
+        # unindexed members, prefixes, trailers and other metadata channels.
+        expected = io.BytesIO()
+        with zipfile.ZipFile(expected, "w", compression=zipfile.ZIP_DEFLATED) as canonical_zip:
+            for info in infos:
+                canonical_member = zipfile.ZipInfo(info.filename)
+                canonical_member.create_system = 3
+                canonical_member.external_attr = (stat.S_IFREG | 0o600) << 16
+                canonical_zip.writestr(canonical_member, z.read(info),
+                                       compress_type=zipfile.ZIP_DEFLATED)
+        if archive.read_bytes() != expected.getvalue():
+            raise EvidenceError("ZIP contains noncanonical bytes outside approved file content")
     return {"status": "ZIP_STRUCTURE_VERIFIED_ONLY", "files": len(seen),
             "raw_secure_included": False, "content_redaction_verified": False}
 
