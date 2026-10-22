@@ -112,8 +112,10 @@ def inspect_json(data: bytes, suffix: str) -> None:
 
 
 def write_private(path: Path, data: bytes) -> None:
-    with path.open("xb") as out:
-        os.chmod(path, 0o600)
+    # Open securely at creation time; chmod-after-open leaves a permission window.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as out:
         out.write(data)
         out.flush()
         os.fsync(out.fileno())
@@ -482,7 +484,8 @@ def export_shared(bundle: Path, output: Path, approval_file: Path, confirm_revie
                 member.external_attr = (stat.S_IFREG | 0o600) << 16
                 z.writestr(member, data, compress_type=zipfile.ZIP_DEFLATED)
         verify_shared(tmp)
-        os.replace(tmp, output)
+        # Atomically refuse existing destinations, including a concurrent creation.
+        os.link(tmp, output)
     finally:
         tmp.unlink(missing_ok=True)
     return {"status": "SHARED_ZIP_CREATED_WITH_APPROVAL_METADATA", "files": len(approved),
