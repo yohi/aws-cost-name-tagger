@@ -28,9 +28,9 @@ A local import does **not** certify that supplied files originated from AWS or t
 
 ## Trusted CLI workspace and synthetic example
 
-The CLI requires an operator-controlled **absolute** \`G2_EVIDENCE_WORKSPACE\` environment variable. This is a local private workspace selected by the operator, not a path accepted from a remote request or LLM-provided argument. It must be outside all Git worktrees and use mode 0700 on POSIX. Pre-create four private subdirectories: \`bundles/\`, \`incoming/\`, \`approvals/\`, and \`exports/\`. Every CLI path is an absolute **direct child** in its appropriate area. Path traversal, symbolic links, relative paths, and arbitrary filesystem locations are refused before an operation begins. Direct use of the Python library must still be restricted to trusted local callers; a CLI workspace is **not a sandbox** and does not defend against a fully malicious same-user process.
+The CLI requires an operator-controlled **absolute** `G2_EVIDENCE_WORKSPACE` environment variable. This is a local private workspace selected by the operator, not a path accepted from a remote request or LLM-provided argument. It must be outside all Git worktrees and use mode 0700 on POSIX. Pre-create four private subdirectories: `bundles/`, `incoming/`, `approvals/`, and `exports/`. Every CLI path is an absolute **direct child** in its appropriate area. Path traversal, symbolic links, relative paths, and arbitrary filesystem locations are refused before an operation begins. Direct use of the Python library must still be restricted to trusted local callers; a CLI workspace is **not a sandbox** and does not defend against a fully malicious same-user process.
 
-\`\`\`bash
+```bash
 # Use a trusted private volume OUTSIDE the repository:
 export G2_EVIDENCE_WORKSPACE=/tmp/g2-private-20261022
 mkdir -m 700 "$G2_EVIDENCE_WORKSPACE"
@@ -53,13 +53,13 @@ python g2_evidence.py verify "$G2_EVIDENCE_WORKSPACE/bundles/demo"
 
 # Only if verify reports a pending interrupted import:
 # python g2_evidence.py recover "$G2_EVIDENCE_WORKSPACE/bundles/demo"
-\`\`\`
+```
 
-The \`--api\`, \`--pages\` and \`--pagination-complete\` arguments are self-reported offline metadata, **not** evidence of actual AWS calls. The example is synthetic and must not be used for production IAM evidence.
+The `--api`, `--pages` and `--pagination-complete` arguments are self-reported offline metadata, **not** evidence of actual AWS calls. The example is synthetic and must not be used for production IAM evidence.
 
 ### Shared ZIP export (requires a separate human review)
 
-1. Independently sanitize and review the output; place only that derivative under `/tmp/g2-demo-20261022/redacted_shared/`. Never copy any raw file directly as if it had been redacted.
+1. Independently sanitize and review the output; place only that derivative under `$G2_EVIDENCE_WORKSPACE/bundles/demo/redacted_shared/`. Never copy any raw file directly as if it had been redacted.
 2. Compute the **derivative** SHA-256 and produce an **external**, operator-maintained approval JSON. The program does not generate approvals:
 
 ```json
@@ -75,9 +75,9 @@ The \`--api\`, \`--pages\` and \`--pagination-complete\` arguments are self-repo
 }
 ```
 
-3. Place the approval file inside the private \`approvals/\` directory (mode 0600). Export only to \`exports/\`:
+3. Place the approval file inside the private `approvals/` directory (mode 0600). Export only to `exports/`:
 
-\`\`\`bash
+```bash
 python g2_evidence.py export-shared \
   "$G2_EVIDENCE_WORKSPACE/bundles/demo" \
   "$G2_EVIDENCE_WORKSPACE/exports/demo-share.zip" \
@@ -86,7 +86,7 @@ python g2_evidence.py export-shared \
 
 python g2_evidence.py verify-shared \
   "$G2_EVIDENCE_WORKSPACE/exports/demo-share.zip"
-\`\`\`
+```
 
 The approval file must be stored as a private (0600 on POSIX), non-symlink file. It is **self-declared metadata**, not a digital signature. Operator review and secure transfer policy remain mandatory. `verify-shared` cannot detect confidential text under permitted filenames; the response expressly returns `content_redaction_verified: false`.
 
