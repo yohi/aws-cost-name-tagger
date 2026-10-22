@@ -33,16 +33,18 @@ jobs:
           import ast
           from pathlib import Path
 
-          tree = ast.parse(Path("g2_evidence.py").read_text(encoding="utf-8"))
-          forbidden = ("boto3", "botocore", "awscrt")
-          for node in ast.walk(tree):
-              if isinstance(node, ast.Import):
-                  assert not any(alias.name.startswith(forbidden) for alias in node.names)
-              elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                  assert not node.module.startswith(forbidden), node.module
-          print("No AWS SDK imports in G2 offline module")
+          for path in ("g2_evidence.py", "g2_collector_contract.py"):
+              tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+              forbidden = ("boto3", "botocore", "awscrt", "socket",
+                           "requests", "urllib", "subprocess")
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      assert not any(alias.name.startswith(forbidden) for alias in node.names)
+                  elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                      assert not node.module.startswith(forbidden), node.module
+          print("No AWS SDK or network imports in either G2 offline module")
           PY
 
       - name: G2 offline evidence tests (standard-library only)
         run: |
-          python -m unittest -v test_g2_evidence
+          python -m unittest -v test_g2_evidence test_g2_collector_contract
