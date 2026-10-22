@@ -47,7 +47,7 @@
 
 - Python 3.10以降、`uv`、対話型 `aws login --remote` を利用する場合は対応AWS CLI。
 - `pyproject.toml`: `boto3[crt]==1.43.116`。
-- **このGitHubリポジトリには `uv.lock` をコミット済み**で、`boto3[crt]==1.43.116` がロックされています。元のv3.6配布ZIPには `uv.lock` が含まれていません。指定依存環境のCI結果はGitHub Actionsで確認してください。
+- **このGitHubリポジトリには `uv.lock` をコミット済み**で、`boto3[crt]==1.43.116` がロックされています。元のv3.6配布ZIPには `uv.lock` が含まれていません。2026-10-22にGitHub Actionsで指定環境の **76/76 テストPASS（2通り）** を確認しました。
 
 ```bash
 # 以下のコマンドはリポジトリのルートディレクトリで実行します。
@@ -104,6 +104,6 @@ uv run --locked python aws_cost_name_tagger_v3.py run \
 1. Python 3.12 と uv を準備し、`uv sync --locked` で依存関係を固定してインストール。
 2. Boto3 `1.43.116` とAWS CRTをimportして依存バージョンを確認。
 3. `SHA256_MANIFEST.json` に記載されたファイルのSHA-256とサイズを確認（`uv.lock` とCI workflowも含む）。
-4. `uv run --locked python -m unittest -q test_aws_cost_name_tagger_v3` および直接実行でSafety Holdを含む70件のテストを検証。
+4. `uv run --locked python -m unittest -q test_aws_cost_name_tagger_v3` および直接実行でSafety Holdを含む現行76件のテストを検証（追加テスト数はリポジトリの更新により変わります）。
 
-**CIの実行結果はGitHub Actions上のRunが根拠です。** ワークフローの追加・ロックファイルの存在だけでPASSとはしません。依存関係の更新が必要な場合は、別変更で `uv lock` を実行して `uv.lock` とマニフェストを更新します。Safety Holdの解除やタグ書き込みは行いません。
+**CIの実行結果は[GitHub Actions Run #39702373325](https://github.com/yohi/aws-cost-name-tagger/actions/runs/39702373325)で確認済みです。** このRunでは依存関係固定、Boto3/CRT、マニフェスト11ファイル、両実行方法のテスト76/76がすべてPASSしました。依存関係の更新が必要な場合は、別変更で `uv lock` を実行して `uv.lock` とマニフェストを更新します。Safety Holdの解除やタグ書き込みは行いません。
