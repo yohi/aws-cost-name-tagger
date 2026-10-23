@@ -53,7 +53,7 @@
 
 ## 2. Readinessマトリクス — 三段階の依存関係と停止条件（FND-PR9-001/003）
 
-**循環を禁止するフェーズ定義:**
+**循環を禁止するフェーズ定義:** `PRE_EXECUTION`内部では`PRE_EXECUTION_TECHNICAL_ACCEPTANCE`（機構・Host・実装の受入）→`OWNER_EXECUTION_AUTHORIZATION`（実際のGrant発行）を**順序付きの別条件**とし、前者に「発行済みOwner Grant」を要求しない。
 
 - **`PRE_EXECUTION`**：初回の実AWS read-only送信**より前**に必要な実装・セキュリティ受入。選定構成における一意なSAES権威・完全仲介・耐久状態、実送信境界、RAW保管基盤、固定Runtime HEADの独立審査、Host境界受入、明示的な人間Ownerの限定Grantなど。未成立ならAWS Evidence Acquisitionを禁止。
 - **`EVIDENCE_ACQUISITION`**：PRE_EXECUTIONの全前提が通過し、別途人間Ownerが発行した**対象限定・期限付きread-only Grant**の範囲で、実AWSのRAWをSource別に取得する段階。収集中の不整合、アクセス不能、欠落は`UNKNOWN/PARTIAL/NOT_ATTEMPTED`として記録。**G2 VERIFIEDは取得開始条件ではない。**
@@ -61,7 +61,7 @@
 
 | ID | 義務とフェーズ | D2/設計の既存証拠 | 現在の未証明部分 | 正確なGate効果 |
 |---|---|---|---|---|
-| IR-01 | **PRE_EXECUTION** Owner署名Grantの真正性、scope/TTL/plan/HEAD/principal binding、取消Auth | 合成SAES Grant状態と規範 | 実署名・本人性・取消権限・鍵管理・replay防止 NOT_PROVEN | **PRE_EXECUTION_BLOCK** |
+| IR-01 | **PRE_EXECUTION（技術受入→Owner発行後照合）** Owner署名Grantの検証機構、scope/TTL/plan/HEAD/principal binding、取消Auth | 合成SAES Grant状態と規範 | 技術受入時点は署名**検証機構・鍵保護・replay防止の試験**がNOT_PROVEN。**実際のGrant原本はIR-13のOwner決裁後にのみ存在し、実行開始時に照合** | 検証機構不在は**PRE_EXECUTION_TECHNICAL_BLOCK**。未発行・無効なGrantは**OWNER_GRANT_BLOCK** |
 | IR-02 | **PRE_EXECUTION** GatewayのみがAWS向けegressできる隔離と完全仲介 | SAES専有の参照設計 | OS/net/sidecar/provider/redirectの経路閉包 NOT_PROVEN | **PRE_EXECUTION_BLOCK** |
 | IR-03 | **PRE_EXECUTION** 採用構成での**一意なAuthority・耐久状態・送信/取消の線形化・旧経路排除** | 単一プロセス`RLock`とsyntheticイベント | durable ledger/partition/crash/epoch・fencing NOT_IMPLEMENTED。**Replica/leader選挙はReplica採用時のみ必要** | **PRE_EXECUTION_BLOCK** |
 | IR-04 | **PRE_EXECUTION** 取消成功ACK後の新規Gateway-local送信0・不明Gatewayなら成功拒否 | Synthetic fencing witnessとACK順序 | 実Gateway停止・旧経路の排除・取消信号真正性 NOT_PROVEN。**旧Leader fencingはLeader交代を採用した場合の追加義務** | **PRE_EXECUTION_BLOCK** |
@@ -73,12 +73,12 @@
 | IR-10 | **EVIDENCE_ACQUISITION → POST_ACQUISITION** CloudTrail EH/Trail-S3/Lakeの取得、期間coverage・履歴・digest/配送欠損評価 | R1.1 source別coverage契約 | Region/Source/timeの**事前取得plan**未承認。実RAW・過去区間coverageは未取得 | 取得scope/Grant欠落はIR-07/13の**PRE_EXECUTION_BLOCK**。Source取得は**EVIDENCE_ACQUISITION**、独立coverage判定は**POST_ACQUISITION_GATE**。**G2事前通過を要求しない** |
 | IR-11 | **PRE_EXECUTION → POST_ACQUISITION** 暗号化secure RAW staging/manifest/不変seal・取得後のcustody照合 | I0のbundle完全性検査 | 取得前のsecure storage/ACL/漏洩隔離・ledger link未証明。実SDK decoded byte/S3原本の同一性は取得後照合 | 収集先の安全な保存基盤なしは**PRE_EXECUTION_BLOCK**。原本完全性は**POST_ACQUISITION_GATE** |
 | IR-12 | **PRE_EXECUTION** CIの非実行境界とHostのread-only隔離検証 | AST guard・Docker network-none・Safety Hold | Host network acceptance、SDK/OS hostile test、Coverage ingestion未証明 | Host環境の受入不足は**PRE_EXECUTION_BLOCK**。既存D2のCI成功はoffline限定 |
-| IR-13 | **PRE_EXECUTION** 人間Ownerの限定実行Grant（account/context/role/region/time/API/budget/bytes/credential/storage） | Owner Matrixの未署名項目 | **OWNER GRANT NOT_GRANTED** | **PRE_EXECUTION_BLOCK** |
+| IR-13 | **PRE_EXECUTION（技術受入後のOwner決裁）** 人間Ownerの限定実行Grant（account/context/role/region/time/API/budget/bytes/credential/storage） | Owner Matrixの未署名項目 | **OWNER GRANT NOT_GRANTED**。発行済みGrantは技術受入の前提にせず、技術受入後に人間が別判断 | **OWNER_GRANT_BLOCK**（技術受入を済ませても、Grant未発行なら取得禁止） |
 | IR-14 | **POST_ACQUISITION + INDEPENDENT G1** 実RAWの独立受入→G2判定。G1条件付きName書込は別系統 | G2/G1の規範のみ | `G2 NOT_VERIFIED`は取得**後**の検証未完了、`G1 NOT_PROVEN`はWriter更新禁止 | **POST_ACQUISITION_G2_GATE**（取得前のBLOCKではない）／**G1_WRITE_BLOCK**（取得と独立） |
 
-**Gateの型:** `PRE_EXECUTION_BLOCK`は実AWS read-only Evidence Acquisition開始を禁止する条件。`EVIDENCE_PARTIAL/UNKNOWN`は承認済取得中の部分・未収集の証拠状態。`POST_ACQUISITION_GATE`は取得後のG2証拠受入条件。`G1_WRITE_BLOCK`はNameタグ書込を別途禁止する条件。これらを同一の単一`BLOCK`へ潰さない。offline RA-A/B/Cの文書・モデル作業はいずれにも依存しない。
+**Gateの型:** `PRE_EXECUTION_BLOCK`／`PRE_EXECUTION_TECHNICAL_BLOCK`は技術機構・Host受入が未了で実AWS read-only Evidence Acquisition開始を禁止する条件。`OWNER_GRANT_BLOCK`は技術受入後でも人間の限定Grantが未発行・無効であるため送信を禁止する条件。`EVIDENCE_PARTIAL/UNKNOWN`は承認済取得中の部分・未収集の証拠状態。`POST_ACQUISITION_GATE`は取得後のG2証拠受入条件。`G1_WRITE_BLOCK`はNameタグ書込を別途禁止する条件。これらを同一の単一`BLOCK`へ潰さない。offline RA-A/B/Cの文書・モデル作業はいずれにも依存しない。
 
-**非循環の必要条件:** `PRE_EXECUTION_ACCEPTED + OWNER_GRANT` → `EVIDENCE_ACQUISITION` → `POST_ACQUISITION_G2_ASSESSMENT`。逆向きの`G2 VERIFIED → EVIDENCE_ACQUISITION`辺は**禁止**。G1のWrite Gateは取得フローから独立。
+**非循環の必要条件:** `PRE_EXECUTION_TECHNICAL_ACCEPTANCE` → `OWNER_EXECUTION_AUTHORIZATION` → `PRE_EXECUTION_COMPLETE` → `EVIDENCE_ACQUISITION` → `POST_ACQUISITION_G2_ASSESSMENT`。逆向きの`G2 VERIFIED → EVIDENCE_ACQUISITION`辺は**禁止**。G1のWrite Gateは取得フローから独立。
 
 
 ## 3. 技術上の優先依存関係（非循環、FND-PR9-002）
@@ -94,15 +94,16 @@
 → `ISOLATED_HOSTILE_RUNTIME_VERIFICATION`（モックendpoint / 隔離OS/netで敵対的試験、実AWS資格情報なし）  
 → **`RUNTIME_FIXED_HEAD_INDEPENDENT_REVIEW`**（固定コードHEADとテスト原本・SDK version・脅威モデルを独立審査）  
 → **`HOST_NETWORK_BOUNDARY_ACCEPTANCE`**（実Hostの完全仲介、Gateway外egress禁止、credential-provider/redirect/旧経路・fencingなどの遮断を別証拠で受入。**実AWS通信なし**のHost境界試験。証明不能なら停止）  
-→ **`PRE_EXECUTION_ACCEPTANCE`**（IR-01〜09/11〜13のうち取得前に必要な証明と範囲固定。該当するレビューとHost受入の全件PASSが必須）  
+→ **`PRE_EXECUTION_TECHNICAL_ACCEPTANCE`**（IR-01検証機構、IR-02〜09/11/12の取得前部分とIR-13の**Grant契約/上限設計**を固定。固定Runtime reviewとHost受入はPASS、**実際のGrant発行を含まない**）  
 → **`OWNER_EXECUTION_AUTHORIZATION`**（人間Ownerの別個の署名済み・期限/範囲付きRead-only Grant。未承認なら禁止）  
+→ **`PRE_EXECUTION_COMPLETE`**（発行されたGrant原本・Owner本人性・対象HEAD/plan/role/context/TTLを実行時に独立照合。照合不可なら送信0）  
 → **`EVIDENCE_ACQUISITION`**（初めての限定Read-only AWS RAW収集。失敗/拒否/欠損をSource別に記録）  
 → **`POST_ACQUISITION_RAW_AND_COVERAGE_INDEPENDENT_ASSESSMENT`**（IR-09〜11/14の取得後証拠照合）  
 → **`G2_INDEPENDENT_ACCEPTANCE_DECISION`**（RAWとcoverageを得た**後**にのみ判定）。
 
 **別系統:** `G1 NOT PROVEN` ⇒ `AWS WRITE BLOCKED` を上記の**全段階で継続**。G1合否をRead-only AWS RAW取得の前提へ混入させない。G2受入もGrant発行・収集開始の前提へ逆流させない。
 
-`RUNTIME_FIXED_HEAD_INDEPENDENT_REVIEW`と`HOST_NETWORK_BOUNDARY_ACCEPTANCE`は**RA-E（実装前レビュー）の代用品ではなく、Runtime実装後の独立した2つのGate**。いずれか未受入なら`PRE_EXECUTION_ACCEPTANCE`を出さず、Owner Grantの承認候補へ昇格しない。Host受入に実AWS通信が必要と判明した場合、別の限定事前認可と再設計がない限り「未証明」として停止する。循環を避けるため、**実AWSのRAW収集結果で事前のHost受入を事後正当化しない**。
+`RUNTIME_FIXED_HEAD_INDEPENDENT_REVIEW`と`HOST_NETWORK_BOUNDARY_ACCEPTANCE`は**RA-E（実装前レビュー）の代用品ではなく、Runtime実装後の独立した2つのGate**。いずれか未受入なら`PRE_EXECUTION_TECHNICAL_ACCEPTANCE`を出さず、Owner Grantの承認候補へ昇格しない。Host受入に実AWS通信が必要と判明した場合、別の限定事前認可と再設計がない限り「未証明」として停止する。循環を避けるため、**実AWSのRAW収集結果で事前のHost受入を事後正当化しない**。
 
 このDAGは本評価用の**提案**であり、RA工程の名前・昇格条件は未承認。RA-A/B/Cは資料・反例仕様のみ。RA-D以降の実装・ホスト検証とRuntime PRは別判断・別審査。Owner Grant/実AWSアクセスは**未承認**。
 
