@@ -45,6 +45,16 @@ def _canonical(items: object) -> str:
                       separators=(",", ":"), allow_nan=False)
 
 
+def _official_exception_evidence(row: dict[str, Any]) -> bool:
+    """Synthetic record shape only: no remote source authentication."""
+    sha = row.get("exception_source_sha256")
+    return (all(_id(row.get(key)) for key in (
+        "exception_evidence_id", "exception_source_url",
+        "exception_checked_at_utc"))
+        and type(sha) is str and len(sha) == 64
+        and all(ch in "0123456789abcdef" for ch in sha))
+
+
 def _unknown_row(row: dict[str, Any], key: str, code: str) -> dict[str, Any]:
     return {
         "evaluation_id": key,
@@ -147,6 +157,7 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
         match = (expected_lookup.get(key_tuple)
                  if type(index) is int and _id(typ) and _id(arn) else None)
         official_id = obj.get("exception_evidence_id")
+        official_verified = _official_exception_evidence(obj)
         exception = obj.get("exception_code", "NONE")
         resource_owner = obj.get("resource_owner_account")
         if (match is None or not sar_valid or not expected_valid
@@ -169,7 +180,7 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
         if exception == "MANAGEMENT_RESOURCE":
             if (resource_owner == data.get("management_account_id")
                     and _id(data.get("management_account_evidence_id"))
-                    and _id(official_id)):
+                    and official_verified):
                 cov, applicable = "NOT_COVERED", "EXEMPT"
         elif exception == "SERVICE_LINKED_ROLE":
             if (data.get("service_linked_role") is True
@@ -179,14 +190,14 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
         elif exception == "AWS_MANAGED_KMS_KEY":
             if (obj.get("key_manager") == "AWS"
                     and _id(obj.get("key_manager_evidence_id"))
-                    and _id(official_id)
+                    and official_verified
                     and typ.startswith("key")):
                 cov, applicable = "NOT_COVERED", "EXEMPT"
         elif exception == "KMS_RETIRE_GRANT":
-            if data["action"] == "kms:RetireGrant" and _id(official_id):
+            if data["action"] == "kms:RetireGrant" and official_verified:
                 cov, applicable = "NOT_COVERED", "EXEMPT"
         elif exception == "UNSUPPORTED_ACTION_RESOURCE":
-            if (obj.get("rcp_supported") is False and _id(official_id)):
+            if (obj.get("rcp_supported") is False and official_verified):
                 cov, applicable = "NOT_COVERED", "NOT_SUPPORTED"
         elif exception == "NONE":
             if (obj.get("rcp_supported") is True
@@ -199,6 +210,9 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
                 cov, applicable = "COVERED", "APPLICABLE"
         row.update(rcp_resource_coverage=cov, rcp_applicable=applicable,
                    rcp_exception_code=exception if cov != "UNKNOWN" else "UNKNOWN",
+                   rcp_exception_evidence_id=(official_id if cov != "UNKNOWN" else None),
+                   exception_source_sha256=(obj.get("exception_source_sha256")
+                       if cov != "UNKNOWN" and exception != "NONE" else None),
                    evidence_id=[obj["sar_evidence_id"], obj["resource_evidence_id"]]
                    if cov != "UNKNOWN" else [])
         rows.append(row)
