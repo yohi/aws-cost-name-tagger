@@ -20,6 +20,11 @@ def make_attempt(aid="a1", epoch=0, context="P1", plan="synthetic-plan"):
     return Attempt(aid, plan, context, "synthetic-request", epoch)
 
 
+def _wait_requested(g):
+    # Event.wait() is a deterministic signal, not a sleeping race loop.
+    return g._cancel_requested.wait(timeout=3)
+
+
 class OfflineSAESTests(unittest.TestCase):
     def test_cancellation_wins_and_queued_attempt_never_sends(self):
         g, transport = make_saes(), SyntheticTransport()
@@ -64,6 +69,41 @@ class OfflineSAESTests(unittest.TestCase):
         self.assertLess(names.index("SEND_STARTED"), names.index("REVOKE_COMMITTED"))
         self.assertLess(names.index("REVOKE_COMMITTED"), names.index("REVOKE_ACK_SUCCESS"))
         self.assertEqual(transport.physical_send_count, 1)
+
+    def test_cancel_between_admission_and_first_byte_blocks_send(self):
+        g, entered, release = make_saes(), threading.Event(), threading.Event()
+        t = SyntheticTransport(pre_start_entered=entered, pre_start_release=release)
+        a = make_attempt("admitted-pending")
+        self.assertEqual(g.queue_attempt(a, tick=1), "QUEUED")
+        results = {}
+        worker = threading.Thread(
+            target=lambda: results.setdefault(
+                "send", g.send_once(a, t, gateway_id=g.gateway_id, tick=2)))
+        revoker = threading.Thread(
+            target=lambda: results.setdefault("revoke", g.revoke()))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3), "pre-start admission barrier not reached")
+            revoker.start()
+            # The request flag is outside the synthetic sequencer lock;
+            # the durable commit/ACK must wait for send to leave the lock.
+            self.assertTrue(_wait_requested(g), "Owner cancellation was not submitted")
+            self.assertNotIn("revoke", results)
+        finally:
+            release.set()
+            worker.join(4)
+            if revoker.ident is not None:
+                revoker.join(4)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(revoker.is_alive())
+        self.assertEqual(results, {"send": "STOP_GRANT", "revoke": "REVOKED"})
+        self.assertEqual(t.physical_send_count, 0)
+        names = [x["kind"] for x in g.ledger]
+        self.assertIn("SEND_ADMITTED", names)
+        self.assertIn("CANCELLED_BEFORE_SEND", names)
+        self.assertNotIn("SEND_STARTED", names)
+        self.assertLess(names.index("CANCELLED_BEFORE_SEND"),
+                        names.index("REVOKE_ACK_SUCCESS"))
 
     def test_retry_after_owner_revokes_is_zero(self):
         g = make_saes()
