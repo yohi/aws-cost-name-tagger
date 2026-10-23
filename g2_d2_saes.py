@@ -19,6 +19,10 @@ class SimulatedTransportCrash(Exception):
     """Only injected by the fixed offline transport."""
 
 
+class SimulatedGrantCancelled(Exception):
+    """Synthetic cancellation won the start-event race."""
+
+
 @dataclass(frozen=True)
 class Attempt:
     attempt_id: str
