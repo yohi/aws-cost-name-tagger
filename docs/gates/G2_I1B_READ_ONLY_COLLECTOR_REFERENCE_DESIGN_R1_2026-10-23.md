@@ -92,6 +92,8 @@ Offline verification / independent reviewer（raw_secureは共有しない）
 
 **非実行状態:** このR2-N01は設計要求のみであり、現在のI1モック・I0にはGrant authority、transport guard、Botocore ClientやSDK retry実装を追加していない。適用可能性は今後のD2/D3で独立レビューが必要。
 
+**参照優先順位:** `3Bは本R3で追加した厳格な取消・送信開始プロトコルであり、先行`3Aの抽象状態機械・直前Grant照会より優先する。Grant有効期限とRevocation epochは`SEND_STARTED`の同一critical section内でも再評価し、事前の`SEND_ADMITTED`結果だけで送信しない。
+
 ## 3B. R3-LIM-001 — 取消完了と物理送信開始の線形化プロトコル（設計案）
 
 **唯一採用する参照方式：Single Authority–Egress Sequencer (SAES)。** Grantの取消Authorityと、AWS宛てHTTP送信を開始できる**唯一のEgress Gateway**を同一の直列化ドメインに置く。Collector Workerはリクエストを作るが、AWSへの直接socket/TLS/HTTP egress権限・資格情報への直接アクセスを持たない。異なるHost/プロセス/リージョンからのWorkerは認証済みのSAESへ要求を送り、SAESだけが承認済みcontextのAWS endpointへ送信する。共有DBだけを使って複数Workerが各自送信する構成、短命permit単独、`before-send`単独、ローカル`revocation_epoch`キャッシュだけでの厳格取消は**不採用**。この遮断境界がOS/net policy/credential provider/sidecar/redirectを含め閉じられない環境は`STRICT_REVOCATION_NOT_PROVEN`。
@@ -114,7 +116,7 @@ Offline verification / independent reviewer（raw_secureは共有しない）
 ### Authority可用性・並列Host・復旧
 
 - **唯一の入口:** すべてのAWS送信はSAES経由。ネットワークACL/namespace/プロセス権限によりWorker→AWS直結、AWS SDK内部retry、別endpoint/credential refreshの迂回を禁止する。P1/P2/P2-Lake/P3/P4の各contextもGrant別sequencerで分離し、複数Worker間で`attempt_id`を一意化する。
-- **単一書込権威:** epoch・Grant状態・admission ledgerは耐久的で線形化可能な権威に固定する。複製Gatewayを同時writerにしない。Leader交代にはfencing tokenと旧Leaderの**ネットワークe​gress失効確証**が必須。古いLeaderが送れる可能性があれば、取消ACK禁止・AWS実行禁止。短期permit/lease期限だけで旧Leaderを安全と判断しない。
+- **単一書込権威:** epoch・Grant状態・admission ledgerは耐久的で線形化可能な権威に固定する。複製Gatewayを同時writerにしない。Leader交代にはfencing tokenと旧Leaderの**ネットワークegress失効確証**が必須。古いLeaderが送れる可能性があれば、取消ACK禁止・AWS実行禁止。短期permit/lease期限だけで旧Leaderを安全と判断しない。
 - **障害:** Grant authority、durable ledger、Gatewayと取消参照のどれかが不能なら新規送信停止。Gateway喪失/ネットワーク分断中に`REVOKE_ACK_SUCCESS`を返さない。`REVOKE_REQUESTED`は`CANCEL_PENDING`で保持し、旧Gatewayのfencingと未開始送信停止が証明されてから成功確定。成功ACK不明の場合Ownerへ`OUTCOME_UNKNOWN`を返し、承認済と扱わない。
 - **Crash recovery:** `SEND_INTENT`を**送信前**にdurable追記し、`SEND_STARTED`の検証可能な記録を別追記する。送信開始→ledger確定の間にCrash/通信断が起きたら`SEND_OUTCOME_UNKNOWN`（`NOT_SENT`とも`SUCCEEDED`とも断定不可）としてsealし、同一attemptを自動再送しない。回復後に古いqueue/permitを再使用しない。取消済みGrantの再稼働も不可。Reader側のAPI結果が「読取専用」であっても、同意なしに結果不明の再試行を繰返さない。
 - **実行権限:** このプロトコルは**非実行設計**。Gateway権限、中央化、OS fencing、Socket境界、crash-safe ledgerの証明がない現状で`D2設計受入`/`AWS runtime`を自動承認しない。
@@ -238,9 +240,11 @@ Page ledger必須レコード候補:
 
 **R1-006（Grant取消）:** R2独立レビューで`RESOLVED_IN_REQUIREMENTS`。全SDKリクエスト直前のGrant有効期限・Owner取消・plan/HEAD・principal/context検証、page ledger記録、取消後`STOP_GRANT`、未承認RAW隔離の**要求契約**は維持。新規R2-N01は**論理SDK呼び出しを超える物理HTTP送信境界**の実装方針を別途限定是正するもので、R1-006を再OPENしない。
 
+**R3-LIM-002（Resource単位のRCP結果）:** Owner Matrix `2A-2により、`ActionEvaluation`→`ResourceEvaluation[]`（1行1認可Resource）の唯一キー、`aggregate_coverage`のUNKNOWN優先/MIXED区別、AWS managed KMS key / `kms:RetireGrant`等の公式固有例外を証拠・テストへ紐づける。未実装・独立レビュー待ち。
+
 **R2-NEW-002（RCP Resource Type）:** 別紙Owner Matrix `2A-1`で`authorized_resource_types`と`rcp_resource_coverage`をA04×A06 Actor/Action/Resourceごとに導入。Service Authorization ReferenceのAction/Resource typeを実際の認可対象ARN・owner accountに結び、対象外やUNKNOWNを区別する。Resource typeが未確認ならRCPの適用・Denyを推定せず、A06 writer候補をOPENにする。受入反例テスト18が未実装であり、今回の判定は`RESOLVED_IN_PROPOSAL`。
 
-**R3-LIM-001の是正案（Post-Merge設計差分）:** 本書`§3B`でSAES型の送信・取消直列化点、未送信admission取消、Gateway fencing、障害・crashのUNKNOWNと決定論的並行テストを契約化。単なるepochやローカルgrant再照会だけでは厳格な取消を認めない。**実装・実行安全の証明ではない。**
+**R3-LIM-001の是正案（Post-Merge設計差分）:** 本書``3B`でSAES型の送信・取消直列化点、未送信admission取消、Gateway fencing、障害・crashのUNKNOWNと決定論的並行テストを契約化。単なるepochやローカルgrant再照会だけでは厳格な取消を認めない。**実装・実行安全の証明ではない。**
 
 **R2/R3限定レビュー状況:** R1の6件は**RESOLVED_IN_DESIGN_R2**（R1-006は特に`RESOLVED_IN_REQUIREMENTS`）で独立確認済み。再OPENしない。R2新規2件は`PARTIALLY_RESOLVED`（独立判定）を継承。R3-LIM-001 Major/R3-LIM-002 Minorの今回差分は`RESOLVED_IN_PROPOSAL`で、**新規の限定独立再レビュー待ち**。Design Review Gateは引き続き`REVISION_REQUIRED`。実装・AWS実行Grantは成立しない。
 
@@ -262,4 +266,4 @@ Page ledger必須レコード候補:
 - [Botocore before-send：シリアライズ・署名済み要求の送信直前イベント](https://docs.aws.amazon.com/botocore/latest/topics/events.html)
 - [Organizations RCP：Service Authorization ReferenceのAction別Resource typeを適用基準とする](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html)
 
-**結論:** 本R2はG2-I1-Bの実装可否を判定するための**非実行参照設計**である。いかなるCI PASSや文書マージもAWS接続・IAM権限付与・G1/G2正式承認・Nameタグ書込の解禁を意味しない。
+**結論:** 本R3はG2-I1-Bの実装可否を判定するための**非実行参照設計**である。いかなるCI PASSや文書マージもAWS接続・IAM権限付与・G1/G2正式承認・Nameタグ書込の解禁を意味しない。
