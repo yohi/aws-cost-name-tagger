@@ -123,6 +123,44 @@ class OfflineSAESTests(unittest.TestCase):
         self.assertLess(names.index("CANCELLED_BEFORE_SEND"),
                         names.index("REVOKE_ACK_SUCCESS"))
 
+    def test_r2_new_001_cancel_after_old_check_before_first_byte(self):
+        g = make_saes()
+        entered, release = threading.Event(), threading.Event()
+        transport = SyntheticTransport(
+            pre_mark_entered=entered, pre_mark_release=release)
+        attempt = make_attempt("final-check-race")
+        self.assertEqual(g.queue_attempt(attempt, tick=1), "QUEUED")
+        results = {}
+        sender = threading.Thread(target=lambda: results.setdefault(
+            "send", g.send_once(attempt, transport,
+                                gateway_id=g.gateway_id, tick=2)))
+        revoker = threading.Thread(target=lambda: results.setdefault(
+            "revoke", revoke_with_evidence(g)))
+        sender.start()
+        try:
+            self.assertTrue(entered.wait(3), "sender did not pass prior cancel check")
+            revoker.start()
+            self.assertTrue(_wait_requested(g), "revoke did not set cancellation")
+            self.assertNotIn("revoke", results, "ACK cannot bypass in-progress send")
+        finally:
+            release.set()
+            sender.join(4)
+            if revoker.ident is not None:
+                revoker.join(4)
+        self.assertFalse(sender.is_alive())
+        self.assertFalse(revoker.is_alive())
+        self.assertEqual(results, {"send": "STOP_GRANT", "revoke": "REVOKED"})
+        self.assertEqual(transport.physical_send_count, 0)
+        events = [record["kind"] for record in g.ledger]
+        self.assertIn("CANCELLED_BEFORE_SEND", events)
+        self.assertNotIn("SEND_STARTED", events)
+        self.assertLess(events.index("REVOKE_REQUESTED"),
+                        events.index("CANCELLED_BEFORE_SEND"))
+        self.assertLess(events.index("CANCELLED_BEFORE_SEND"),
+                        events.index("REVOKE_COMMITTED"))
+        self.assertLess(events.index("REVOKE_COMMITTED"),
+                        events.index("REVOKE_ACK_SUCCESS"))
+
     def test_d2_001_queued_fingerprint_is_immutable_binding(self):
         g, queued = make_saes(), make_attempt("same-id")
         transport = SyntheticTransport()
