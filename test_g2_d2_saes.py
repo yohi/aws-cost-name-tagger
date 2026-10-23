@@ -101,6 +101,8 @@ class OfflineSAESTests(unittest.TestCase):
         names = [x["kind"] for x in g.ledger]
         self.assertIn("SEND_ADMITTED", names)
         self.assertIn("CANCELLED_BEFORE_SEND", names)
+        self.assertLess(names.index("REVOKE_REQUESTED"),
+                        names.index("CANCELLED_BEFORE_SEND"))
         self.assertNotIn("SEND_STARTED", names)
         self.assertLess(names.index("CANCELLED_BEFORE_SEND"),
                         names.index("REVOKE_ACK_SUCCESS"))
