@@ -106,6 +106,7 @@ class OfflineSAES:
         self.expires_at_tick = expires_at_tick
         self.max_sends = max_sends
         self._lock = threading.RLock()
+        self._event_lock = threading.RLock()
         self._cancel_requested = threading.Event()
         self._epoch = 0
         self._state = "ACTIVE"
@@ -115,13 +116,14 @@ class OfflineSAES:
         self._gateway_fencing_proven = True
 
     def _record(self, kind: str, attempt_id: str | None = None) -> None:
-        self._records.append({
-            "seq": len(self._records) + 1, "kind": kind,
-            "grant_id": self.grant_id, "attempt_id": attempt_id,
-            "revocation_epoch": self._epoch,
-            "gateway_id": self.gateway_id,
-            "provenance": "SYNTHETIC_IN_MEMORY_NOT_DURABLE",
-        })
+        with self._event_lock:
+            self._records.append({
+                "seq": len(self._records) + 1, "kind": kind,
+                "grant_id": self.grant_id, "attempt_id": attempt_id,
+                "revocation_epoch": self._epoch,
+                "gateway_id": self.gateway_id,
+                "provenance": "SYNTHETIC_IN_MEMORY_NOT_DURABLE",
+            })
 
     @property
     def ledger(self) -> tuple[dict[str, Any], ...]:
@@ -224,12 +226,14 @@ class OfflineSAES:
     def revoke(self, *, gateway_fencing_proven: bool = True) -> str:
         if type(gateway_fencing_proven) is not bool:
             raise OfflineContractError("Explicit fencing proof required")
-        # Mark cancellation intent BEFORE waiting on the serialization lock.
-        self._cancel_requested.set()
+        # Record revocation intent atomically with signaling cancellation,
+        # BEFORE waiting for an already-admitted send to release the lock.
+        with self._event_lock:
+            self._cancel_requested.set()
+            self._record("REVOKE_REQUESTED")
         with self._lock:
             if self._state == "REVOKED":
                 return "REVOKED"
-            self._record("REVOKE_REQUESTED")
             self._state = "CANCEL_PENDING"
             self._gateway_fencing_proven = gateway_fencing_proven
             for aid, st in self._attempts.items():
