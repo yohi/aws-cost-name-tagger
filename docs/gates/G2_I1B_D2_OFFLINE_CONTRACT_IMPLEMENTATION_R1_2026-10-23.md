@@ -52,3 +52,20 @@ The `SAES` implementation is **not** a production Grant Authority or network tra
 6. Reviewer judgment: `LIMITED_PASS_OFFLINE_CONTRACT` or `REVISION_REQUIRED`, **never Runtime PROVEN or OWNER AUTHORIZED**.
 
 **Final fixed status:** D2 offline work does not alter `G1 NOT PROVEN / G2 NOT VERIFIED / AWS EVIDENCE ACQUISITION NOT EXECUTED / OWNER EXECUTION NOT GRANTED / AWS WRITE BLOCKED`.
+
+## 5. PR #8 Fresh Independent R1 — Five-Finding Limited Remediation
+
+**Independent review baseline:** `3c46244a8039c2281568b8b8db7309141932b423`. Independent disposition: `REVISION_REQUIRED` (Major 3, Minor 2), merge blocked. The following are **author-side CORRECTED_IN_PROPOSAL** until fixed-HEAD independent R2 review. No review finding is self-closed by this document or passing CI.
+
+| Finding | R2 remediation | Offline regression |
+|---|---|---|
+| FND-D2-001 Major | `queue_attempt` snapshots `attempt_id / plan / context / request_fingerprint / epoch` into fixed tuple. `send_once` verifies every field; mismatch is `STOP_BINDING_MISMATCH` with no transport and no reuse | Same ID with different fingerprint must yield 0 sends and reject later replay |
+| FND-D2-002 Major | `revoke()` sets `CANCEL_PENDING` only and **never** success ACK by default. Separate `simulate_gateway_fenced()` registers an in-process **synthetic witness** after cancellation; `finalize_revoke` requires the identical registered request/epoch/gateway-bound witness. Repeated revokes, forged/copy/stale/wrong-epoch evidence cannot acknowledge. | Unproven fencing remains pending; only verified *synthetic fixture witness* permits model ACK |
+| FND-D2-003 Major | Required SAR Resource Types absent from the expected closed set must be explained by `absent_required_resource_types[]` with allowed reason, source-evidence ID, SAR ID and exact request fingerprint. Unexplained/duplicate/stale/mismatched/invalid absence proof → aggregate UNKNOWN. A non-applicable required type is not indiscriminately forced into every Action request. | REQUIRED type-A missing but OPTIONAL type-B present; with fixture-bound synthetic explanation vs none, wrong request, wrong SAR or duplicated |
+| FND-D2-004 Minor | `SyntheticTransport.send_once` invokes a **model-first-byte callback** that updates synthetic send counter and `SEND_STARTED` under the same event lock before post-start barrier/response. `REVOKE_REQUESTED` cannot be ordered earlier than the observed first byte when the send won. | Deterministic send-start-before-revoke sequence and cancellation-before-first-byte zero send |
+| FND-D2-005 Minor | `_source_proof` now checks HTTPS documentation-domain URL syntax, SHA-256 hex shape, and strict parseable UTC `YYYY-MM-DDTHH:MM:SSZ`. Values remain synthetic and do **not** establish official-source authenticity. | Invalid URL, HTTP scheme, wrong host, invalid/out-of-range dates, timezone offset → UNKNOWN |
+
+**Critical qualification:** `simulate_gateway_fenced` is a **trusted deterministic test event**, not evidence that an actual OS/firewall/host is fenced. Likewise SAR omission evidence and official source hash IDs are synthetic fixtures, not independently authenticated AWS source bytes. **RUNTIME NOT_PROVEN / STRICT REVOCATION NOT_PROVEN** remain non-negotiable. CI passing does not approve merging or AWS access.
+
+**New independent review should specifically challenge:** forged proof copies, resubmission without a proof, a fingerprint swap after queueing, cancellation between admission and first byte, started-before-revoke ledger order, SAR REQUIRED types absent for the current request without authentic proof, and malformed exception URL/time. Existing R1 six and R3-LIM design closure statuses are unchanged.
+
