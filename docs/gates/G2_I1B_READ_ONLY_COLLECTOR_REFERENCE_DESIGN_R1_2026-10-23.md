@@ -1,15 +1,15 @@
-# G2-I1-B — 実AWS Read-only Evidence Collector 参照設計 R2（R1独立レビュー是正）
+# G2-I1-B — 実AWS Read-only Evidence Collector 参照設計 R3（限定是正）
 
 **基準日:** 2026-10-23（JST）  
-**Baseline:** `yohi/aws-cost-name-tagger` master `423f123a2df64bd3c296376c1f3980b4e1aa0267`  
+**Baseline:** `yohi/aws-cost-name-tagger` master `a0afd2e61f050935b4f920127eeecd9eb20ff6f3`（PR #6 merge）  
 **上位規範:** `docs/gates/G2_OFFLINE_EVIDENCE_BUNDLE_CONTRACT_R1_2026-10-22.md`（本文R1.1）  
 **依存実装:** I0 `g2_evidence.py`、I1 `g2_collector_contract.py`  
-**文書状態:** **R2 DESIGN PROPOSAL / R1 FINDINGS CORRECTED_IN_PROPOSAL / INDEPENDENT_REVIEW_PENDING / UNSIGNED / NO ACCESS GRANT / NOT_EXECUTED**  
-**Gate:** Design Review=REVISION_REQUIRED（R1）。R2独立再レビュー待ち。G1 NOT PROVEN、G2 NOT VERIFIED、EXECUTION NOT AUTHORIZED、AWS WRITE BLOCKED、Safety Hold維持。
+**文書状態:** **R3 LIMITED DESIGN CORRECTIONS / R3-LIM-001,002 RESOLVED_IN_PROPOSAL / INDEPENDENT_REVIEW_PENDING / UNSIGNED / NO ACCESS GRANT / NOT_EXECUTED**  
+**Gate:** Design Review=REVISION_REQUIRED（R3-LIM-001 Major / 002 Minor OPEN）・R3限定独立再レビュー待ち。R1既存6件は設計上クローズ済み。G1 NOT PROVEN、G2 NOT VERIFIED、EXECUTION NOT AUTHORIZED、AWS WRITE BLOCKED、Safety Hold維持。
 
 ## 0. 本設計の境界
 
-この文書は**実AWSアクセスの認可でも、実行指示でも、IAMポリシーとしてデプロイ可能な完成品でもない**。本PRは文書追加のみ。資格情報の取得、AWS CLI/SDK呼び出し、IAM/SCP/ログ設定変更、CloudTrail Lakeクエリ、Nameタグ更新、実AWS証拠のアップロードを行わない。
+この文書は**実AWSアクセスの認可でも、実行指示でも、IAMポリシーとしてデプロイ可能な完成品でもない**。本R3 PRは既存設計2文書のみの非実行変更。資格情報の取得、AWS CLI/SDK呼び出し、IAM/SCP/ログ設定変更、CloudTrail Lakeクエリ、Nameタグ更新、実AWS証拠のアップロードを行わない。
 
 **成功しても解除できない事項:** G1の条件付きNameタグ原子更新はNOT PROVEN。G2-I0の「バイト整合性」／I1の「合成レスポンスの契約検証」は実AWSでの全件取得・実効ReadOnly権限・真正性・単一時点整合性・全writer不存在の証明ではない。過去のName候補58件という数字は再取得済みの現在値ではない。
 
@@ -92,6 +92,35 @@ Offline verification / independent reviewer（raw_secureは共有しない）
 
 **非実行状態:** このR2-N01は設計要求のみであり、現在のI1モック・I0にはGrant authority、transport guard、Botocore ClientやSDK retry実装を追加していない。適用可能性は今後のD2/D3で独立レビューが必要。
 
+## 3B. R3-LIM-001 — 取消完了と物理送信開始の線形化プロトコル（設計案）
+
+**唯一採用する参照方式：Single Authority–Egress Sequencer (SAES)。** Grantの取消Authorityと、AWS宛てHTTP送信を開始できる**唯一のEgress Gateway**を同一の直列化ドメインに置く。Collector Workerはリクエストを作るが、AWSへの直接socket/TLS/HTTP egress権限・資格情報への直接アクセスを持たない。異なるHost/プロセス/リージョンからのWorkerは認証済みのSAESへ要求を送り、SAESだけが承認済みcontextのAWS endpointへ送信する。共有DBだけを使って複数Workerが各自送信する構成、短命permit単独、`before-send`単独、ローカル`revocation_epoch`キャッシュだけでの厳格取消は**不採用**。この遮断境界がOS/net policy/credential provider/sidecar/redirectを含め閉じられない環境は`STRICT_REVOCATION_NOT_PROVEN`。
+
+### イベントと線形化点
+
+| 事象 | 定義 / 線形化点 | 不変条件 |
+|---|---|---|
+| `SEND_REQUESTED` | Workerが要求をSAESへ登録。論理要求ID・対象Grant・plan・context・params・`attempt_id`付き | **まだ送信許可ではない**。キュー投入のみ |
+| `SEND_ADMITTED` | SAES内の単一Grant別sequencerで`ACTIVE`/epoch、scope、expiry、budget、attempt一意性、transport構成を検証し、exclusive ingress-to-egress critical sectionへ入れる | admitted-but-not-startedは**取消で破棄可能**。外部permitを渡してSAES外送信不可 |
+| `SEND_STARTED` | **同じcritical sectionを保持したまま**、対象HTTP requestの最初のネットワーク送信開始を、唯一のSAES transportが観測・確定した時点。アプリケーション上の送信開始境界は「最初のHTTP送信byteをOS socket I/Oへ正常に引き渡した時点」と定義する | これ以前は`NOT_STARTED`/`PENDING`で取消可能。TLS準備・DNS接続は`SEND_STARTED`に数えず、別送信経路は遮断。remote AWS到達時刻の保証ではない |
+| `REVOKE_REQUESTED` | Ownerが署名済み取消指示をSAESへ提出 | `CANCEL_PENDING`に入り、新規admission停止。取消要求受理≠取消完了 |
+| `REVOKE_COMMITTED` | **同じsequencer**がGrantを`REVOKED`にしepoch更新を耐久記録したうえ、すべての未開始attemptを`CANCELLED_BEFORE_SEND`にし、`STARTING` critical sectionの解消と全egress replica fencingを確認 | この点より後の`SEND_STARTED`は禁止。失敗時は`CANCEL_PENDING`のまま |
+| `REVOKE_ACK_SUCCESS` | `REVOKE_COMMITTED`がdurableであり、許可済み未開始attempt・不明Gateway/Replicaが**存在しない**ことを確認してからOwnerへ成功通知 | 成功ACK時点以降の新規`SEND_STARTED`は0。証明不能ならACK成功を返さない |
+
+**同時実行順序の固定:** 各Grantにつき`SEND_STARTED`と`REVOKE_COMMITTED`は同じ単一sequencerの全順序で決定する。送信がロックを先取した場合、SAESは`SEND_STARTED`へ到達するか送信前中止を確認するまでその送信開始critical sectionを終了させず、取消成功を通知しない。取消が先に`CANCEL_PENDING`に入った場合、新しい`SEND_ADMITTED`は禁止し、未開始の`SEND_ADMITTED`は破棄する。ロックを解放してから未送信attemptが独自にsocketへ送る構造は**禁止**。
+
+**同一プロセス内の権威性の前提:** OS socket I/O引渡し（`SEND_STARTED`）が完了するまでGrant排他を保持する専用Gateway/transportと、発信Socketの完全仲介を必須にする。`before-send`は補助計測であり線形化点ではない。TLSハンドシェイク、HTTP/2多重化、接続プール、透過redirect、Kernel buffer、認証provider通信について、初回request byteの正確な意味と経路閉包をD2オフラインtransport fixtureで検証できなければ`STRICT_REVOCATION_NOT_PROVEN`。**ここで保証するのはSAESが開始する新規HTTP送信のローカル境界**であり、AWSへの到達／送信開始後の残りのバイトや既開始リクエストの中断を保証しない。
+
+### Authority可用性・並列Host・復旧
+
+- **唯一の入口:** すべてのAWS送信はSAES経由。ネットワークACL/namespace/プロセス権限によりWorker→AWS直結、AWS SDK内部retry、別endpoint/credential refreshの迂回を禁止する。P1/P2/P2-Lake/P3/P4の各contextもGrant別sequencerで分離し、複数Worker間で`attempt_id`を一意化する。
+- **単一書込権威:** epoch・Grant状態・admission ledgerは耐久的で線形化可能な権威に固定する。複製Gatewayを同時writerにしない。Leader交代にはfencing tokenと旧Leaderの**ネットワークe​gress失効確証**が必須。古いLeaderが送れる可能性があれば、取消ACK禁止・AWS実行禁止。短期permit/lease期限だけで旧Leaderを安全と判断しない。
+- **障害:** Grant authority、durable ledger、Gatewayと取消参照のどれかが不能なら新規送信停止。Gateway喪失/ネットワーク分断中に`REVOKE_ACK_SUCCESS`を返さない。`REVOKE_REQUESTED`は`CANCEL_PENDING`で保持し、旧Gatewayのfencingと未開始送信停止が証明されてから成功確定。成功ACK不明の場合Ownerへ`OUTCOME_UNKNOWN`を返し、承認済と扱わない。
+- **Crash recovery:** `SEND_INTENT`を**送信前**にdurable追記し、`SEND_STARTED`の検証可能な記録を別追記する。送信開始→ledger確定の間にCrash/通信断が起きたら`SEND_OUTCOME_UNKNOWN`（`NOT_SENT`とも`SUCCEEDED`とも断定不可）としてsealし、同一attemptを自動再送しない。回復後に古いqueue/permitを再使用しない。取消済みGrantの再稼働も不可。Reader側のAPI結果が「読取専用」であっても、同意なしに結果不明の再試行を繰返さない。
+- **実行権限:** このプロトコルは**非実行設計**。Gateway権限、中央化、OS fencing、Socket境界、crash-safe ledgerの証明がない現状で`D2設計受入`/`AWS runtime`を自動承認しない。
+
+**形式的不変条件:** `REVOKE_ACK_SUCCESS(g)`が発行されたGrant gについて、以後のすべてのGateway-local `SEND_STARTED(g, attempt)`は0件。取消要求の前に`SEND_STARTED`だったattemptの応答はin-flightとして`UNAUTHORIZED_AFTER_REVOKE`隔離し、取消ACK後の完了やAWS側反映を禁止すると主張しない。必要ならより強い「in-flightの全byte送出終了」要求は別のDrain・ACK規範として新レビューに戻す。
+
 ## 4. 非原子的収集とSource別完全性
 
 - **Coverage matrix:** `evidence_id × account × source_context × region × time_window × event_category × target_ARN × API`ごとに`NOT_ATTEMPTED / CAPTURED_UNVERIFIED / PARTIAL / ACCESS_DENIED / UNKNOWN / INCONSISTENT`を維持。`UNKNOWN`とゼロ件を混同しない。
@@ -117,6 +146,17 @@ Page ledger必須レコード候補:
   "grant_validation_evidence_id": null,
   "grant_revocation_epoch": null,
   "transport_attempt_id": null,
+  "gateway_id": null,
+  "gateway_fencing_epoch": null,
+  "send_requested_seq": null,
+  "send_admitted_seq": null,
+  "send_intent_durable_seq": null,
+  "send_started_seq": null,
+  "send_started_observed_at_utc": null,
+  "revoke_requested_seq": null,
+  "revoke_committed_seq": null,
+  "revoke_ack_seq": null,
+  "send_outcome": "NOT_ATTEMPTED|NOT_STARTED|SENT|SEND_OUTCOME_UNKNOWN",
   "retry_owner": "COLLECTOR_ONLY",
   "effective_sdk_total_max_attempts": 1,
   "pre_send_grant_decision": "NOT_VERIFIED",
@@ -161,6 +201,8 @@ Page ledger必須レコード候補:
 | Owner Grant未署名、scope/plan/HEAD不一致 | `NOT_AUTHORIZED` | AWSへ一切接続しない |
 | Grantがリクエスト間／HTTP送信直前に失効・取消・期限切れ、状態検証不能 | `STOP_GRANT` | **次の物理HTTP送信なし**。SDK暗黙retryを禁止、Collector側の再試行は新たなGrant評価が必要。取得済みRAWを未承認seal/隔離。既送信in-flightは取消保証しない |
 | SDKが内部retryや暗黙的HTTP sendを構成上・計測上排除できない、取消との競合を線形化できない | `RUNTIME_NOT_PROVEN` / `STRICT_REVOCATION_NOT_PROVEN` | 実Client利用禁止。別設計と独立レビューに戻す |
+| 取消要求後のGateway/Authority障害・旧Leader fencing未証明 | `CANCEL_PENDING` / `OUTCOME_UNKNOWN` | **Owner取消成功ACKを返さず**送信停止。復旧・厳密時系列を独立照合 |
+| Transport送信開始からdurable ledger確定前にcrash | `SEND_OUTCOME_UNKNOWN` | 送信済み/未送信と断定せず、seal/隔離・同じattemptを自動再送禁止 |
 | STS Account/ARN不一致、意図しない主体切替 | `ABORTED_IDENTITY` | 以後のAPIを停止。取得済みデータを承認扱いにしない |
 | 未許可operation／リソース／パラメータ／endpoint | `STOP_POLICY` | 呼び出さず停止し監査記録 |
 | 資格情報・Secret・禁止データの取得要求／混入 | `STOP_SENSITIVE` | 収集と共有を停止、隔離。RAWの自動公開不可 |
@@ -198,7 +240,9 @@ Page ledger必須レコード候補:
 
 **R2-NEW-002（RCP Resource Type）:** 別紙Owner Matrix `2A-1`で`authorized_resource_types`と`rcp_resource_coverage`をA04×A06 Actor/Action/Resourceごとに導入。Service Authorization ReferenceのAction/Resource typeを実際の認可対象ARN・owner accountに結び、対象外やUNKNOWNを区別する。Resource typeが未確認ならRCPの適用・Denyを推定せず、A06 writer候補をOPENにする。受入反例テスト18が未実装であり、今回の判定は`RESOLVED_IN_PROPOSAL`。
 
-**R2独立再審査結果:** R1の6件は**RESOLVED_IN_DESIGN_R2**（R1-006は特に`RESOLVED_IN_REQUIREMENTS`）で独立確認済み。再OPENしない。新規R2-N01 MajorとR2-N02 Minorは今回の**限定是正案**として`RESOLVED_IN_PROPOSAL`に止め、差分だけの独立再審査を待つ。Design Review Gateは引き続き`REVISION_REQUIRED`。実装・AWS実行Grantは成立しない。
+**R3-LIM-001の是正案（Post-Merge設計差分）:** 本書`§3B`でSAES型の送信・取消直列化点、未送信admission取消、Gateway fencing、障害・crashのUNKNOWNと決定論的並行テストを契約化。単なるepochやローカルgrant再照会だけでは厳格な取消を認めない。**実装・実行安全の証明ではない。**
+
+**R2/R3限定レビュー状況:** R1の6件は**RESOLVED_IN_DESIGN_R2**（R1-006は特に`RESOLVED_IN_REQUIREMENTS`）で独立確認済み。再OPENしない。R2新規2件は`PARTIALLY_RESOLVED`（独立判定）を継承。R3-LIM-001 Major/R3-LIM-002 Minorの今回差分は`RESOLVED_IN_PROPOSAL`で、**新規の限定独立再レビュー待ち**。Design Review Gateは引き続き`REVISION_REQUIRED`。実装・AWS実行Grantは成立しない。
 
 ## 9. 根拠となるAWS公式仕様
 
