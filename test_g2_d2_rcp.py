@@ -1,5 +1,6 @@
 """D2 RCP contract tests, including R4-OBS-001 schema closure."""
 import copy
+import hashlib
 import unittest
 
 from g2_d2_rcp import evaluate_action, ResourceContractError, AWS_WRITES
@@ -18,6 +19,10 @@ def resource(index, typ, name, *, owner="member-account", **kw):
         "exception_code": "NONE",
     }
     row.update(kw)
+    if row["exception_code"] != "NONE" and row.get("exception_evidence_id") is not None:
+        row.setdefault("exception_source_url", "https://docs.aws.amazon.com/synthetic-fixture")
+        row.setdefault("exception_source_sha256", hashlib.sha256(b"synthetic-official-source").hexdigest())
+        row.setdefault("exception_checked_at_utc", "2026-10-23T00:00:00Z")
     return row
 
 
@@ -154,6 +159,20 @@ class ResourceEvaluationTests(unittest.TestCase):
         self.assertEqual(
             evaluate_action(fixture([row], action="kms:Decrypt"))["aggregate_coverage"],
             "UNKNOWN")
+
+    def test_exception_requires_source_hash_and_date(self):
+        row = resource(
+            0, "key", "kms", exception_code="AWS_MANAGED_KMS_KEY",
+            key_manager="AWS", key_manager_evidence_id="synthetic-key-proof",
+            exception_evidence_id="official-rcp-exception-proof")
+        for field in ("exception_source_url", "exception_source_sha256",
+                      "exception_checked_at_utc"):
+            case = copy.deepcopy(row)
+            case.pop(field)
+            with self.subTest(field=field):
+                self.assertEqual(
+                    evaluate_action(fixture([case], action="kms:Decrypt"))
+                    ["aggregate_coverage"], "UNKNOWN")
 
     def test_kms_retire_grant_action_specific_exception(self):
         row = resource(0, "key", "kms", exception_code="KMS_RETIRE_GRANT",
