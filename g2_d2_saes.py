@@ -54,7 +54,9 @@ class SyntheticTransport:
                  gate_entered: threading.Event | None = None,
                  gate_release: threading.Event | None = None,
                  pre_start_entered: threading.Event | None = None,
-                 pre_start_release: threading.Event | None = None):
+                 pre_start_release: threading.Event | None = None,
+                 pre_mark_entered: threading.Event | None = None,
+                 pre_mark_release: threading.Event | None = None):
         if outcome not in ("OK", "THROTTLED", "CRASH_BEFORE_START",
                            "CRASH_AFTER_START"):
             raise OfflineContractError("Unsupported fixed simulation outcome")
@@ -70,6 +72,14 @@ class SyntheticTransport:
                 type(pre_start_entered) is not type(threading.Event())
                 or type(pre_start_release) is not type(threading.Event())):
             raise OfflineContractError("Trusted pre-start barriers only")
+        if (pre_mark_entered is None) != (pre_mark_release is None):
+            raise OfflineContractError("Both pre-mark barriers required")
+        if pre_mark_entered is not None and (
+                type(pre_mark_entered) is not type(threading.Event())
+                or type(pre_mark_release) is not type(threading.Event())):
+            raise OfflineContractError("Trusted pre-mark barriers only")
+        self.pre_mark_entered = pre_mark_entered
+        self.pre_mark_release = pre_mark_release
         self.pre_start_entered = pre_start_entered
         self.pre_start_release = pre_start_release
         self.outcome = outcome
@@ -88,6 +98,10 @@ class SyntheticTransport:
         """Atomically mark the first synthetic byte before post-start barrier."""
         if self.outcome == "CRASH_BEFORE_START":
             raise SimulatedTransportCrash("Unknown before I/O observation")
+        if self.pre_mark_entered is not None:
+            self.pre_mark_entered.set()
+            if not self.pre_mark_release.wait(timeout=5):
+                raise SimulatedTransportCrash("Pre-mark barrier timed out")
         mark_send_started()
         if self.gate_entered is not None:
             self.gate_entered.set()
