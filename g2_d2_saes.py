@@ -232,7 +232,7 @@ class OfflineSAES:
             self._record("REVOKE_REQUESTED")
             self._state = "CANCEL_PENDING"
             self._gateway_fencing_proven = gateway_fencing_proven
-            for aid, st in list(self._attempts.items()):
+            for aid, st in self._attempts.items():
                 if st == "QUEUED" or st == "STARTING":
                     self._attempts[aid] = "CANCELLED_BEFORE_SEND"
                     self._record("CANCELLED_BEFORE_SEND", aid)
