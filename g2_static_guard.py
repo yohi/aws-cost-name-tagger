@@ -72,15 +72,18 @@ def check_ast(source: str) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     # CLI flags may select/order the known modules, but can never choose paths.
     supplied = argv if argv is not None else sys.argv[1:]
-    expected = ("g2_evidence.py", "g2_collector_contract.py")
+    expected = ("g2_evidence.py", "g2_collector_contract.py",
+                "g2_d2_saes.py", "g2_d2_rcp.py")
     if len(supplied) != len(expected) or set(supplied) != set(expected):
-        print("Only the two fixed G2 offline modules may be scanned", file=sys.stderr)
+        print("Only the four fixed G2 offline modules may be scanned", file=sys.stderr)
         return 1
     source_dir = Path(__file__).resolve().parent
     # These are constant, source-controlled filenames, never built from CLI input.
     fixed_paths = (
         source_dir / "g2_evidence.py",
         source_dir / "g2_collector_contract.py",
+        source_dir / "g2_d2_saes.py",
+        source_dir / "g2_d2_rcp.py",
     )
     errors = []
     for path in fixed_paths:
@@ -92,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         for msg in errors:
             print(msg, file=sys.stderr)
         return 1
-    print("G2 static import/code guard PASS (2 fixed modules)")
+    print("G2 static import/code guard PASS (4 fixed modules)")
     return 0
 
 
