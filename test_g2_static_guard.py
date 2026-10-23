@@ -46,7 +46,8 @@ class OfflineStaticGuardTests(unittest.TestCase):
         self.assertEqual(guard.main(["../g2_evidence.py",
                                      "g2_collector_contract.py"]), 1)
         self.assertEqual(guard.main(["g2_evidence.py",
-                                     "g2_collector_contract.py"]), 0)
+                                     "g2_collector_contract.py",
+                                     "g2_d2_saes.py", "g2_d2_rcp.py"]), 0)
 
 
 if __name__ == "__main__":
