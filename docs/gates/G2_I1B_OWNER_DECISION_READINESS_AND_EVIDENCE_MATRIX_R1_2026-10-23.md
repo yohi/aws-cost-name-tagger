@@ -80,6 +80,18 @@ RCPは管理アカウントResourceには適用されず、対象は対応サー
 
 **実装開始前の必須反例テスト:** 合成SCPがName書込をdenyしていても、管理AccountのRoleやSLRを`IMPOSSIBLE_WRITER`にしない。管理AccountのresourceやRCP非対応serviceへRCP denyを誤適用しない。一方、管理RoleからメンバーResourceへの書き込み経路ではRCP適用を省かない。UNKNOWNのactorはA06台帳に残す。本PRは設計のみでテスト実装なし。
 
+## 2A-1. R2-NEW-002 — Actionの認可Resource TypeとRCP coverage（限定是正）
+
+AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、当該Actionで**認可されるResource type**に作用する。各ActionはAWS Service Authorization Reference（SAR）のAction行／Resource type列と突合する。管理アカウント資源・SLR例外はR1のA04契約を維持する。
+
+- `authorized_resource_types`を各Actionの**配列**とし、要素には`resource_type`、`resource_arn`、`resource_owner_account`、`sar_action_reference`、`required_or_optional`、`evidence_id`を含める。同一APIで複数の認可Resource typeが現れる場合、それぞれを別行で判定し、単純な1つのBooleanにしない。
+- `rcp_resource_coverage=COVERED`にできるのは、SAR Action行の認可Resource type、実際のリクエストで認可対象となったARN、対応するメンバーアカウントResource、RCP対応対象が**証拠で一致**したときだけ。RCPのPolicy本文・階層attachment・Conditionの検証は別であり、COVEREDだけではDeny確定でもAllow確定でもない。
+- `NOT_COVERED`は対象Action/認可ResourceがRCPの非対応範囲であることを**公式仕様と観測範囲**から確認した場合だけ。サービス対応だけ判明してもAction/Resource typeが不明なら`UNKNOWN`。ARNの所有者、SAR Action行、対応するResource typeのいずれかが欠落したら`UNKNOWN`を維持する。
+- SARでResource type欄が空／明示されない場合、その事实と対象SDK/Actionのモデルを記録し、RCP非適用を結論できるか独立照合する。未検証の場合は`UNKNOWN`であり、`rcp_applicable=NOT_SUPPORTED`に自動変換しない。
+- A06のWriter閉包は、全ての認可Resource typeの適用性とRCP/その他IAM評価が確定するまでOPEN。`exception_reason`と`authorization_reference_evidence_id`が揃わない除外・非対応の断定は禁止。
+
+**将来の合成反例テスト:** ① RCP対応サービスだが認可Resource typeが不明→UNKNOWN、② 同一サービスのAction A/Bで認可Resource typeが異なる→別結果、③ 複数Resource中1件が不明→全Writerを不可能としない、④ 管理アカウント資源→EXEMPT、⑤メンバー資源のSAR対象Resource type一致→COVERED、⑥SAR版／実SDK認可対象が矛盾→UNKNOWN。本PRではテスト設計のみ、コード実装なし。
+
 ## 2B. A05-Trailの時系列証拠／coverage契約（R1-004）
 
 ```json
