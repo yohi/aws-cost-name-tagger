@@ -196,6 +196,8 @@ Page ledger必須レコード候補:
 
 **R1-006（Grant取消）:** R2独立レビューで`RESOLVED_IN_REQUIREMENTS`。全SDKリクエスト直前のGrant有効期限・Owner取消・plan/HEAD・principal/context検証、page ledger記録、取消後`STOP_GRANT`、未承認RAW隔離の**要求契約**は維持。新規R2-N01は**論理SDK呼び出しを超える物理HTTP送信境界**の実装方針を別途限定是正するもので、R1-006を再OPENしない。
 
+**R2-NEW-002（RCP Resource Type）:** 別紙Owner Matrix `2A-1`で`authorized_resource_types`と`rcp_resource_coverage`をA04×A06 Actor/Action/Resourceごとに導入。Service Authorization ReferenceのAction/Resource typeを実際の認可対象ARN・owner accountに結び、対象外やUNKNOWNを区別する。Resource typeが未確認ならRCPの適用・Denyを推定せず、A06 writer候補をOPENにする。受入反例テスト18が未実装であり、今回の判定は`RESOLVED_IN_PROPOSAL`。
+
 **R2独立再審査結果:** R1の6件は**RESOLVED_IN_DESIGN_R2**（R1-006は特に`RESOLVED_IN_REQUIREMENTS`）で独立確認済み。再OPENしない。新規R2-N01 MajorとR2-N02 Minorは今回の**限定是正案**として`RESOLVED_IN_PROPOSAL`に止め、差分だけの独立再審査を待つ。Design Review Gateは引き続き`REVISION_REQUIRED`。実装・AWS実行Grantは成立しない。
 
 ## 9. 根拠となるAWS公式仕様
