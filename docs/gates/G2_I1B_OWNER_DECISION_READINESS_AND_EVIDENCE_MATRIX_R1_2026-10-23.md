@@ -49,6 +49,9 @@
   "resource_account": null,
   "resource_service": null,
   "action": null,
+  "authorized_resource_types": [],
+  "rcp_resource_coverage": "COVERED|NOT_COVERED|UNKNOWN",
+  "authorization_reference_evidence_id": null,
   "scp_applicable": "APPLICABLE|EXEMPT|UNKNOWN",
   "rcp_applicable": "APPLICABLE|EXEMPT|NOT_SUPPORTED|UNKNOWN",
   "exception_reason": null,
@@ -56,6 +59,8 @@
   "effective_write_reachability": "UNKNOWN"
 }
 ```
+
+`authorized_resource_types`は対象`action`のService Authorization Reference（SAR）Action表にある認可Resource typeを、ARN/owner account/必須・任意/証拠IDと一対一で記録する。`rcp_resource_coverage`はCOVERED/NOT_COVERED/UNKNOWNの三値で、ActionとResource typeの一致を確認するまではUNKNOWNを維持する。`authorization_reference_evidence_id`でSAR Action行・取得日・原本ハッシュを結ぶ。対応サービスという情報だけではRCPの適用は確定しない。 
 
 `exception_reason`はEXEMPT/NOT_SUPPORTEDなら必須。`evidence_id`にはIAM Role/SLR識別根拠、Organizations管理/委任管理account情報、対象Resource所有account、SCP/RCPの有効状態と階層attachment、対象サービスの公式サポート根拠を結ぶ。欠落時はUNKNOWNであり、推測で`scp_applicable=false`を埋めない。
 
@@ -67,6 +72,8 @@
 | 委任管理**メンバー**Role→対応メンバーResource | APPLICABLE | APPLICABLE | 委任管理という名目だけで除外しない |
 | **Service-linked role**→対応メンバーResource | EXEMPT | EXEMPT | SCP/RCPでは制限できない。role trust・service callerも調査 |
 | メンバーRole→**RCP非対応サービス** | APPLICABLE | NOT_SUPPORTED | RCPでwriter不可能としない |
+| RCP対応サービスだが当該Actionの認可Resource typeが未確定 | APPLICABLE | UNKNOWN | Action/Resource Type未確認はUNKNOWN。Writer候補を残す |
+| 対応Actionとメンバー所有認可Resource typeが証拠で一致 | APPLICABLE | APPLICABLE | Resourceごとに`rcp_resource_coverage=COVERED`。RCP Statementの効果は別判定 |
 | Principal/SLR/Resource所有者/サービス対応の根拠不明 | UNKNOWN | UNKNOWN | A06 writer候補を消さずOPEN |
 
 RCPは管理アカウントResourceには適用されず、対象は対応サービスのメンバーResource（外部principalからの呼出しにも適用され得る）。SCPは管理アカウントprincipalとSLRを除外。**ガードレール除外は実効ALLOWと同義ではない**。他のIAM/boundary/session/resource policy・trust・denyなどを引き続き検証する。
