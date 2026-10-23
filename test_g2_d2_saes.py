@@ -91,8 +91,6 @@ class OfflineSAESTests(unittest.TestCase):
                 self.assertEqual(g.simulate_recovery(), "SUSPENDED")
                 self.assertEqual(g.send_once(a, SyntheticTransport(),
                                               gateway_id=g.gateway_id, tick=3), "STOP_GRANT")
-                self.assertEqual(g.ledger[-2]["kind"], "RECOVERY_BLOCKED"
-                                 if False else g.ledger[-2]["kind"])
                 self.assertNotIn("REVOKE_ACK_SUCCESS",
                                  [x["kind"] for x in g.ledger])
 
