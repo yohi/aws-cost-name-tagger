@@ -185,7 +185,7 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
         elif exception == "SERVICE_LINKED_ROLE":
             if (data.get("service_linked_role") is True
                     and _id(data.get("service_linked_role_evidence_id"))
-                    and _id(official_id)):
+                    and official_verified):
                 cov, applicable = "NOT_COVERED", "EXEMPT"
         elif exception == "AWS_MANAGED_KMS_KEY":
             if (obj.get("key_manager") == "AWS"
