@@ -37,7 +37,9 @@ class SyntheticTransport:
 
     def __init__(self, outcome: str = "OK", *,
                  gate_entered: threading.Event | None = None,
-                 gate_release: threading.Event | None = None):
+                 gate_release: threading.Event | None = None,
+                 pre_start_entered: threading.Event | None = None,
+                 pre_start_release: threading.Event | None = None):
         if outcome not in ("OK", "THROTTLED", "CRASH_BEFORE_START",
                            "CRASH_AFTER_START"):
             raise OfflineContractError("Unsupported fixed simulation outcome")
@@ -47,10 +49,25 @@ class SyntheticTransport:
                 type(gate_entered) is not type(threading.Event())
                 or type(gate_release) is not type(threading.Event())):
             raise OfflineContractError("Trusted threading.Event barriers only")
+        if (pre_start_entered is None) != (pre_start_release is None):
+            raise OfflineContractError("Both pre-start barriers required")
+        if pre_start_entered is not None and (
+                type(pre_start_entered) is not type(threading.Event())
+                or type(pre_start_release) is not type(threading.Event())):
+            raise OfflineContractError("Trusted pre-start barriers only")
+        self.pre_start_entered = pre_start_entered
+        self.pre_start_release = pre_start_release
         self.outcome = outcome
         self.gate_entered = gate_entered
         self.gate_release = gate_release
         self.physical_send_count = 0
+
+    def before_start(self) -> None:
+        """Synthetic barrier AFTER admission and BEFORE first send."""
+        if self.pre_start_entered is not None:
+            self.pre_start_entered.set()
+            if not self.pre_start_release.wait(timeout=5):
+                raise SimulatedTransportCrash("Pre-start barrier timeout")
 
     def send_once(self) -> str:
         """Model only the first local HTTP request-byte send boundary."""
@@ -110,6 +127,10 @@ class OfflineSAES:
     def ledger(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
             return tuple(dict(record) for record in self._records)
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested.is_set()
 
     @property
     def state(self) -> str:
@@ -176,6 +197,13 @@ class OfflineSAES:
             # Atomicity here is an *in-memory model*, not an OS proof.
             # No lock is released between authorization and send simulation.
             self._attempts[attempt.attempt_id] = "STARTING"
+            try:
+                transport.before_start()
+            except SimulatedTransportCrash:
+                self._attempts[attempt.attempt_id] = "SEND_OUTCOME_UNKNOWN"
+                self._state = "SUSPENDED"
+                self._record("SEND_OUTCOME_UNKNOWN", attempt.attempt_id)
+                return "SEND_OUTCOME_UNKNOWN"
             if self._cancel_requested.is_set():
                 self._attempts[attempt.attempt_id] = "CANCELLED_BEFORE_SEND"
                 self._record("CANCELLED_BEFORE_SEND", attempt.attempt_id)
