@@ -69,3 +69,16 @@ The `SAES` implementation is **not** a production Grant Authority or network tra
 
 **New independent review should specifically challenge:** forged proof copies, resubmission without a proof, a fingerprint swap after queueing, cancellation between admission and first byte, started-before-revoke ledger order, SAR REQUIRED types absent for the current request without authentic proof, and malformed exception URL/time. Existing R1 six and R3-LIM design closure statuses are unchanged.
 
+
+## 6. Fixed-HEAD R2 Independent Re-review — R2-NEW-001 Limited Correction
+
+**Review baseline:** `629614116ea6472098944504cde7f38c62e11be6`. Independent result: `REVISION_REQUIRED` because a `REVOKE_REQUESTED` event could occur after the old cancellation check but before the synthetic first-byte callback. The five previous findings `FND-D2-001..005` remain `RESOLVED_IN_SOURCE`, not reopened.
+
+**Author-side correction — `CORRECTED_IN_PROPOSAL`, independent closure pending:**
+
+- `mark_first_byte()` now obtains the same `_event_lock` as `revoke()` and rechecks `_cancel_requested` **inside that critical section** before updating `physical_send_count`, `_known_started` or logging `SEND_STARTED`.
+- If revocation has already signaled, the callback raises `SimulatedGrantCancelled`. `send_once()` transitions that attempt to `CANCELLED_BEFORE_SEND`, records the cancellation, and returns `STOP_GRANT` without a synthetic physical-send increment.
+- If first-byte start wins, `SEND_STARTED` is committed while holding `_event_lock` **before** `REVOKE_REQUESTED` can be committed. The earlier send retains the existing in-flight boundary and cancellation success ACK still waits for the enclosing sequencer.
+- `SyntheticTransport` provides optional, trusted-test-only `pre_mark_entered`/`pre_mark_release` barriers **after the old cancellation check but immediately before the atomic callback**. The test `test_r2_new_001_cancel_after_old_check_before_first_byte` deterministically injects revocation in this exact window and asserts zero sends, no `SEND_STARTED`, `REVOKE_REQUESTED` before `CANCELLED_BEFORE_SEND`, and `REVOKE_COMMITTED` before ACK.
+
+This proves only an **in-memory synthetic ordering property** if the fixed-HEAD offline CI passes. It does **not** prove atomic real TCP/TLS/HTTP byte transmission, authenticated revocation, durable ledger linearizability, multi-host fencing, or runtime cancellation. These remain `NOT_PROVEN`. Do not merge before fresh independent fixed-HEAD R2-NEW-001 limited re-review; no AWS access is authorized.
