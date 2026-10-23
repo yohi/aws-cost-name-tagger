@@ -28,7 +28,7 @@ def resource(index, typ, name, *, owner="member-account", **kw):
 
 def fixture(rows=None, *, action="synthetic:Action"):
     rows = list(rows if rows is not None else [resource(0, "type-a", "a")])
-    return {
+    payload = {
         "actor_id": "synthetic-role",
         "action": action,
         "request_fingerprint_sha256": "synthetic-request-hash",
@@ -57,6 +57,22 @@ def fixture(rows=None, *, action="synthetic:Action"):
         "management_account_id": "management-account",
         "management_account_evidence_id": "synthetic-organization-proof",
     }
+    # A request-specific synthetic explanation is needed when SAR requires
+    # a type that the closed request resource set does not contain.
+    present = {row["resource_type"] for row in rows}
+    payload["absent_required_resource_types"] = [
+        {
+            "resource_type": item["resource_type"],
+            "reason": "ACTION_VARIANT_NOT_APPLICABLE",
+            "evidence_id": "synthetic-request-specific-absence-proof",
+            "request_fingerprint_sha256": payload["request_fingerprint_sha256"],
+            "sar_evidence_id": item["sar_evidence_id"],
+        }
+        for item in payload["authorized_resource_types"]
+        if item["required_or_optional"] == "REQUIRED"
+        and item["resource_type"] not in present
+    ]
+    return payload
 
 
 class ResourceEvaluationTests(unittest.TestCase):
@@ -70,6 +86,33 @@ class ResourceEvaluationTests(unittest.TestCase):
                          "OPTIONAL")
         self.assertEqual(out["effective_write_reachability"], "UNKNOWN")
         self.assertEqual(out["g2_gate"], "NOT_VERIFIED")
+
+    def test_d2_003_sar_required_type_missing_requires_request_bound_reason(self):
+        # SAR type-a REQUIRED; request only identifies optional type-b.
+        request = fixture([resource(0, "type-b", "b")])
+        self.assertEqual(evaluate_action(request)["aggregate_coverage"], "COVERED")
+        for field, bad in (
+            ("absent_required_resource_types", []),
+            ("absent_required_resource_types", None),
+        ):
+            case = copy.deepcopy(request)
+            case[field] = bad
+            with self.subTest(field=field, bad=bad):
+                self.assertEqual(evaluate_action(case)["aggregate_coverage"], "UNKNOWN")
+        for field, bad in (
+            ("request_fingerprint_sha256", "different-request"),
+            ("sar_evidence_id", "different-sar"),
+            ("evidence_id", None),
+            ("reason", "UNVERIFIED"),
+        ):
+            case = copy.deepcopy(request)
+            case["absent_required_resource_types"][0][field] = bad
+            with self.subTest(field=field):
+                self.assertEqual(evaluate_action(case)["aggregate_coverage"], "UNKNOWN")
+        case = copy.deepcopy(request)
+        case["absent_required_resource_types"].append(
+            copy.deepcopy(case["absent_required_resource_types"][0]))
+        self.assertEqual(evaluate_action(case)["aggregate_coverage"], "UNKNOWN")
 
     def test_mixed_and_unknown_priority(self):
         first = resource(0, "type-a", "a")
@@ -173,6 +216,29 @@ class ResourceEvaluationTests(unittest.TestCase):
                 self.assertEqual(
                     evaluate_action(fixture([case], action="kms:Decrypt"))
                     ["aggregate_coverage"], "UNKNOWN")
+
+    def test_d2_005_official_source_must_have_valid_https_url_and_utc_date(self):
+        row = resource(
+            0, "key", "kms", exception_code="AWS_MANAGED_KMS_KEY",
+            key_manager="AWS", key_manager_evidence_id="synthetic-key-proof",
+            exception_evidence_id="official-sar-proof")
+        for field, bad in (
+            ("exception_source_url", "not-a-url"),
+            ("exception_source_url", "http://docs.aws.amazon.com/test"),
+            ("exception_source_url", "https://not-amazon.example/test"),
+            ("exception_checked_at_utc", "invalid-date"),
+            ("exception_checked_at_utc", "2026-99-99T25:61:61Z"),
+            ("exception_checked_at_utc", "2026-10-23T00:00:00+09:00"),
+        ):
+            case = copy.deepcopy(row)
+            case[field] = bad
+            with self.subTest(field=field, bad=bad):
+                self.assertEqual(
+                    evaluate_action(fixture([case], action="kms:Decrypt"))
+                    ["aggregate_coverage"], "UNKNOWN")
+        self.assertEqual(
+            evaluate_action(fixture([row], action="kms:Decrypt"))
+            ["aggregate_coverage"], "NOT_COVERED")
 
     def test_aws_managed_key_exception_requires_exact_kms_action_and_type(self):
         row = resource(
