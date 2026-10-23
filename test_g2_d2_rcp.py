@@ -174,6 +174,21 @@ class ResourceEvaluationTests(unittest.TestCase):
                     evaluate_action(fixture([case], action="kms:Decrypt"))
                     ["aggregate_coverage"], "UNKNOWN")
 
+    def test_aws_managed_key_exception_requires_exact_kms_action_and_type(self):
+        row = resource(
+            0, "key", "kms", exception_code="AWS_MANAGED_KMS_KEY",
+            key_manager="AWS", key_manager_evidence_id="synthetic-key-proof",
+            exception_evidence_id="official-rcp-exception-proof")
+        self.assertEqual(
+            evaluate_action(fixture([row], action="synthetic:Action"))
+            ["aggregate_coverage"], "UNKNOWN")
+        row["resource_type"] = "key-other"
+        case = fixture([row], action="kms:Decrypt")
+        case["authorized_resource_types"].append(
+            {"resource_type": "key-other", "required_or_optional": "OPTIONAL",
+             "sar_evidence_id": "synthetic-sar-row"})
+        self.assertEqual(evaluate_action(case)["aggregate_coverage"], "UNKNOWN")
+
     def test_kms_retire_grant_action_specific_exception(self):
         row = resource(0, "key", "kms", exception_code="KMS_RETIRE_GRANT",
                        exception_evidence_id="official-kms-retire-proof")
