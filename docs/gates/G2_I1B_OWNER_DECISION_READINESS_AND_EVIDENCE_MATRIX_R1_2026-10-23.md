@@ -301,9 +301,11 @@ R1の6件は独立レビューでクローズ済みとして維持。R2-NEW-001/
 
 ## 5. Independent Design Review依頼内容
 
+**今回のR3限定審査ではR3-LIM-001/002だけを判定し、R1の6件を再OPENしない。** 送信と取消の順序保証がコードにより証明されたと推定せず、D2に着手可能な検証可能仕様かを評価する。
+
 独立レビュアーには次を要求する。
 
-- G2 R1.1原文と本R2の**正規スコープ差分**（勝手な認可拡張・候補API不足・Source漏れ）、P1〜P4とP2-LakeのIAM principalと実行権限分離を追跡する。
+- G2 R1.1原文と本R3の**限定差分**（勝手な認可拡張・候補API不足・Source漏れ）、P1〜P4とP2-LakeのIAM principalと実行権限分離を追跡する。
 - 具体的に不足するAPI・condition・resource-level IAM対応、CloudTrail 3ソースでの非原子的なcoverage、Identity Center Permission Set/Group/Roleマッピング、OU/root SCP/RCP継承を反証可能なFindingとして示す。
 - RAW保存と公開ZIPの安全性、認証情報漏洩、失敗・中断、将来のOwner署名と実行者の分離を評価する。
 - **提出判定は`ACCEPTABLE_IN_DESIGN`または`REVISION_REQUIRED`等の設計に限る**。`AWS GRANT APPROVED`／`G2 VERIFIED`を自動付与しない。
