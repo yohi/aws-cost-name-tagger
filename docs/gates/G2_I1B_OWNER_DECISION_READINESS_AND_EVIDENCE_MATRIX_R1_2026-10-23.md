@@ -205,6 +205,26 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 
 すでに送信済みのin-flightリクエストは後から巻き戻せる保証がないため、失効時の応答と既取得RAWは`UNAUTHORIZED_AFTER_REVOKE`という**内部保全ラベル**で未承認seal・隔離し、共有不可。再開には新しいOwner決裁・新規snapshot IDと独立確認が必須。これは設計上の要求であり、現PRには取消実装もOwner Grantも存在しない。
 
+## 2C-1. R3-LIM-001 — 取消完了と物理送信開始のイベント・証跡契約
+
+採用する唯一の参照方式は、[Reference Design R3 §3B](G2_I1B_READ_ONLY_COLLECTOR_REFERENCE_DESIGN_R1_2026-10-23.md)の **Single Authority–Egress Sequencer（SAES）** である。WorkerはAWSへ直結しない。Grant authorityと唯一のAWS Egress Gatewayが同一sequencerで送信開始・取消確定を全順序化する。
+
+| 事象 | 必須ledger証拠 | 判定 |
+|---|---|---|
+| SEND_REQUESTED / SEND_ADMITTED | attempt_id、Grant、epoch、context、plan、request指紋 | 未送信なら取消可能 |
+| SEND_INTENT | 送信前の耐久journal記録 | 永続化失敗ならSEND禁止 |
+| SEND_STARTED | Gateway ID/fencing epoch、ローカルsocket I/Oに最初のHTTP request byteを渡した観測時点、送信seq | 同一critical section内でGrant評価と送信開始を直列化 |
+| REVOKE_REQUESTED | Owner署名・Grant・epoch・sequence | CANCEL_PENDING、新admission禁止 |
+| REVOKE_COMMITTED | epochの耐久更新、未送信attemptの破棄、Gateway fencing証拠 | 以後の新規SEND_STARTEDを禁止 |
+| REVOKE_ACK_SUCCESS | 上記全証拠、耐久revoke seq、Owner通知時刻 | ここでのみ取消成功と宣言 |
+| Crash / authority partition / Gateway fencing不明 | 残留queue・障害根拠・SEND_INTENT/SEND_STARTED状態 | CANCEL_PENDING または SEND_OUTCOME_UNKNOWN。ACK成功不可 |
+
+**順序の定義:** 送信開始側が先にsequencerを確保すれば、ローカルsocket I/Oで最初のHTTP request byteの引渡しが確認されるか送信前中止が確定するまで取消成功をACKしない。取消側が先にCANCEL_PENDINGになれば新たなSEND_ADMITTED禁止。未開始のadmitted/queued attemptは破棄する。古い短命permit/epochだけではSAES外の送信を許可できない。
+
+**Authority/Host障害:** 旧GatewayをOS/network policy等で確実にfenceできない場合は新Gateway起動・Owner取消成功ACK禁止。SEND_INTENTとSEND_STARTEDの間にCrashした場合は送信の有無を推定せずSEND_OUTCOME_UNKNOWN、同じattemptを自動retryしない。認証プロバイダやredirect等の別送信経路を閉じられない環境もSTRICT_REVOCATION_NOT_PROVEN。
+
+**保証範囲:** OwnerへのREVOKE_ACK_SUCCESS以降の**新規のGateway-local SEND_STARTED=0**。AWS側受信時刻、以前に開始済みのin-flight byte完送/取消は保証しない。before-call/before-sendのイベント発火のみを送信開始の証明として扱わず、初回HTTP request byteのtransport受理と取消順序をD2の合成transport試験で示す。証明不能ならRuntime禁止。
+
 ## 3. 権限取得前の決裁未確定項目（**未署名**）
 
 次の項目が揃うまでは、**AWSに1回も接続しない**。
