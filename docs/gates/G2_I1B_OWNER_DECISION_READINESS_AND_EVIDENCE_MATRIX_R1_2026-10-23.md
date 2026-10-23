@@ -272,6 +272,11 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 17. **R2-N01 物理送信境界とOwner取消:** 合成transportで初回`SEND_ONCE`→Throttling/5xx→SDK標準内部retryが無効のままCollector再試行を予約→OwnerがGrant取消・`revocation_epoch`更新→再試行の`CHECK_GRANT`が`STOP_GRANT`→**以後のHTTP transport send 0回**を確認。`before-call`検証後の取消、`before-send`前の取消、照会不能、期限切れ、SDK設定改変、custom retry handler、redirect、別Client、競合同時実行とin-flight隔離を含める。`before-send`のみの単体テストではtransport経路全体を証明しない。
 18. **R2-N02 RCP Action/Resource Type:** RCP対応サービスでActionの認可Resource type不明→`UNKNOWN`。同一サービスの別Actionで異なるタイプ、複数Resourceの一部が不明、管理資源、サービスリンクロール、SAR版不一致を合成し、`rcp_resource_coverage`をresource別に確認。`UNKNOWN`を`NOT_SUPPORTED`や書込不可能に変換しない。
 
+19. **R3-LIM-001 決定論的並行テスト:** 2 Workerと単一SAESにBarrierを配置。SEND_ADMITTED後でSEND_STARTED前に取消要求。取消のREVOKE_COMMITTEDが先なら送信開始0件。送信の最初のHTTP request byteが先にtransportで受理されたなら、SEND_STARTED seqが取消seqより前になり、Owner取消成功ACKはその送信開始/中止確定まで待つ。取消後は未開始queue/permitを全て破棄。
+20. **R3-LIM-001 障害・回復:** Authority停止/分断、旧Gateway fencing失敗、並列Host旧epoch、Permit replay、credential provider/redirect迂回、SEND_INTENT記録後かつSEND_STARTED確定前のCrashで、取消成功ACK禁止またはSEND_OUTCOME_UNKNOWN。再起動後の自動再送0、旧LeaderのAWS直結0を合成transportとネットワーク遮断環境で検査。
+21. **R3-LIM-002 一意性・集約:** [COVERED,UNKNOWN]→UNKNOWN、[COVERED,NOT_COVERED]→MIXED、[NOT_COVERED,NOT_COVERED]→NOT_COVERED（2件とも証明済）、空/重複/未識別Resource/期待数不一致→UNKNOWN。Action親の集約値からWriterを自動的に閉じない。
+22. **R3-LIM-002 KMS例外:** AWS managed KMS keyはKeyManager=AWSの原本証拠があればResource別NOT_COVERED。Customer-managed KMS keyは別判定。kms:RetireGrantはAction別RCP対象外。管理Account resourceとService-linked Roleは別種のEXEMPT。公式例外資料・Key管理者の証拠欠落時はUNKNOWN。
+
 ## 4A. R1 Finding Closure Tracker（R2独立クローズ済み）
 
 | Finding | Major/Minor | R2の証拠箇所 | 現時点の判定 |
@@ -283,7 +288,16 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 | R1-005 | Minor | A01 Filter5種類とDefaultVersionId・本文ハッシュ照合、受入試験15 | RESOLVED_IN_DESIGN_R2 |
 | R1-006 | Minor | 本表 2Cおよび参照設計page ledgerのGrant再検証、受入試験16 | RESOLVED_IN_REQUIREMENTS |
 
-**R2独立再レビューでR1の6件は設計上クローズ済み**（R1-001〜005=`RESOLVED_IN_DESIGN_R2`、R1-006=`RESOLVED_IN_REQUIREMENTS`）。R1の6件を再OPENしない。新規`R2-NEW-001 Major`と`R2-NEW-002 Minor`は今回**LIMITED_CORRECTIONS_IN_PROPOSAL**とし、限定差分の新しい独立再レビューを待つ。Design Review Gateは`REVISION_REQUIRED`を維持する。
+**R2独立再レビューでR1の6件は設計上クローズ済み**（R1-001〜005=`RESOLVED_IN_DESIGN_R2`、R1-006=`RESOLVED_IN_REQUIREMENTS`）。R1の6件を再OPENしない。R2-NEW-001/002は独立判定PARTIALLY_RESOLVEDを継承。R3-LIM-001/002はRESOLVED_IN_PROPOSALで独立限定再レビュー待ち。Design Review Gateは`REVISION_REQUIRED`を維持する。
+
+## 4B. R3限定Finding追跡
+
+| Finding | 独立レビュー状態 | R3限定是正案 | 現在の状態 |
+|---|---|---|---|
+| R3-LIM-001 Major | OPEN | Reference Design §3Bと本書§2C-1で送信/取消直列化、Gateway fencing、障害/Crashの結果不明と試験19/20を規定 | RESOLVED_IN_PROPOSAL |
+| R3-LIM-002 Minor | OPEN | 本書§2A-2でResourceごとの一意キー、集約とKMS例外、試験21/22を規定 | RESOLVED_IN_PROPOSAL |
+
+R1の6件は独立レビューでクローズ済みとして維持。R2-NEW-001/002の独立判定PARTIALLY_RESOLVEDは本R3を再審査するまで維持する。著者のRESOLVED_IN_PROPOSALは正式クローズではない。
 
 ## 5. Independent Design Review依頼内容
 
@@ -297,8 +311,8 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 
 ## 6. 次の安全な作業分解
 
-- **I1-B R2（本PR）:** 非実行設計2文書のR1独立レビュー指摘6件の是正。実行権限は未付与。
-- **I1-B D2（別PR）:** 本R2の独立再レビューを経て、実SDKモデルに基づく純粋なschemaと合成fixtureのoffline契約テストを実装する。AWS接続なし。
+- **I1-B R3（本PR）:** マージ済みPR #6の設計文書2件のみ更新。R3-LIM-001/002の限定是正。実行権限は未付与。
+- **I1-B D2（別PR）:** 本R3限定独立再レビューで受入後、実SDKモデルに基づく純粋なschemaと合成fixtureのoffline契約テストを実装する。AWS接続なし。
 - **I1-B Runtime（別PR + 別Grant）:** Authenticated read-only client、strict policy guard、RAW writer、audit/observabilityの実装とoffline test。接続前の別審査必須。
 - **G2 Evidence Capture（別Owner決裁）:** 固定したAWS Account/role/期間/sourceにだけ短期アクセスして、完全性を過大評価しない収集。
 - **G2 Independent Assessment:** 実収集証拠に対する第三者判断。G1 NOT PROVENなら書き込み再開なし。
