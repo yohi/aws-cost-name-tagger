@@ -28,6 +28,17 @@ class Attempt:
     epoch: int
 
 
+@dataclass(frozen=True)
+class SyntheticFencingEvidence:
+    """Synthetic post-revocation fencing witness, NOT authentic AWS/OS proof."""
+
+    grant_id: str
+    gateway_id: str
+    revoke_request_seq: int
+    fenced_epoch: int
+    evidence_id: str
+
+
 class SyntheticTransport:
     """Fixed synthetic transport; increments a counter, NEVER sends bytes.
 
@@ -69,11 +80,11 @@ class SyntheticTransport:
             if not self.pre_start_release.wait(timeout=5):
                 raise SimulatedTransportCrash("Pre-start barrier timeout")
 
-    def send_once(self) -> str:
-        """Model only the first local HTTP request-byte send boundary."""
+    def send_once(self, mark_send_started) -> str:
+        """Atomically mark the first synthetic byte before post-start barrier."""
         if self.outcome == "CRASH_BEFORE_START":
             raise SimulatedTransportCrash("Unknown before I/O observation")
-        self.physical_send_count += 1
+        mark_send_started()
         if self.gate_entered is not None:
             self.gate_entered.set()
             if not self.gate_release.wait(timeout=5):
@@ -111,11 +122,13 @@ class OfflineSAES:
         self._epoch = 0
         self._state = "ACTIVE"
         self._attempts: dict[str, str] = {}
+        self._bindings: dict[str, tuple[str, str, str, str, int]] = {}
+        self._revoke_request_seq: int | None = None
         self._records: list[dict[str, Any]] = []
         self._known_started = 0
         self._gateway_fencing_proven = True
 
-    def _record(self, kind: str, attempt_id: str | None = None) -> None:
+    def _record(self, kind: str, attempt_id: str | None = None) -> int:
         with self._event_lock:
             self._records.append({
                 "seq": len(self._records) + 1, "kind": kind,
@@ -124,11 +137,17 @@ class OfflineSAES:
                 "gateway_id": self.gateway_id,
                 "provenance": "SYNTHETIC_IN_MEMORY_NOT_DURABLE",
             })
+            return len(self._records)
 
     @property
     def ledger(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
             return tuple(dict(record) for record in self._records)
+
+    @property
+    def revoke_request_seq(self) -> int | None:
+        with self._event_lock:
+            return self._revoke_request_seq
 
     @property
     def cancel_requested(self) -> bool:
@@ -151,12 +170,17 @@ class OfflineSAES:
                 and not self._cancel_requested.is_set()
                 and self._gateway_fencing_proven)
 
+    @staticmethod
+    def _identity(attempt: Attempt) -> tuple[str, str, str, str, int]:
+        return (attempt.attempt_id, attempt.plan_sha256, attempt.context_id,
+                attempt.request_fingerprint, attempt.epoch)
+
     def queue_attempt(self, attempt: Attempt, *, tick: int) -> str:
         if type(attempt) is not Attempt:
             raise OfflineContractError("Exact synthetic Attempt required")
         if any(type(v) is not str or not v for v in (
                 attempt.attempt_id, attempt.plan_sha256,
-                attempt.context_id, attempt.request_fingerprint)):
+                attempt.context_id, attempt.request_fingerprint)) or type(attempt.epoch) is not int:
             raise OfflineContractError("Invalid synthetic request")
         with self._lock:
             if not self._grant_valid(tick):
@@ -171,6 +195,7 @@ class OfflineSAES:
                 self._record("STOP_DUPLICATE", attempt.attempt_id)
                 return "STOP_DUPLICATE"
             self._attempts[attempt.attempt_id] = "QUEUED"
+            self._bindings[attempt.attempt_id] = self._identity(attempt)
             self._record("SEND_REQUESTED", attempt.attempt_id)
             return "QUEUED"
 
@@ -191,6 +216,10 @@ class OfflineSAES:
             if self._attempts.get(attempt.attempt_id) != "QUEUED":
                 self._record("STOP_UNQUEUED", attempt.attempt_id)
                 return "STOP_UNQUEUED"
+            if self._bindings.get(attempt.attempt_id) != self._identity(attempt):
+                self._attempts[attempt.attempt_id] = "REJECTED_BINDING"
+                self._record("STOP_BINDING_MISMATCH", attempt.attempt_id)
+                return "STOP_BINDING_MISMATCH"
             if self._known_started >= self.max_sends:
                 self._record("STOP_BUDGET", attempt.attempt_id)
                 return "STOP_BUDGET"
@@ -210,40 +239,77 @@ class OfflineSAES:
                 self._attempts[attempt.attempt_id] = "CANCELLED_BEFORE_SEND"
                 self._record("CANCELLED_BEFORE_SEND", attempt.attempt_id)
                 return "STOP_GRANT"
+            def mark_first_byte() -> None:
+                # Synthetic send linearization: counter and SEND_STARTED are
+                # under the same event lock, before the post-start barrier.
+                with self._event_lock:
+                    transport.physical_send_count += 1
+                    self._known_started += 1
+                    self._attempts[attempt.attempt_id] = "STARTED"
+                    self._record("SEND_STARTED", attempt.attempt_id)
+
             try:
-                outcome = transport.send_once()
+                outcome = transport.send_once(mark_first_byte)
             except SimulatedTransportCrash:
                 self._attempts[attempt.attempt_id] = "SEND_OUTCOME_UNKNOWN"
                 self._state = "SUSPENDED"
                 self._record("SEND_OUTCOME_UNKNOWN", attempt.attempt_id)
                 return "SEND_OUTCOME_UNKNOWN"
-            self._known_started += 1
-            self._attempts[attempt.attempt_id] = "STARTED"
-            self._record("SEND_STARTED", attempt.attempt_id)
             self._record("RESPONSE_" + outcome, attempt.attempt_id)
             return outcome
 
-    def revoke(self, *, gateway_fencing_proven: bool = True) -> str:
-        if type(gateway_fencing_proven) is not bool:
-            raise OfflineContractError("Explicit fencing proof required")
-        # Record revocation intent atomically with signaling cancellation,
-        # BEFORE waiting for an already-admitted send to release the lock.
+    def revoke(self) -> str:
+        """Request cancellation; NEVER emit success ACK without fencing evidence.
+
+        Repeated calls do not reset the unproven state or create new proofs.
+        """
         with self._event_lock:
-            self._cancel_requested.set()
-            self._record("REVOKE_REQUESTED")
+            if not self._cancel_requested.is_set():
+                self._cancel_requested.set()
+                self._revoke_request_seq = self._record("REVOKE_REQUESTED")
         with self._lock:
             if self._state == "REVOKED":
                 return "REVOKED"
             self._state = "CANCEL_PENDING"
-            self._gateway_fencing_proven = gateway_fencing_proven
-            for aid, st in self._attempts.items():
-                if st == "QUEUED" or st == "STARTING":
+            self._gateway_fencing_proven = False
+            for aid, state in self._attempts.items():
+                if state in ("QUEUED", "STARTING"):
                     self._attempts[aid] = "CANCELLED_BEFORE_SEND"
                     self._record("CANCELLED_BEFORE_SEND", aid)
-            if not gateway_fencing_proven:
+            self._record("FENCING_PENDING")
+            return "CANCEL_PENDING"
+
+    def finalize_revoke(self, evidence: SyntheticFencingEvidence | None) -> str:
+        """Accept explicit request-bound synthetic fencing evidence, or stay pending.
+
+        A checked data shape is not real proof of OS gateway fencing. Only a
+        later runtime security review can substantiate that separate boundary.
+        """
+        if evidence is not None and type(evidence) is not SyntheticFencingEvidence:
+            raise OfflineContractError("Fixed synthetic evidence type required")
+        with self._lock:
+            if self._state == "REVOKED":
+                return "REVOKED"
+            valid = (
+                self._state == "CANCEL_PENDING"
+                and self._cancel_requested.is_set()
+                and evidence is not None
+                and evidence.grant_id == self.grant_id
+                and evidence.gateway_id == self.gateway_id
+                and type(evidence.revoke_request_seq) is int
+                and evidence.revoke_request_seq == self._revoke_request_seq
+                and type(evidence.fenced_epoch) is int
+                and evidence.fenced_epoch == self._epoch + 1
+                and type(evidence.evidence_id) is str
+                and bool(evidence.evidence_id)
+                and len(evidence.evidence_id) <= 256
+            )
+            if not valid:
                 self._record("FENCING_UNPROVEN")
                 return "CANCEL_PENDING"
+            self._gateway_fencing_proven = True
             self._epoch += 1
+            self._record("FENCING_EVIDENCE_ACCEPTED")
             self._state = "REVOKED"
             self._record("REVOKE_COMMITTED")
             self._record("REVOKE_ACK_SUCCESS")
