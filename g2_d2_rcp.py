@@ -144,17 +144,19 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
             seen_obs.add(key_tuple)
             seen_arn_type.add((typ, arn))
         row = _unknown_row(obj, key_string, "UNKNOWN")
-        match = expected_lookup.get(key_tuple) if isinstance(key_tuple, tuple) else None
+        match = (expected_lookup.get(key_tuple)
+                 if type(index) is int and _id(typ) and _id(arn) else None)
         official_id = obj.get("exception_evidence_id")
         exception = obj.get("exception_code", "NONE")
         resource_owner = obj.get("resource_owner_account")
         if (match is None or not sar_valid or not expected_valid
                 or not _id(obj.get("sar_evidence_id"))
+                or not _id(typ)
                 or obj.get("sar_evidence_id") != sar_map.get(typ, {}).get("sar_evidence_id")
                 or obj.get("resource_owner_account") != match.get("resource_owner_account")
                 or not _id(obj.get("resource_evidence_id"))
                 or not _id(resource_owner)
-                or exception not in EXCEPTIONS):
+                or type(exception) is not str or exception not in EXCEPTIONS):
             rows.append(row)
             continue
         # Unknown exception evidence never proves absence of RCP.
