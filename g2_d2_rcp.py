@@ -56,11 +56,11 @@ def _source_proof(row: dict[str, Any]) -> bool:
     stamp = row.get("exception_checked_at_utc")
     if (not _id(row.get("exception_evidence_id"))
             or type(url) is not str
-            or re.fullmatch(r"https://docs\\.aws\\.amazon\\.com/[A-Za-z0-9._~/%?=&+-]+", url) is None
+            or re.fullmatch(r"https://docs\.aws\.amazon\.com/[A-Za-z0-9._~/%?=&+-]+", url) is None
             or type(h) is not str or len(h) != 64
             or any(c not in "0123456789abcdef" for c in h)
             or type(stamp) is not str
-            or re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z", stamp) is None):
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp) is None):
         return False
     try:
         datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
