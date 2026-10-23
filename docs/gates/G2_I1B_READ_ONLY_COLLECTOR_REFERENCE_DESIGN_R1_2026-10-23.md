@@ -71,12 +71,26 @@ Offline verification / independent reviewer（raw_secureは共有しない）
 ## 3. 認可・実行preflight（実装前の要求）
 
 1. **Grant binding:** 人間Ownerの署名済み決裁原本と、固定した`plan_sha256`／コードcommit／収集対象Account／context principal・role ARN／regions／from-to-as_of／保存先／費用・回数・bytes上限／有効期限／中止条件を一対一で紐付ける。どれか欠けたら`NOT_AUTHORIZED`（現状は全て未承認）。**Grantは各AWSリクエスト直前（ページ遷移・retry・BEGIN/ENDも含む）に再認証・再評価する。取消・期限切れ・状態照会不能・code/plan/credential context変更があれば次リクエストを出さず停止し、取得済み証拠を未承認状態でsealする。**
-2. **Client creation:** 管理者指定profile/credential-providerを使い、接続前に環境値・出力先の安全性、対象アカウントの確認方法、SDKバージョン・TLS・リトライ・endpoint方針を検査。任意`endpoint_url`やローカルmetadata認証への予期せぬfallbackを許可しない。認証情報をログ／保存ファイルへ出さない。
+2. **Client creation:** 管理者指定profile/credential-providerを使い、接続前に環境値・出力先の安全性、対象アカウントの確認方法、SDKバージョン・TLS・endpoint方針を検査。**Botocore標準内部リトライを`Config(retries={"mode": "standard", "total_max_attempts": 1})`で禁止し、全Clientの`client.meta.config.retries.total_max_attempts=1`相当を実測検証**する。`AWS_MAX_ATTEMPTS`/profileからの意図しない上書き、adaptive retry、別SDK client/独自retry event handlerを拒否。任意`endpoint_url`やmetadata認証への予期せぬfallbackを許可しない。認証情報をログ／保存ファイルへ出さない。**設定値だけでは物理HTTP送信が1回と証明したことにはならず、送信試行監査が別途必須**。
 3. **STS identity:** コンテキストごとにAccount・ARN・UserId（必要ならrole sessionの追加根拠）を確認し、期待Account/ARNと一致しなければ即停止。STS照合だけで「readonly=true」を立てない。
 4. **Permission feasibility:** 発行可能な権限からIAM/SCP/permission boundary/resource policyを独立評価。CloudTrailやSource側の収集権限が欠ければそのsourceは`ACCESS_DENIED`で、別アカウント／roleへ自動切替しない。
-5. **Request allowlist:** **毎回**Context×SDK operation×IAM action×resource×全params×region×timeに加え、Grantの有効性・未取消・plan/HEAD fingerprint・principal一致を照合した直後にread-onlyの正規APIだけを実行。中間のClock/取消取得失敗も`STOP_GRANT`。API呼び出し中の失効は既に送出されたAPIを取り消せる保証ではないため、返却は未承認／隔離し、後続呼び出しをゼロにする。非許可・スキーマ不正・範囲外で`STOP_POLICY`。
-6. **Budgets:** 全体とsource別でpages/API calls/bytes/期間/estimated costsをハード制限。RateLimitは明示制御（CloudTrail LookupEventsは2 calls/s/account/Region）。読取のみの有限回数retryは別途決定し、結果・retry回数・ページ重複をledgerに残す。上限超過は`PARTIAL`で停止し、全件成功に見せない。
+5. **Request allowlist:** **毎回の物理HTTP送信試行**の直前にContext×SDK operation×IAM action×resource×全params×region×time、Grant有効性・未取消・plan/HEAD fingerprint・principal一致を検証し、正規allowlist操作だけを送出する。`before-call`は論理SDK呼び出しのpreflight補助と位置付け、再送信境界の代わりにしない。Collector所有の明示的`send_attempt`経路に送信を集約し、送信直前の`before-send`/認可済みtransport guard等の実効監査が必要。時刻や取消状態照会に失敗したら`STOP_GRANT`。既送信in-flightの巻戻しは保証せず、未承認隔離・後続送信禁止。非許可・スキーマ不正・範囲外で`STOP_POLICY`。
+6. **Budgets:** 全体とsource別でpages/API calls/**physical HTTP sends**/bytes/期間/estimated costsをハード制限。RateLimitは明示制御（CloudTrail LookupEventsは2 calls/s/account/Region）。**SDK側リトライなし**。有限回数の読み取り再試行を許す場合も、毎回のCollector-owned試行ごとにOwner Grant再検証→allowlist照合→予算消費→単一送信の順序で実施し、試行ID・時刻・Grant判定・結果・ページ重複をledgerに記録。予算上限・Grant失効で次送信を出さず`PARTIAL/STOP_GRANT`。
 7. **No execution by CI:** GitHub Actionsは合成fixtureとソース検査だけ。本番資格情報をCIに提供しない。実Collectorの接続試行は別の明示承認・独立レビューの後に限る。
+
+## 3A. R2-NEW-001 — HTTP送信試行単位のGrant再検証（限定是正）
+
+**採用方式A: Botocore SDK内部リトライ無効化 + Collector管理の再試行。** `before-call`イベントは**1つの論理SDK操作**に関するpreflightであり、実際に何回HTTPが送出されたかを保証する境界ではない。Botocore`Config(retries={"mode": "standard", "total_max_attempts": 1})`を全認証コンテキスト・全Clientに明示設定する（`total_max_attempts`は初回要求を含む）。`max_attempts=1`は初回＋1 retryを意味し得るため代用禁止。Client生成後にeffective ConfigとSDK/プラグインの独自`needs-retry`等のイベントハンドラを検査し、再送信可能性を除外できなければClientを起動しない。
+
+**物理送信境界:** SDK設定と別に、`before-send`相当の最終HTTP送信直前に**Grant・Owner取消/期限・code/plan/credential/全params・送信予算**を再評価する監査フック/専用transport guardを要求する。あらゆる`retry`、redirect、別endpointの物理送信（認証プロバイダが暗黙に行う通信を含む）を例外扱いにしない。送信数の観測と`attempt_id`の対応が保証できないSDK/version/client/plugin構成は`RUNTIME_NOT_PROVEN`として実行禁止。`before-send`だけに権威性を委ねるのではなく、Collectorが制御できる送信境界にGrant検証を一元化し、未認可時にネットワークへ送らないことを合成transport試験で証明してから採用する。
+
+**最小状態機械:** `PREPARE` → `CHECK_GRANT` → `CHECK_OPERATION_SCOPE` → `RESERVE_BUDGET` → `SEND_ONCE` → `OBSERVE_RESPONSE` → `RETRY_DECISION`（必要なら最初の`CHECK_GRANT`に戻る）。`STOP_GRANT`・`STOP_POLICY`・`STOP_BUDGET`への遷移後は同一Grantでの物理送信は禁止。リトライは新`attempt_id`・再チェック・独立予算消費を必須とし、SDKの暗黙的再送信や`needs-retry`から直接`SEND_ONCE`へ遷移する経路は認めない。
+
+**失効の線形化点:** Owner取消と送信可否判定の競合を曖昧にしない。Grant authorityが`revocation_epoch`/monotonic generationを単一権威で管理し、送信許可トークン（対象attempt、context、plan、短い有効区間）との整合性を**送信境界で原子的に仲介できる実装**を要求する。単なる直前照会＋ローカル判定だけでは「判定直後に取消→送信」のTOCTOUを解決できないため、取消完了後の送信ゼロを証明できない限り、`STRICT_REVOCATION_NOT_PROVEN`として実行不可。ネットワーク上で既に送信済みのin-flight HTTP要求は取り消せないものとして未承認seal/隔離し、送信済みであった時点と取消完了時刻をledgerへ記録する。
+
+**再試行反例:** 初回HTTP`SEND_ONCE` → Throttling/5xxを合成 → Collectorが再試行準備 → OwnerがGrant取消してauthority epoch更新 → 2回目`CHECK_GRANT`が`STOP_GRANT` → **2回目以降のtransport send = 0**。SDK内部`needs-retry`が送信を試みる合成ケース、`before-call`済み→取消→`before-send`、Grant state照会失敗、Clientの`total_max_attempts`変更、別Client／redirect、期限満了、並行試行も禁止テスト対象。`before-send`だけの単体テストではtransport全経路の閉包を主張しない。
+
+**非実行状態:** このR2-N01は設計要求のみであり、現在のI1モック・I0にはGrant authority、transport guard、Botocore ClientやSDK retry実装を追加していない。適用可能性は今後のD2/D3で独立レビューが必要。
 
 ## 4. 非原子的収集とSource別完全性
 
@@ -101,6 +115,12 @@ Page ledger必須レコード候補:
   "grant_expires_at_utc": null,
   "grant_revocation_state": "NOT_VERIFIED",
   "grant_validation_evidence_id": null,
+  "grant_revocation_epoch": null,
+  "transport_attempt_id": null,
+  "retry_owner": "COLLECTOR_ONLY",
+  "effective_sdk_total_max_attempts": 1,
+  "pre_send_grant_decision": "NOT_VERIFIED",
+  "actual_transport_send_count": 0,
   "collector_commit_sha": null,
   "context_id": null,
   "expected_account": "456720798575",
@@ -139,7 +159,8 @@ Page ledger必須レコード候補:
 | トリガー | 固定結果 | 処理 |
 |---|---|---|
 | Owner Grant未署名、scope/plan/HEAD不一致 | `NOT_AUTHORIZED` | AWSへ一切接続しない |
-| Grantがリクエスト間に失効・取消・期限切れ、状態検証不能 | `STOP_GRANT` | **次のAWSリクエストなし**。既取得RAWを承認済みと扱わず封印・隔離。送信済みin-flight要求は取消保証しない |
+| Grantがリクエスト間／HTTP送信直前に失効・取消・期限切れ、状態検証不能 | `STOP_GRANT` | **次の物理HTTP送信なし**。SDK暗黙retryを禁止、Collector側の再試行は新たなGrant評価が必要。取得済みRAWを未承認seal/隔離。既送信in-flightは取消保証しない |
+| SDKが内部retryや暗黙的HTTP sendを構成上・計測上排除できない、取消との競合を線形化できない | `RUNTIME_NOT_PROVEN` / `STRICT_REVOCATION_NOT_PROVEN` | 実Client利用禁止。別設計と独立レビューに戻す |
 | STS Account/ARN不一致、意図しない主体切替 | `ABORTED_IDENTITY` | 以後のAPIを停止。取得済みデータを承認扱いにしない |
 | 未許可operation／リソース／パラメータ／endpoint | `STOP_POLICY` | 呼び出さず停止し監査記録 |
 | 資格情報・Secret・禁止データの取得要求／混入 | `STOP_SENSITIVE` | 収集と共有を停止、隔離。RAWの自動公開不可 |
@@ -173,9 +194,9 @@ Page ledger必須レコード候補:
 
 **R1-005（IAM Filter）:** A01 `GetAccountAuthorizationDetails`はFilter5種類を明示して全ページを照合。PolicyARN→DefaultVersionId→本文SHAと付与関係を再照合する。欠落種別または取得不能policyは`PARTIAL/UNKNOWN`。
 
-**R1-006（Grant取消）:** 全SDKリクエスト直前でGrant有効期限・Owner取消・plan/HEAD・principal/contextを検証し、その判定時刻・Grant ID・失効状態・証拠IDをpage ledgerにも記録。取消後または検証不能なら`STOP_GRANT`、後続API0、未承認RAW隔離。途中リクエストを無条件に巻き戻せるとは主張しない。
+**R1-006（Grant取消）:** R2独立レビューで`RESOLVED_IN_REQUIREMENTS`。全SDKリクエスト直前のGrant有効期限・Owner取消・plan/HEAD・principal/context検証、page ledger記録、取消後`STOP_GRANT`、未承認RAW隔離の**要求契約**は維持。新規R2-N01は**論理SDK呼び出しを超える物理HTTP送信境界**の実装方針を別途限定是正するもので、R1-006を再OPENしない。
 
-**本R2の状態:** 6件は`RESOLVED_IN_PROPOSAL`であり、独立レビュアーによる正式な`RESOLVED`は未実施。R2修正で設計GateやAWS実行Grantは自動成立しない。
+**R2独立再審査結果:** R1の6件は**RESOLVED_IN_DESIGN_R2**（R1-006は特に`RESOLVED_IN_REQUIREMENTS`）で独立確認済み。再OPENしない。新規R2-N01 MajorとR2-N02 Minorは今回の**限定是正案**として`RESOLVED_IN_PROPOSAL`に止め、差分だけの独立再審査を待つ。Design Review Gateは引き続き`REVISION_REQUIRED`。実装・AWS実行Grantは成立しない。
 
 ## 9. 根拠となるAWS公式仕様
 
@@ -191,5 +212,8 @@ Page ledger必須レコード候補:
 - [CloudTrail：Organization Event Data Storeは管理アカウント保有・メンバー非表示](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-lake-organizations.html)
 - [AWS Organizations：SCP適用除外](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html) / [RCP適用除外・対象サービス制限](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html)
 - [CloudTrail：digest chain断絶・配信欠損の可能性](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-log-file-validation-digest-file-structure.html)
+- [Botocore Config retries：total_max_attempts=1は初回のみ](https://docs.aws.amazon.com/botocore/latest/reference/config.html) / [Boto3 retries behavior](https://docs.aws.amazon.com/boto3/latest/guide/retries.html)
+- [Botocore before-send：シリアライズ・署名済み要求の送信直前イベント](https://docs.aws.amazon.com/botocore/latest/topics/events.html)
+- [Organizations RCP：Service Authorization ReferenceのAction別Resource typeを適用基準とする](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html)
 
 **結論:** 本R2はG2-I1-Bの実装可否を判定するための**非実行参照設計**である。いかなるCI PASSや文書マージもAWS接続・IAM権限付与・G1/G2正式承認・Nameタグ書込の解禁を意味しない。
