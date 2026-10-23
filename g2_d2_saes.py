@@ -262,6 +262,8 @@ class OfflineSAES:
                 # Synthetic send linearization: counter and SEND_STARTED are
                 # under the same event lock, before the post-start barrier.
                 with self._event_lock:
+                    if self._cancel_requested.is_set():
+                        raise SimulatedGrantCancelled()
                     transport.physical_send_count += 1
                     self._known_started += 1
                     self._attempts[attempt.attempt_id] = "STARTED"
@@ -269,6 +271,10 @@ class OfflineSAES:
 
             try:
                 outcome = transport.send_once(mark_first_byte)
+            except SimulatedGrantCancelled:
+                self._attempts[attempt.attempt_id] = "CANCELLED_BEFORE_SEND"
+                self._record("CANCELLED_BEFORE_SEND", attempt.attempt_id)
+                return "STOP_GRANT"
             except SimulatedTransportCrash:
                 self._attempts[attempt.attempt_id] = "SEND_OUTCOME_UNKNOWN"
                 self._state = "SUSPENDED"
