@@ -143,7 +143,7 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 | Plan fingerprint | `plan_sha256`と正規スキーマ、何をどの順番でいつ取得するか | NOT_DEFINED |
 | Target Account | `456720798575`（規範上の既存ターゲット）。実行直前のOwner再確認 | NOT_RECONFIRMED |
 | Source contexts | P1/P2/P3/P4、**P2-Lake Organization EDS独立文脈**の期待STS Account/ARN、CloudTrail delegated権限、セッション方式、credential lifetime/role | ALL_PENDING |
-| Action/resource policy | SDK OperationとIAM Actionを別欄にしてS3 `ListObjectsV2`→`s3:ListBucket`、承認済Bucket/Prefix/token/期間・件数・SCP/RCP適用性と除外例外を検証 | NOT_VERIFIED |
+| Action/resource policy | SDK OperationとIAM Actionを別欄にしてS3 `ListObjectsV2`→`s3:ListBucket`、承認済Bucket/Prefix/token/期間・件数・SCP/RCP適用性、**SAR Action Resource type照合**と`authorized_resource_types`/`rcp_resource_coverage`を証拠付きで検証 | NOT_VERIFIED |
 | Regions | 対象Regionの明示リストとGlobal IAM/STSの処理方法 | NOT_APPROVED |
 | Period and as-of | CloudTrail Event Historyの直近90日に収まるstart/end/as_of、Trail/Lake各別期間 | NOT_APPROVED |
 | Rate, cost and size | API calls/second、最大pages/requests/bytes、timeout、有限retry、停止予算 | NOT_APPROVED |
@@ -151,7 +151,7 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 | S3/KMS log grants | 正確なbucket/prefix/object range、key ARN、Decrypt例外、別アカウント許可 | NOT_APPROVED |
 | Existing Lake query permission | P1 Account EDSとP2-Lake Organization EDSの独立Grants、Region/selector/retention/ingestion、既存store、料金上限と`StartQuery`別承認 | NOT_APPROVED |
 | Preflight source validity | I1モックと実AWS SDK modelの差、S3 gzip原本/digest検証、fixture不信頼入力境界 | NOT_PROVEN |
-| Stop/incident authority | `STOP_GRANT`を含む全停止状態、Owner取消状態の権威・リクエスト直前の再検証、未承認RAW隔離と報告先 | NOT_APPROVED |
+| Stop/incident authority | `STOP_GRANT`、Owner取消authority/`revocation_epoch`の線形化、**物理送信直前**の認可とSDK内部retry無効化、transport監査、未承認RAW隔離と報告先 | NOT_APPROVED |
 | Independent review | 非実行設計レビューと、後続コード/Grant/RAWのレビュー担当を独立に指定 | PENDING |
 
 **決裁記録の必須文言候補（署名ではない）:** 「対象計画SHA、実装SHA、Principal、Region/Source、期間、暗号化保存先、予算を固定した**AWSの読み取りだけ**を期限付きで承認する。対象外のAWS操作／権限追加／別Principalへのfallback／タグ書き込みは認可しない」。Ownerがこの文言を承認したと**推定しない**。
@@ -183,14 +183,14 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 
 | Finding | Major/Minor | R2の証拠箇所 | 現時点の判定 |
 |---|---|---|---|
-| R1-001 | Major | 参照設計`2 SDK↔IAM Action表、S3 request bound、受入試験11 | RESOLVED_IN_PROPOSAL |
-| R1-002 | Major | 参照設計`2 P1/P2-Lake別行、A05-Lake-Organization、受入試験12 | RESOLVED_IN_PROPOSAL |
-| R1-003 | Major | 本表`2AのActor×Resource適用判定表、A04×A06、受入試験13 | RESOLVED_IN_PROPOSAL |
-| R1-004 | Major | 本表`2Bの時系列coverage、参照設計`8、受入試験14 | RESOLVED_IN_PROPOSAL |
-| R1-005 | Minor | A01 Filter5種類とDefaultVersionId・本文ハッシュ照合、受入試験15 | RESOLVED_IN_PROPOSAL |
-| R1-006 | Minor | 本表`2Cおよび参照設計page ledgerのGrant再検証、受入試験16 | RESOLVED_IN_PROPOSAL |
+| R1-001 | Major | 参照設計 2 SDK↔IAM Action表、S3 request bound、受入試験11 | RESOLVED_IN_DESIGN_R2 |
+| R1-002 | Major | 参照設計 2 P1/P2-Lake別行、A05-Lake-Organization、受入試験12 | RESOLVED_IN_DESIGN_R2 |
+| R1-003 | Major | 本表 2AのActor×Resource適用判定表、A04×A06、受入試験13 | RESOLVED_IN_DESIGN_R2 |
+| R1-004 | Major | 本表 2Bの時系列coverage、参照設計 8、受入試験14 | RESOLVED_IN_DESIGN_R2 |
+| R1-005 | Minor | A01 Filter5種類とDefaultVersionId・本文ハッシュ照合、受入試験15 | RESOLVED_IN_DESIGN_R2 |
+| R1-006 | Minor | 本表 2Cおよび参照設計page ledgerのGrant再検証、受入試験16 | RESOLVED_IN_REQUIREMENTS |
 
-**正式クローズではない。** 著者側がR2の是正を記述したことと、過去の独立レビュアーまたは新規レビュアーによる`RESOLVED`判定は別である。現Gateは`R1 REVISION_REQUIRED / R2 INDEPENDENT_REVIEW_PENDING`。
+**R2独立再レビューでR1の6件は設計上クローズ済み**（R1-001〜005=`RESOLVED_IN_DESIGN_R2`、R1-006=`RESOLVED_IN_REQUIREMENTS`）。R1の6件を再OPENしない。新規`R2-NEW-001 Major`と`R2-NEW-002 Minor`は今回**LIMITED_CORRECTIONS_IN_PROPOSAL**とし、限定差分の新しい独立再レビューを待つ。Design Review Gateは`REVISION_REQUIRED`を維持する。
 
 ## 5. Independent Design Review依頼内容
 
@@ -212,6 +212,6 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 
 ## 7. 最終状態
 
-`R1 REVISION_REQUIRED / R2 INDEPENDENT_REVIEW_PENDING` / `EXECUTION NOT AUTHORIZED` / `EVIDENCE NOT CAPTURED` / `G2 NOT VERIFIED` / `G1 NOT PROVEN` / **AWS WRITE BLOCKED**。
+`R1 SIX FINDINGS RESOLVED_IN_DESIGN / R2 NEW FINDINGS CORRECTED_IN_PROPOSAL / LIMITED RE-REVIEW PENDING` / `EXECUTION NOT AUTHORIZED` / `EVIDENCE NOT CAPTURED` / `G2 NOT VERIFIED` / `G1 NOT PROVEN` / **AWS WRITE BLOCKED**。
 
 **この文書自体も他のどの設計・Pull Requestのマージも、AWS接続認可またはタグ書込解除を発生させない。**
