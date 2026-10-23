@@ -77,7 +77,7 @@
 ### RA-A：境界・脅威モデルの正式化
 
 - Owner本人性とGrant発行・取消の信頼境界（誰が署名し、何を署名し、誰が署名鍵と取消Authorityを保護するか）。`CANCEL_PENDING`、`REVOKE_COMMITTED`、`REVOKE_ACK_SUCCESS`、無効Grant・期限切れ・不明状態の差を契約化する。
-- Worker↔Gateway↔OS/net↔AWS endpoint、およびSDK認証provider・STS・DNS・TLS・redirect・HTTP再試行を含む**全e​gress経路**の閉包を証明対象として定義する。
+- Worker↔Gateway↔OS/net↔AWS endpoint、およびSDK認証provider・STS・DNS・TLS・redirect・HTTP再試行を含む**全egress経路**の閉包を証明対象として定義する。
 - 成功ACK後の**新規Gateway-local SEND_STARTED=0**という保証と、既開始in-flight byte／AWS到達・処理の非保証を厳格に分離する。
 - 失効中の読取RAW、欠落・不一致・送信結果不明を承認済証拠に変換しない。
 
@@ -131,7 +131,7 @@
 - PR #8の独立コードレビューR3は`LIMITED_PASS_OFFLINE_CONTRACT`を付与した。Finding `FND-D2-001..005`および`R2-NEW-001`は合成ソースで解消したとの審査結果を継承する。ただし実HTTP/TLSやGatewayのruntime保証を昇格させない。
 - マージ済みmasterで`G2 Offline Evidence Safety`、`Safety Hold CI`、`SonarCloud Code Analysis`はSUCCESS。SonarCloudのmasterチェックには新規Issueが50件と表示された。PR #8の3件は`g2_d2_rcp.py`のCognitive Complexity 2件およびnested `if` 1件として確認済み。新規コードCoverageはPR #8チェック上`0.0%`と表示され、CIでテストを実行した事実とは区別。**実装フェーズへの昇格前に**CIカバレッジ計測・取込、重大Code Smellの取扱いを技術的に判定する。
 - R3設計原本とD2履歴文書の旧「review pending」表示を、現在の安全状態や承認の証拠として再利用しない。新文書には`fixed commit → independent review → merge commit`の履歴を明示する。上位仕様や既存Findingのステータスをこの評価だけで改変・再OPEN・解決しない。
-- SDKの実transportやAWS Credentialの実装は、静的guardを単に弱めて既存D2模块に混入させない。専用の別設計・別ブランチ・別CI/Gateを必要条件とする。
+- SDKの実transportやAWS Credentialの実装は、静的guardを単に弱めて既存D2モジュールに混入させない。専用の別設計・別ブランチ・別CI/Gateを必要条件とする。
 
 ## 7. 結論・次の許容作業
 
