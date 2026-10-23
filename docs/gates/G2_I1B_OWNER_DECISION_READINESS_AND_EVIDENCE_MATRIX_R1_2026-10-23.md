@@ -1,15 +1,15 @@
-# G2-I1-B — Evidence Acquisition / Owner Decision Readiness Matrix R2
+# G2-I1-B — Evidence Acquisition / Owner Decision Readiness Matrix R3（R3-LIM限定是正）
 
 **基準日:** 2026-10-23（JST）  
 **役割:** 参照設計の独立審査入力と、将来の人間Ownerによる**別途の取得認可判断の準備**。  
-**上位仕様:** [G2 R1.1契約](G2_OFFLINE_EVIDENCE_BUNDLE_CONTRACT_R1_2026-10-22.md) / [G2-I1-B R2参照設計](G2_I1B_READ_ONLY_COLLECTOR_REFERENCE_DESIGN_R1_2026-10-23.md)（従来ファイル名を維持）
-**現在の決定:** **R1 REVISION_REQUIRED / R2 CORRECTED_IN_PROPOSAL / INDEPENDENT_REVIEW_PENDING / NO HUMAN EXECUTION GRANT / NO AWS CONNECTION / DESIGN REVIEW ONLY**。この文書にOwner署名・承認トークンは含まない。
+**上位仕様:** [G2 R1.1契約](G2_OFFLINE_EVIDENCE_BUNDLE_CONTRACT_R1_2026-10-22.md) / [G2-I1-B R3参照設計](G2_I1B_READ_ONLY_COLLECTOR_REFERENCE_DESIGN_R1_2026-10-23.md)（従来ファイル名を維持）
+**現在の決定:** **R3-LIM-001/002 CORRECTED_IN_PROPOSAL / R3 LIMITED INDEPENDENT_REVIEW_PENDING / NO HUMAN EXECUTION GRANT / NO AWS CONNECTION / DESIGN REVIEW ONLY**。この文書にOwner署名・承認トークンは含まない。
 
 ## 1. 3つの独立Gateを混同しない
 
 | Gate | 通過に必要な証拠 | 本PRでの結果 |
 |---|---|---|
-| **Design Review Gate** | API × Account × Context × Region/期間 × 最小権限の整合性、Manifest/RAW保護、Fail Closed、独立技術レビュー | **PROPOSAL / INDEPENDENT_REVIEW_PENDING** |
+| **Design Review Gate** | API × Account × Context × Region/期間 × 最小権限の整合性、Manifest/RAW保護、Fail Closed、独立技術レビュー | **REVISION_REQUIRED / R3 LIMITED CORRECTIONS UNDER REVIEW** |
 | **Execution Authorization Gate** | 人間Ownerが限定取得計画・対象principal・Role・保存先・期間・最大費用／回数／bytes・有効期限を**別の署名済み記録**として承認 | **NOT_GRANTED** |
 | **Evidence / G2 Acceptance Gate** | 実AWS RAW原本、Source別coverage、IAM/SCP/SSOの権限推論、CloudTrailの3系統、BEGIN/END、独立再照合 | **NOT_EXECUTED / NOT_VERIFIED** |
 
@@ -50,7 +50,8 @@
   "resource_service": null,
   "action": null,
   "authorized_resource_types": [],
-  "rcp_resource_coverage": "COVERED|NOT_COVERED|UNKNOWN",
+  "resource_evaluations": [],
+  "aggregate_coverage": "COVERED|NOT_COVERED|MIXED|UNKNOWN",
   "authorization_reference_evidence_id": null,
   "scp_applicable": "APPLICABLE|EXEMPT|UNKNOWN",
   "rcp_applicable": "APPLICABLE|EXEMPT|NOT_SUPPORTED|UNKNOWN",
@@ -60,7 +61,7 @@
 }
 ```
 
-`authorized_resource_types`は対象`action`のService Authorization Reference（SAR）Action表にある認可Resource typeを、ARN/owner account/必須・任意/証拠IDと一対一で記録する。`rcp_resource_coverage`はCOVERED/NOT_COVERED/UNKNOWNの三値で、ActionとResource typeの一致を確認するまではUNKNOWNを維持する。`authorization_reference_evidence_id`でSAR Action行・取得日・原本ハッシュを結ぶ。対応サービスという情報だけではRCPの適用は確定しない。 
+`authorized_resource_types`は対象`action`のService Authorization Reference（SAR）Action表にある認可Resource typeを、ARN/owner account/必須・任意/証拠IDと一対一で記録する。`rcp_resource_coverage`は各`ResourceEvaluation`にのみCOVERED/NOT_COVERED/UNKNOWNの三値で保存する。Action親の`aggregate_coverage`は`§2A-2`の規則で派生計算し、1資源でもUNKNOWNなら親UNKNOWN。`authorization_reference_evidence_id`でSAR Action行・取得日・原本ハッシュを結ぶ。対応サービスという情報だけではRCPの適用は確定しない。 
 
 `exception_reason`はEXEMPT/NOT_SUPPORTEDなら必須。`evidence_id`にはIAM Role/SLR識別根拠、Organizations管理/委任管理account情報、対象Resource所有account、SCP/RCPの有効状態と階層attachment、対象サービスの公式サポート根拠を結ぶ。欠落時はUNKNOWNであり、推測で`scp_applicable=false`を埋めない。
 
@@ -84,13 +85,85 @@ RCPは管理アカウントResourceには適用されず、対象は対応サー
 
 AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、当該Actionで**認可されるResource type**に作用する。各ActionはAWS Service Authorization Reference（SAR）のAction行／Resource type列と突合する。管理アカウント資源・SLR例外はR1のA04契約を維持する。
 
-- `authorized_resource_types`を各Actionの**配列**とし、要素には`resource_type`、`resource_arn`、`resource_owner_account`、`sar_action_reference`、`required_or_optional`、`evidence_id`を含める。同一APIで複数の認可Resource typeが現れる場合、それぞれを別行で判定し、単純な1つのBooleanにしない。
-- `rcp_resource_coverage=COVERED`にできるのは、SAR Action行の認可Resource type、実際のリクエストで認可対象となったARN、対応するメンバーアカウントResource、RCP対応対象が**証拠で一致**したときだけ。RCPのPolicy本文・階層attachment・Conditionの検証は別であり、COVEREDだけではDeny確定でもAllow確定でもない。
+- `authorized_resource_types`は親ActionのSARで許される認可Resource type一覧、`resource_evaluations[]`に実際の各Resourceの`resource_type`・`resource_arn`・`resource_owner_account`・`evidence_id`・coverageを保持する。複数Resourceの行識別キー、唯一性、集約と例外は`§2A-2`に固定し、単一Booleanへ潰さない。
+- ResourceEvaluationの`rcp_resource_coverage=COVERED`にできるのは、SAR Action行の認可Resource type、実際のリクエストで認可対象となったARN、対応するメンバーアカウントResource、RCP対応対象が**証拠で一致**したときだけ。RCPのPolicy本文・階層attachment・Conditionの検証は別であり、COVEREDだけではDeny確定でもAllow確定でもない。
 - `NOT_COVERED`は対象Action/認可ResourceがRCPの非対応範囲であることを**公式仕様と観測範囲**から確認した場合だけ。サービス対応だけ判明してもAction/Resource typeが不明なら`UNKNOWN`。ARNの所有者、SAR Action行、対応するResource typeのいずれかが欠落したら`UNKNOWN`を維持する。
 - SARでResource type欄が空／明示されない場合、その事实と対象SDK/Actionのモデルを記録し、RCP非適用を結論できるか独立照合する。未検証の場合は`UNKNOWN`であり、`rcp_applicable=NOT_SUPPORTED`に自動変換しない。
 - A06のWriter閉包は、全ての認可Resource typeの適用性とRCP/その他IAM評価が確定するまでOPEN。`exception_reason`と`authorization_reference_evidence_id`が揃わない除外・非対応の断定は禁止。
 
 **将来の合成反例テスト:** ① RCP対応サービスだが認可Resource typeが不明→UNKNOWN、② 同一サービスのAction A/Bで認可Resource typeが異なる→別結果、③ 複数Resource中1件が不明→全Writerを不可能としない、④ 管理アカウント資源→EXEMPT、⑤メンバー資源のSAR対象Resource type一致→COVERED、⑥SAR版／実SDK認可対象が矛盾→UNKNOWN。本PRではテスト設計のみ、コード実装なし。
+
+## 2A-2. R3-LIM-002 — 1認可Resourceごとの唯一の評価行・Action集約・例外証拠
+
+**正規データモデル:** `1 actor × 1 IAM action × 1 request_fingerprint × 1 authorized resource`につき**1つの`ResourceEvaluation`行**を採用する（親Actionに単一の`rcp_resource_coverage`を置く旧表現は廃止）。親`ActionEvaluation`は`authorized_resource_types`をSARの期待Resource type一覧として保持するが、RCP結果は**`resource_evaluations[]`の各行**だけが所有する。親には導出専用の`aggregate_coverage`を格納する。
+
+### Action/Resource schema（合成・未実装）
+
+```json
+{
+  "schema": "g2-rcp-actor-action-resources-r3-proposal",
+  "actor_id": "synthetic-actor-1",
+  "action": "synthetic:Action",
+  "request_fingerprint_sha256": "synthetic-fingerprint",
+  "authorization_reference_evidence_id": "synthetic-sar-evidence",
+  "authorized_resource_types": ["synthetic-type-A", "synthetic-type-B"],
+  "expected_authorized_resource_count": 2,
+  "resource_evaluations": [
+    {
+      "evaluation_id": "hash(actor_id, action, request_fingerprint, resource_index, canonical_arn, sar_resource_type)",
+      "resource_index": 0,
+      "resource_type": "synthetic-type-A",
+      "resource_arn": "arn:synthetic:resource-a",
+      "resource_owner_account": "member-account-synthetic",
+      "rcp_resource_coverage": "COVERED",
+      "rcp_applicable": "APPLICABLE",
+      "rcp_exception_code": "NONE",
+      "rcp_exception_evidence_id": null,
+      "evidence_id": ["synthetic-sar-evidence"]
+    },
+    {
+      "evaluation_id": "unique-second-evaluation",
+      "resource_index": 1,
+      "resource_type": "synthetic-type-B",
+      "resource_arn": "arn:synthetic:resource-b",
+      "resource_owner_account": null,
+      "rcp_resource_coverage": "UNKNOWN",
+      "rcp_applicable": "UNKNOWN",
+      "rcp_exception_code": "OWNER_UNKNOWN",
+      "rcp_exception_evidence_id": null,
+      "evidence_id": []
+    }
+  ],
+  "aggregate_coverage": "UNKNOWN",
+  "effective_write_reachability": "UNKNOWN"
+}
+```
+
+`evaluation_id`は記述用のplaceholderであり、実装時に全キーを正規直列化してSHA-256等で固定する。正規識別キー＝`(actor_id, IAM action, request_fingerprint_sha256, resource_index, canonical_resource_arn, sar_resource_type)`。配列indexは連番・安定順序で一意、同じindexやevaluation_idの重複、改変可能なResource所有者の根拠欠落、期待Resource数と観測数不一致は**集約UNKNOWN**。期待Resource集合の閉包自体が証明されなければ、0行で`NOT_COVERED`にしない。
+
+### 集約規則（Action親・決定的）
+
+| ResourceEvaluation coverageの集合 | 期待数/一意性 | `aggregate_coverage` |
+|---|---|---|
+| `[COVERED,COVERED]` | 完全・重複なし | `COVERED` |
+| `[NOT_COVERED,NOT_COVERED]` | 完全・例外/非対応の証拠あり | `NOT_COVERED` |
+| `[COVERED,NOT_COVERED]` | 完全・重複なし | `MIXED`（双方を親で保持） |
+| `[COVERED,UNKNOWN]` / `[NOT_COVERED,UNKNOWN]` | 問わない | **`UNKNOWN`** |
+| 空、件数不一致、行重複、Resource type/ARN/Owner未確認 | 不完全 | **`UNKNOWN`** |
+
+**集約はcoverageだけの表示であり、IAMの許可・拒否、Name書込の安全性を証明しない。** `MIXED`や`NOT_COVERED`の場合もA06 Writerは別の明示的Allow/Denyと全Resourceの証拠がそろうまでOPEN。適用対象が判明してもRCP Policy Statementの評価は別レイヤー。
+
+### RCP固有の除外規則・証拠の契約
+
+各ResourceEvaluationには`rcp_exception_code`（`NONE|MANAGEMENT_RESOURCE|SERVICE_LINKED_ROLE|AWS_MANAGED_KMS_KEY|KMS_RETIRE_GRANT|UNSUPPORTED_ACTION_RESOURCE|UNKNOWN`）、`rcp_exception_evidence_id`、`exception_source_url`、`exception_source_sha256`、`exception_checked_at_utc`を記録する。`NONE`以外で非適用`NOT_COVERED`または`EXEMPT`を確定する場合、AWS公式仕様の固定原本と実対象識別証拠が必須。
+
+- **AWS managed KMS key:** 具体的なKMS Keyの`KeyManager=AWS`を保護原本の証拠で確認できれば、その鍵へのRCP資源適用は`NOT_COVERED`。`CUSTOMER`管理鍵とは区別し、管理者不明は`UNKNOWN`。`KeyManager`等の取得API・権限は別のD2参照設計段階で審査対象。
+- **`kms:RetireGrant`:** AWS公式例外（RCPではそのpermissionを制限できない）。Action別に`NOT_COVERED`、`KMS_RETIRE_GRANT`証拠を残す。同じKMS serviceというだけで他Actionへ例外を伝播しない。
+- **Management-account-owned resource:** RCP適用外。`resource_owner_account`とOrganizations管理Accountの独立証拠必須。
+- **Service-linked role:** Resource type自体のcoverageと区別して`rcp_applicable=EXEMPT`。RoleがSLRである証拠を必須とし、他principalへ適用しない。
+- **その他RCP対応Action/Resource typeと公式例外:** SAR Action行の認可資源とAWS Organizations RCP公式例外表を双方照合し、未確認は`UNKNOWN`。例外のリストは静的な既知数件で完結とは扱わず、資料改訂時はversionを固定して再評価する。
+
+旧`2A`の`rcp_resource_coverage`スカラーはR3以降ResourceEvaluation専用フィールドと再解釈し、実装者がAction全体のデフォルト値として使うことを禁止する。実装移行時にデータ互換性を担保できなければ`UNKNOWN`で停止し独立レビューへ差し戻す。
 
 ## 2B. A05-Trailの時系列証拠／coverage契約（R1-004）
 
@@ -131,6 +204,26 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 **証跡:** page/attempt ledgerに`transport_attempt_id`、`grant_id`、`grant_revocation_epoch`、`pre_send_grant_decision`、`grant_checked_at_utc`、`effective_sdk_total_max_attempts`、`physical_send_count`、`retry_owner=COLLECTOR_ONLY`、`revocation_observed_at_utc`、`in_flight_at_revocation`を持たせ、Owner取消→次送信0回を独立監査できるようにする。新しいAWS接続権限は一切付与していない。
 
 すでに送信済みのin-flightリクエストは後から巻き戻せる保証がないため、失効時の応答と既取得RAWは`UNAUTHORIZED_AFTER_REVOKE`という**内部保全ラベル**で未承認seal・隔離し、共有不可。再開には新しいOwner決裁・新規snapshot IDと独立確認が必須。これは設計上の要求であり、現PRには取消実装もOwner Grantも存在しない。
+
+## 2C-1. R3-LIM-001 — 取消完了と物理送信開始のイベント・証跡契約
+
+採用する唯一の参照方式は、[Reference Design R3 §3B](G2_I1B_READ_ONLY_COLLECTOR_REFERENCE_DESIGN_R1_2026-10-23.md)の **Single Authority–Egress Sequencer（SAES）** である。WorkerはAWSへ直結しない。Grant authorityと唯一のAWS Egress Gatewayが同一sequencerで送信開始・取消確定を全順序化する。
+
+| 事象 | 必須ledger証拠 | 判定 |
+|---|---|---|
+| SEND_REQUESTED / SEND_ADMITTED | attempt_id、Grant、epoch、context、plan、request指紋 | 未送信なら取消可能 |
+| SEND_INTENT | 送信前の耐久journal記録 | 永続化失敗ならSEND禁止 |
+| SEND_STARTED | Gateway ID/fencing epoch、ローカルsocket I/Oに最初のHTTP request byteを渡した観測時点、送信seq | 同一critical section内でGrant評価と送信開始を直列化 |
+| REVOKE_REQUESTED | Owner署名・Grant・epoch・sequence | CANCEL_PENDING、新admission禁止 |
+| REVOKE_COMMITTED | epochの耐久更新、未送信attemptの破棄、Gateway fencing証拠 | 以後の新規SEND_STARTEDを禁止 |
+| REVOKE_ACK_SUCCESS | 上記全証拠、耐久revoke seq、Owner通知時刻 | ここでのみ取消成功と宣言 |
+| Crash / authority partition / Gateway fencing不明 | 残留queue・障害根拠・SEND_INTENT/SEND_STARTED状態 | CANCEL_PENDING または SEND_OUTCOME_UNKNOWN。ACK成功不可 |
+
+**順序の定義:** 送信開始側が先にsequencerを確保すれば、ローカルsocket I/Oで最初のHTTP request byteの引渡しが確認されるか送信前中止が確定するまで取消成功をACKしない。取消側が先にCANCEL_PENDINGになれば新たなSEND_ADMITTED禁止。未開始のadmitted/queued attemptは破棄する。古い短命permit/epochだけではSAES外の送信を許可できない。
+
+**Authority/Host障害:** 旧GatewayをOS/network policy等で確実にfenceできない場合は新Gateway起動・Owner取消成功ACK禁止。SEND_INTENTとSEND_STARTEDの間にCrashした場合は送信の有無を推定せずSEND_OUTCOME_UNKNOWN、同じattemptを自動retryしない。認証プロバイダやredirect等の別送信経路を閉じられない環境もSTRICT_REVOCATION_NOT_PROVEN。
+
+**保証範囲:** OwnerへのREVOKE_ACK_SUCCESS以降の**新規のGateway-local SEND_STARTED=0**。AWS側受信時刻、以前に開始済みのin-flight byte完送/取消は保証しない。before-call/before-sendのイベント発火のみを送信開始の証明として扱わず、初回HTTP request byteのtransport受理と取消順序をD2の合成transport試験で示す。証明不能ならRuntime禁止。
 
 ## 3. 権限取得前の決裁未確定項目（**未署名**）
 
@@ -179,6 +272,11 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 17. **R2-N01 物理送信境界とOwner取消:** 合成transportで初回`SEND_ONCE`→Throttling/5xx→SDK標準内部retryが無効のままCollector再試行を予約→OwnerがGrant取消・`revocation_epoch`更新→再試行の`CHECK_GRANT`が`STOP_GRANT`→**以後のHTTP transport send 0回**を確認。`before-call`検証後の取消、`before-send`前の取消、照会不能、期限切れ、SDK設定改変、custom retry handler、redirect、別Client、競合同時実行とin-flight隔離を含める。`before-send`のみの単体テストではtransport経路全体を証明しない。
 18. **R2-N02 RCP Action/Resource Type:** RCP対応サービスでActionの認可Resource type不明→`UNKNOWN`。同一サービスの別Actionで異なるタイプ、複数Resourceの一部が不明、管理資源、サービスリンクロール、SAR版不一致を合成し、`rcp_resource_coverage`をresource別に確認。`UNKNOWN`を`NOT_SUPPORTED`や書込不可能に変換しない。
 
+19. **R3-LIM-001 決定論的並行テスト:** 2 Workerと単一SAESにBarrierを配置。SEND_ADMITTED後でSEND_STARTED前に取消要求。取消のREVOKE_COMMITTEDが先なら送信開始0件。送信の最初のHTTP request byteが先にtransportで受理されたなら、SEND_STARTED seqが取消seqより前になり、Owner取消成功ACKはその送信開始/中止確定まで待つ。取消後は未開始queue/permitを全て破棄。
+20. **R3-LIM-001 障害・回復:** Authority停止/分断、旧Gateway fencing失敗、並列Host旧epoch、Permit replay、credential provider/redirect迂回、SEND_INTENT記録後かつSEND_STARTED確定前のCrashで、取消成功ACK禁止またはSEND_OUTCOME_UNKNOWN。再起動後の自動再送0、旧LeaderのAWS直結0を合成transportとネットワーク遮断環境で検査。
+21. **R3-LIM-002 一意性・集約:** [COVERED,UNKNOWN]→UNKNOWN、[COVERED,NOT_COVERED]→MIXED、[NOT_COVERED,NOT_COVERED]→NOT_COVERED（2件とも証明済）、空/重複/未識別Resource/期待数不一致→UNKNOWN。Action親の集約値からWriterを自動的に閉じない。
+22. **R3-LIM-002 KMS例外:** AWS managed KMS keyはKeyManager=AWSの原本証拠があればResource別NOT_COVERED。Customer-managed KMS keyは別判定。kms:RetireGrantはAction別RCP対象外。管理Account resourceとService-linked Roleは別種のEXEMPT。公式例外資料・Key管理者の証拠欠落時はUNKNOWN。
+
 ## 4A. R1 Finding Closure Tracker（R2独立クローズ済み）
 
 | Finding | Major/Minor | R2の証拠箇所 | 現時点の判定 |
@@ -190,13 +288,24 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 | R1-005 | Minor | A01 Filter5種類とDefaultVersionId・本文ハッシュ照合、受入試験15 | RESOLVED_IN_DESIGN_R2 |
 | R1-006 | Minor | 本表 2Cおよび参照設計page ledgerのGrant再検証、受入試験16 | RESOLVED_IN_REQUIREMENTS |
 
-**R2独立再レビューでR1の6件は設計上クローズ済み**（R1-001〜005=`RESOLVED_IN_DESIGN_R2`、R1-006=`RESOLVED_IN_REQUIREMENTS`）。R1の6件を再OPENしない。新規`R2-NEW-001 Major`と`R2-NEW-002 Minor`は今回**LIMITED_CORRECTIONS_IN_PROPOSAL**とし、限定差分の新しい独立再レビューを待つ。Design Review Gateは`REVISION_REQUIRED`を維持する。
+**R2独立再レビューでR1の6件は設計上クローズ済み**（R1-001〜005=`RESOLVED_IN_DESIGN_R2`、R1-006=`RESOLVED_IN_REQUIREMENTS`）。R1の6件を再OPENしない。R2-NEW-001/002は独立判定PARTIALLY_RESOLVEDを継承。R3-LIM-001/002はRESOLVED_IN_PROPOSALで独立限定再レビュー待ち。Design Review Gateは`REVISION_REQUIRED`を維持する。
+
+## 4B. R3限定Finding追跡
+
+| Finding | 独立レビュー状態 | R3限定是正案 | 現在の状態 |
+|---|---|---|---|
+| R3-LIM-001 Major | OPEN | Reference Design §3Bと本書§2C-1で送信/取消直列化、Gateway fencing、障害/Crashの結果不明と試験19/20を規定 | RESOLVED_IN_PROPOSAL |
+| R3-LIM-002 Minor | OPEN | 本書§2A-2でResourceごとの一意キー、集約とKMS例外、試験21/22を規定 | RESOLVED_IN_PROPOSAL |
+
+R1の6件は独立レビューでクローズ済みとして維持。R2-NEW-001/002の独立判定PARTIALLY_RESOLVEDは本R3を再審査するまで維持する。著者のRESOLVED_IN_PROPOSALは正式クローズではない。
 
 ## 5. Independent Design Review依頼内容
 
+**今回のR3限定審査ではR3-LIM-001/002だけを判定し、R1の6件を再OPENしない。** 送信と取消の順序保証がコードにより証明されたと推定せず、D2に着手可能な検証可能仕様かを評価する。
+
 独立レビュアーには次を要求する。
 
-- G2 R1.1原文と本R2の**正規スコープ差分**（勝手な認可拡張・候補API不足・Source漏れ）、P1〜P4とP2-LakeのIAM principalと実行権限分離を追跡する。
+- G2 R1.1原文と本R3の**限定差分**（勝手な認可拡張・候補API不足・Source漏れ）、P1〜P4とP2-LakeのIAM principalと実行権限分離を追跡する。
 - 具体的に不足するAPI・condition・resource-level IAM対応、CloudTrail 3ソースでの非原子的なcoverage、Identity Center Permission Set/Group/Roleマッピング、OU/root SCP/RCP継承を反証可能なFindingとして示す。
 - RAW保存と公開ZIPの安全性、認証情報漏洩、失敗・中断、将来のOwner署名と実行者の分離を評価する。
 - **提出判定は`ACCEPTABLE_IN_DESIGN`または`REVISION_REQUIRED`等の設計に限る**。`AWS GRANT APPROVED`／`G2 VERIFIED`を自動付与しない。
@@ -204,14 +313,14 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 
 ## 6. 次の安全な作業分解
 
-- **I1-B R2（本PR）:** 非実行設計2文書のR1独立レビュー指摘6件の是正。実行権限は未付与。
-- **I1-B D2（別PR）:** 本R2の独立再レビューを経て、実SDKモデルに基づく純粋なschemaと合成fixtureのoffline契約テストを実装する。AWS接続なし。
+- **I1-B R3（本PR）:** マージ済みPR #6の設計文書2件のみ更新。R3-LIM-001/002の限定是正。実行権限は未付与。
+- **I1-B D2（別PR）:** 本R3限定独立再レビューで受入後、実SDKモデルに基づく純粋なschemaと合成fixtureのoffline契約テストを実装する。AWS接続なし。
 - **I1-B Runtime（別PR + 別Grant）:** Authenticated read-only client、strict policy guard、RAW writer、audit/observabilityの実装とoffline test。接続前の別審査必須。
 - **G2 Evidence Capture（別Owner決裁）:** 固定したAWS Account/role/期間/sourceにだけ短期アクセスして、完全性を過大評価しない収集。
 - **G2 Independent Assessment:** 実収集証拠に対する第三者判断。G1 NOT PROVENなら書き込み再開なし。
 
 ## 7. 最終状態
 
-`R1 SIX FINDINGS RESOLVED_IN_DESIGN / R2 NEW FINDINGS CORRECTED_IN_PROPOSAL / LIMITED RE-REVIEW PENDING` / `EXECUTION NOT AUTHORIZED` / `EVIDENCE NOT CAPTURED` / `G2 NOT VERIFIED` / `G1 NOT PROVEN` / **AWS WRITE BLOCKED**。
+`R1 SIX FINDINGS RESOLVED_IN_DESIGN / R2 NEW FINDINGS PARTIALLY_RESOLVED / R3-LIM-001,002 CORRECTED_IN_PROPOSAL / LIMITED RE-REVIEW PENDING` / `EXECUTION NOT AUTHORIZED` / `EVIDENCE NOT CAPTURED` / `G2 NOT VERIFIED` / `G1 NOT PROVEN` / **AWS WRITE BLOCKED**。
 
 **この文書自体も他のどの設計・Pull Requestのマージも、AWS接続認可またはタグ書込解除を発生させない。**
