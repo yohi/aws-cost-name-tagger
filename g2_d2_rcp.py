@@ -135,7 +135,8 @@ def _required_type_evidence_valid(
             return False
         name = record.get("resource_type")
         if (not _id(name) or name not in missing or name in covered
-                or record.get("reason") not in REQUIRED_ABSENCE_REASONS
+                or type(record.get("reason")) is not str
+                or record["reason"] not in REQUIRED_ABSENCE_REASONS
                 or record.get("request_fingerprint_sha256")
                    != data["request_fingerprint_sha256"]
                 or record.get("sar_evidence_id") != sar[name].get("sar_evidence_id")
@@ -306,7 +307,7 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
              "required_or_optional": x.get("required_or_optional"),
              "sar_evidence_id": x.get("sar_evidence_id")} for x in sar_types
         ],
-        "absent_required_resource_types": data["absent_required_resource_types"],
+        "absent_required_resource_types": data.get("absent_required_resource_types"),
         "expected_authorized_resource_count": count,
         "expected_resource_set_evidence_id": data.get("expected_resource_set_evidence_id"),
         "resource_evaluations": rows,
