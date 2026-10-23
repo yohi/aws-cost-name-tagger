@@ -131,7 +131,8 @@ def _decision(obj: dict[str, Any], action: dict[str, Any],
                 and _source_proof(obj)):
             return "NOT_COVERED", "EXEMPT"
     elif code == "AWS_MANAGED_KMS_KEY":
-        if (obj.get("key_manager") == "AWS" and typ.startswith("key")
+        if (obj.get("key_manager") == "AWS" and typ == "key"
+                and action["action"].startswith("kms:")
                 and _id(obj.get("key_manager_evidence_id"))
                 and _source_proof(obj)):
             return "NOT_COVERED", "EXEMPT"
