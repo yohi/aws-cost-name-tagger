@@ -27,6 +27,8 @@ def _wait_requested(g):
 
 
 def fencing_for(g, *, gateway_id=None, request_seq=None, evidence_id="synthetic-fencing-evidence", epoch=1):
+    if gateway_id is None and request_seq is None and evidence_id == "synthetic-fencing-evidence" and epoch == 1:
+        return g.simulate_gateway_fenced()
     return SyntheticFencingEvidence(
         g.grant_id, gateway_id or g.gateway_id,
         g.revoke_request_seq if request_seq is None else request_seq,
@@ -154,6 +156,15 @@ class OfflineSAESTests(unittest.TestCase):
                 self.assertEqual(g.finalize_revoke(invalid), "CANCEL_PENDING")
         self.assertEqual(g.state, "CANCEL_PENDING")
         self.assertNotIn("REVOKE_ACK_SUCCESS", [x["kind"] for x in g.ledger])
+        # Even a copy of a valid-looking witness cannot prove fencing.
+        fake = SyntheticFencingEvidence(
+            g.grant_id, g.gateway_id, seq, 1, "SYNTHETIC_GATEWAY_ISOLATED")
+        self.assertEqual(g.finalize_revoke(fake), "CANCEL_PENDING")
+        witness = g.simulate_gateway_fenced()
+        self.assertEqual(g.state, "CANCEL_PENDING")
+        self.assertEqual(g.finalize_revoke(SyntheticFencingEvidence(
+            witness.grant_id, witness.gateway_id, witness.revoke_request_seq,
+            witness.fenced_epoch, witness.evidence_id)), "CANCEL_PENDING")
         self.assertEqual(g.finalize_revoke(fencing_for(g)), "REVOKED")
         kinds = [x["kind"] for x in g.ledger]
         self.assertLess(kinds.index("FENCING_EVIDENCE_ACCEPTED"),
