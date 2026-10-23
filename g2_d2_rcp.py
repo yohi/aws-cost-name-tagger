@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
+from datetime import datetime
 from typing import Any
 
 MAX_RESOURCES = 64
@@ -48,13 +50,23 @@ def _digest(items: object) -> str:
 
 
 def _source_proof(row: dict[str, Any]) -> bool:
-    """Validate only the synthetic official-source record shape."""
+    """Validate syntax of synthetic official-source metadata, not authenticity."""
     h = row.get("exception_source_sha256")
-    return (all(_id(row.get(k)) for k in (
-        "exception_evidence_id", "exception_source_url",
-        "exception_checked_at_utc"))
-        and type(h) is str and len(h) == 64
-        and all(c in "0123456789abcdef" for c in h))
+    url = row.get("exception_source_url")
+    stamp = row.get("exception_checked_at_utc")
+    if (not _id(row.get("exception_evidence_id"))
+            or type(url) is not str
+            or re.fullmatch(r"https://docs\\.aws\\.amazon\\.com/[A-Za-z0-9._~/%?=&+-]+", url) is None
+            or type(h) is not str or len(h) != 64
+            or any(c not in "0123456789abcdef" for c in h)
+            or type(stamp) is not str
+            or re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z", stamp) is None):
+        return False
+    try:
+        datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 def _sar_index(types: list[dict[str, Any]], source: Any
@@ -97,6 +109,40 @@ def _expected_index(expected: list[dict[str, Any]], sar: dict[str, Any],
     if {k[0] for k in index} != set(range(len(expected))):
         valid = False
     return index, valid
+
+
+REQUIRED_ABSENCE_REASONS = frozenset({
+    "REQUEST_PARAMETER_EXCLUDES_RESOURCE", "ACTION_VARIANT_NOT_APPLICABLE",
+})
+
+
+def _required_type_evidence_valid(
+    data: dict[str, Any], sar: dict[str, dict[str, Any]],
+    expected: list[dict[str, Any]],
+) -> bool:
+    """Absent REQUIRED SAR types require explicit request-bound synthetic proof."""
+    required = {name for name, details in sar.items()
+                if details.get("required_or_optional") == "REQUIRED"}
+    present = {item.get("resource_type") for item in expected
+               if type(item) is dict and _id(item.get("resource_type"))}
+    missing = required - present
+    records = data.get("absent_required_resource_types")
+    if type(records) is not list or len(records) != len(missing):
+        return False
+    covered: set[str] = set()
+    for record in records:
+        if type(record) is not dict:
+            return False
+        name = record.get("resource_type")
+        if (not _id(name) or name not in missing or name in covered
+                or record.get("reason") not in REQUIRED_ABSENCE_REASONS
+                or record.get("request_fingerprint_sha256")
+                   != data["request_fingerprint_sha256"]
+                or record.get("sar_evidence_id") != sar[name].get("sar_evidence_id")
+                or not _id(record.get("evidence_id"))):
+            return False
+        covered.add(name)
+    return covered == missing
 
 
 def _unknown(obj: dict[str, Any], eval_id: str) -> dict[str, Any]:
@@ -226,6 +272,8 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
     sar, sar_valid = _sar_index(sar_types, data.get("authorization_reference_evidence_id"))
     expected_index, expected_valid = _expected_index(
         expected, sar, count, data.get("expected_resource_set_evidence_id"))
+    expected_valid = (expected_valid and sar_valid
+                      and _required_type_evidence_valid(data, sar, expected))
     rows: list[dict[str, Any]] = []
     seen_keys: set[tuple[int, str, str]] = set()
     seen_resources: set[tuple[str, str]] = set()
@@ -258,6 +306,7 @@ def evaluate_action(data: dict[str, Any]) -> dict[str, Any]:
              "required_or_optional": x.get("required_or_optional"),
              "sar_evidence_id": x.get("sar_evidence_id")} for x in sar_types
         ],
+        "absent_required_resource_types": data["absent_required_resource_types"],
         "expected_authorized_resource_count": count,
         "expected_resource_set_evidence_id": data.get("expected_resource_set_evidence_id"),
         "resource_evaluations": rows,
