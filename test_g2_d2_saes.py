@@ -3,7 +3,7 @@ import threading
 import unittest
 
 from g2_d2_saes import (
-    Attempt, OfflineContractError, OfflineSAES, SyntheticTransport,
+    Attempt, OfflineContractError, OfflineSAES, SyntheticFencingEvidence, SyntheticTransport,
     SAES_RUNTIME_PROOF, AWS_WRITES,
 )
 
@@ -25,12 +25,25 @@ def _wait_requested(g):
     return g._cancel_requested.wait(timeout=3)
 
 
+
+def fencing_for(g, *, gateway_id=None, request_seq=None, evidence_id="synthetic-fencing-evidence", epoch=1):
+    return SyntheticFencingEvidence(
+        g.grant_id, gateway_id or g.gateway_id,
+        g.revoke_request_seq if request_seq is None else request_seq,
+        epoch, evidence_id)
+
+
+def revoke_with_evidence(g):
+    assert g.revoke() == "CANCEL_PENDING"
+    return g.finalize_revoke(fencing_for(g))
+
+
 class OfflineSAESTests(unittest.TestCase):
     def test_cancellation_wins_and_queued_attempt_never_sends(self):
         g, transport = make_saes(), SyntheticTransport()
         a = make_attempt()
         self.assertEqual(g.queue_attempt(a, tick=1), "QUEUED")
-        self.assertEqual(g.revoke(), "REVOKED")
+        self.assertEqual(revoke_with_evidence(g), "REVOKED")
         self.assertEqual(g.attempt_state("a1"), "CANCELLED_BEFORE_SEND")
         self.assertEqual(g.send_once(a, transport, gateway_id=g.gateway_id, tick=2), "STOP_GRANT")
         self.assertEqual(transport.physical_send_count, 0)
@@ -48,7 +61,7 @@ class OfflineSAESTests(unittest.TestCase):
             target=lambda: results.setdefault(
                 "send", g.send_once(a, transport, gateway_id=g.gateway_id, tick=2)))
         revoker = threading.Thread(
-            target=lambda: results.setdefault("revoke", g.revoke()))
+            target=lambda: results.setdefault("revoke", revoke_with_evidence(g)))
         worker.start()
         try:
             self.assertTrue(transport_started.wait(3), "synthetic start never reached")
@@ -66,6 +79,7 @@ class OfflineSAESTests(unittest.TestCase):
         self.assertFalse(revoker.is_alive())
         self.assertEqual(results, {"send": "OK", "revoke": "REVOKED"})
         names = [x["kind"] for x in g.ledger]
+        self.assertLess(names.index("SEND_STARTED"), names.index("REVOKE_REQUESTED"))
         self.assertLess(names.index("SEND_STARTED"), names.index("REVOKE_COMMITTED"))
         self.assertLess(names.index("REVOKE_COMMITTED"), names.index("REVOKE_ACK_SUCCESS"))
         self.assertEqual(transport.physical_send_count, 1)
@@ -80,7 +94,7 @@ class OfflineSAESTests(unittest.TestCase):
             target=lambda: results.setdefault(
                 "send", g.send_once(a, t, gateway_id=g.gateway_id, tick=2)))
         revoker = threading.Thread(
-            target=lambda: results.setdefault("revoke", g.revoke()))
+            target=lambda: results.setdefault("revoke", revoke_with_evidence(g)))
         worker.start()
         try:
             self.assertTrue(entered.wait(3), "pre-start admission barrier not reached")
@@ -107,13 +121,51 @@ class OfflineSAESTests(unittest.TestCase):
         self.assertLess(names.index("CANCELLED_BEFORE_SEND"),
                         names.index("REVOKE_ACK_SUCCESS"))
 
+    def test_d2_001_queued_fingerprint_is_immutable_binding(self):
+        g, queued = make_saes(), make_attempt("same-id")
+        transport = SyntheticTransport()
+        self.assertEqual(g.queue_attempt(queued, tick=1), "QUEUED")
+        # Same attempt_id/plan/context/epoch, different payload fingerprint.
+        replaced = Attempt("same-id", queued.plan_sha256, queued.context_id,
+                           "different-fingerprint", queued.epoch)
+        self.assertEqual(g.send_once(replaced, transport,
+                                     gateway_id=g.gateway_id, tick=2),
+                         "STOP_BINDING_MISMATCH")
+        self.assertEqual(transport.physical_send_count, 0)
+        self.assertEqual(g.attempt_state("same-id"), "REJECTED_BINDING")
+        self.assertEqual(g.send_once(queued, transport, gateway_id=g.gateway_id, tick=3),
+                         "STOP_UNQUEUED")
+        self.assertNotIn("SEND_STARTED", [x["kind"] for x in g.ledger])
+
+    def test_d2_002_fencing_unproven_cannot_be_overridden_by_second_revoke(self):
+        g = make_saes()
+        self.assertEqual(g.revoke(), "CANCEL_PENDING")
+        seq = g.revoke_request_seq
+        self.assertEqual(g.revoke(), "CANCEL_PENDING")
+        self.assertEqual(seq, g.revoke_request_seq)
+        self.assertEqual(g.finalize_revoke(None), "CANCEL_PENDING")
+        for invalid in (
+            fencing_for(g, gateway_id="other-gateway"),
+            fencing_for(g, request_seq=seq + 1),
+            fencing_for(g, epoch=2),
+            fencing_for(g, evidence_id=""),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(g.finalize_revoke(invalid), "CANCEL_PENDING")
+        self.assertEqual(g.state, "CANCEL_PENDING")
+        self.assertNotIn("REVOKE_ACK_SUCCESS", [x["kind"] for x in g.ledger])
+        self.assertEqual(g.finalize_revoke(fencing_for(g)), "REVOKED")
+        kinds = [x["kind"] for x in g.ledger]
+        self.assertLess(kinds.index("FENCING_EVIDENCE_ACCEPTED"),
+                        kinds.index("REVOKE_ACK_SUCCESS"))
+
     def test_retry_after_owner_revokes_is_zero(self):
         g = make_saes()
         first, second = make_attempt("initial"), make_attempt("retry")
         t1, t2 = SyntheticTransport("THROTTLED"), SyntheticTransport()
         self.assertEqual(g.queue_attempt(first, tick=1), "QUEUED")
         self.assertEqual(g.send_once(first, t1, gateway_id=g.gateway_id, tick=2), "THROTTLED")
-        self.assertEqual(g.revoke(), "REVOKED")
+        self.assertEqual(revoke_with_evidence(g), "REVOKED")
         self.assertEqual(g.queue_attempt(second, tick=3), "STOP_GRANT")
         self.assertEqual(g.send_once(second, t2, gateway_id=g.gateway_id, tick=3), "STOP_GRANT")
         self.assertEqual(t1.physical_send_count, 1)
@@ -139,7 +191,7 @@ class OfflineSAESTests(unittest.TestCase):
     def test_unfenced_gateway_cannot_ack_or_restart(self):
         g, a = make_saes(), make_attempt()
         self.assertEqual(g.queue_attempt(a, tick=1), "QUEUED")
-        self.assertEqual(g.revoke(gateway_fencing_proven=False), "CANCEL_PENDING")
+        self.assertEqual(g.revoke(), "CANCEL_PENDING")
         transport = SyntheticTransport()
         self.assertEqual(g.send_once(a, transport, gateway_id=g.gateway_id, tick=2), "STOP_GRANT")
         self.assertEqual(transport.physical_send_count, 0)
