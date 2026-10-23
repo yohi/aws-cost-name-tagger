@@ -124,6 +124,7 @@ class OfflineSAES:
         self._attempts: dict[str, str] = {}
         self._bindings: dict[str, tuple[str, str, str, str, int]] = {}
         self._revoke_request_seq: int | None = None
+        self._synthetic_fencing_witness: SyntheticFencingEvidence | None = None
         self._records: list[dict[str, Any]] = []
         self._known_started = 0
         self._gateway_fencing_proven = True
@@ -279,6 +280,28 @@ class OfflineSAES:
             self._record("FENCING_PENDING")
             return "CANCEL_PENDING"
 
+    def simulate_gateway_fenced(self) -> SyntheticFencingEvidence:
+        """Trusted offline-fixture event: model an independently isolated Gateway.
+
+        Does NOT establish real network/OS fencing. Only a witness created
+        after CANCEL_PENDING may be accepted by this one synthetic authority.
+        """
+        with self._lock:
+            if self._state != "CANCEL_PENDING" or self._revoke_request_seq is None:
+                raise OfflineContractError("Fencing witness requires pending revoke")
+            if self._synthetic_fencing_witness is not None:
+                return self._synthetic_fencing_witness
+            witness = SyntheticFencingEvidence(
+                grant_id=self.grant_id,
+                gateway_id=self.gateway_id,
+                revoke_request_seq=self._revoke_request_seq,
+                fenced_epoch=self._epoch + 1,
+                evidence_id="SYNTHETIC_GATEWAY_ISOLATED",
+            )
+            self._synthetic_fencing_witness = witness
+            self._record("SYNTHETIC_FENCING_WITNESS_REGISTERED")
+            return witness
+
     def finalize_revoke(self, evidence: SyntheticFencingEvidence | None) -> str:
         """Accept explicit request-bound synthetic fencing evidence, or stay pending.
 
@@ -294,6 +317,7 @@ class OfflineSAES:
                 self._state == "CANCEL_PENDING"
                 and self._cancel_requested.is_set()
                 and evidence is not None
+                and evidence is self._synthetic_fencing_witness
                 and evidence.grant_id == self.grant_id
                 and evidence.gateway_id == self.gateway_id
                 and type(evidence.revoke_request_seq) is int
