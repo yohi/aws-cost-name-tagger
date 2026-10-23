@@ -120,9 +120,15 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 - 各区間で設定履歴・S3 original gzip/digest・署名チェーン・ログのeventTime/region/account・配送/retentionを対応付け、未確認区間を`PARTIAL`/`UNKNOWN`とする。矛盾があるとき`INCONSISTENT`。**現在のEventSelector/IsLoggingとBEGIN/END一致だけでは過去全期間`COMPLETE`禁止**。
 - 反例：過去の3日間にStopLoggingまたはselector変更を否定できなければ、その区間の`Name更新0件`主張は禁止。
 
-## 2C. Owner Grantの実行中失効契約（R1-006）
+## 2C. Owner Grantの実行中失効契約（R1-006 RESOLVED_IN_REQUIREMENTS / R2-NEW-001 限定是正）
 
-各SDKリクエスト**直前**に署名/承認元のGrant状態・取消・満了時刻・固定コードHEAD・承認済plan SHA・principal/context・paramsをチェックする（最初のSTS、ページ2以降、retry、Context切替、BEGIN/END含む）。参照元に到達不能、時計の信用不足、状態不明でも`STOP_GRANT`、**後続AWS API呼出しゼロ**。
+各**物理HTTP送信試行の直前**に署名/承認元のGrant状態・取消・満了時刻・固定コードHEAD・承認済plan SHA・principal/context・paramsを検証する（最初のSTS、ページ2以降、Collector-managed retry、Context切替、BEGIN/END含む）。参照元に到達不能、時計の信用不足、状態不明でも`STOP_GRANT`、**以後の物理HTTP送信ゼロ**。SDK設定は`Config(retries={"mode":"standard","total_max_attempts":1})`で内部再試行を禁止。`before-call`単独の確認は実送信単位の証明ではなく、`before-send`相当の送信直前guardとtransport送信数の監査が別途必要。
+
+**実装方式は「SDK内部retry無効化／Collectorのみがretry所有」に固定する。** 各再試行で新`attempt_id`を付け、`CHECK_GRANT` → `CHECK_SCOPE` → `RESERVE_SEND_BUDGET` → `SEND_ONCE`という状態遷移を繰り返す。SDK標準の自動retryだけでなく、custom `needs-retry` handler、redirect、別Client、credential providerの暗黙送信経路が存在するなら、送信境界の観測と制御を証明するまで`RUNTIME_NOT_PROVEN`で停止する。
+
+**失効競合:** 直前チェックと本当の送信の間にOwner取消が割り込むTOCTOUを、単なるローカル時刻比較だけで解決したと主張しない。Owner取消と物理送信認可の線形化を単一`Grant authority`の`revocation_epoch`/`attempt_id`で仲介し、取消完了後の新規送信を禁止できるruntime証拠が未成立なら`STRICT_REVOCATION_NOT_PROVEN`でAWS実行不可。すでに送信されたin-flight要求は撤回不能として未承認sealする。
+
+**証跡:** page/attempt ledgerに`transport_attempt_id`、`grant_id`、`grant_revocation_epoch`、`pre_send_grant_decision`、`grant_checked_at_utc`、`effective_sdk_total_max_attempts`、`physical_send_count`、`retry_owner=COLLECTOR_ONLY`、`revocation_observed_at_utc`、`in_flight_at_revocation`を持たせ、Owner取消→次送信0回を独立監査できるようにする。新しいAWS接続権限は一切付与していない。
 
 すでに送信済みのin-flightリクエストは後から巻き戻せる保証がないため、失効時の応答と既取得RAWは`UNAUTHORIZED_AFTER_REVOKE`という**内部保全ラベル**で未承認seal・隔離し、共有不可。再開には新しいOwner決裁・新規snapshot IDと独立確認が必須。これは設計上の要求であり、現PRには取消実装もOwner Grantも存在しない。
 
@@ -170,7 +176,10 @@ AWS OrganizationsのRCPは、単にServiceが対応しているかでなく、�
 15. **IAM Filter:** 5種別以外、部分ページ、DefaultVersionIdとPolicy ARN不一致、Policy本文未取得を`PARTIAL/UNKNOWN`にする。
 16. **Grant実行中失効:** 1ページ目完了後にOwner取消/満了/取消照会不能/planやHEAD不一致→2ページ目以降AWS API0、未承認RAW seal、別Grantなしの再開禁止。in-flightは取消可能と主張しない。
 
-## 4A. R1 Finding Closure Tracker（R2提案上の状態）
+17. **R2-N01 物理送信境界とOwner取消:** 合成transportで初回`SEND_ONCE`→Throttling/5xx→SDK標準内部retryが無効のままCollector再試行を予約→OwnerがGrant取消・`revocation_epoch`更新→再試行の`CHECK_GRANT`が`STOP_GRANT`→**以後のHTTP transport send 0回**を確認。`before-call`検証後の取消、`before-send`前の取消、照会不能、期限切れ、SDK設定改変、custom retry handler、redirect、別Client、競合同時実行とin-flight隔離を含める。`before-send`のみの単体テストではtransport経路全体を証明しない。
+18. **R2-N02 RCP Action/Resource Type:** RCP対応サービスでActionの認可Resource type不明→`UNKNOWN`。同一サービスの別Actionで異なるタイプ、複数Resourceの一部が不明、管理資源、サービスリンクロール、SAR版不一致を合成し、`rcp_resource_coverage`をresource別に確認。`UNKNOWN`を`NOT_SUPPORTED`や書込不可能に変換しない。
+
+## 4A. R1 Finding Closure Tracker（R2独立クローズ済み）
 
 | Finding | Major/Minor | R2の証拠箇所 | 現時点の判定 |
 |---|---|---|---|
