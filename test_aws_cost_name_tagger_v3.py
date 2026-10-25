@@ -1919,5 +1919,147 @@ class AWSServiceTagSchemaPRBR2Tests(unittest.TestCase):
             self.assertEqual(fake.writes, [])
 
 
+
+
+class PaginationFailClosedPRBR3Tests(unittest.TestCase):
+    """FND-12-R2-003: incomplete tag pages cannot establish Name state."""
+
+    def test_athena_next_token_blocks_candidate_before_workgroup_lookup(self):
+        arn = f'arn:aws:athena:{REGION}:{ACCOUNT}:workgroup/scs2-prd-athena'
+        for token in ('page-2', '', 123):
+            for first_tags in (
+                [{'Key': 'Product', 'Value': 'app'}],
+                [{'Key': 'Name', 'Value': ''}],
+                [{'Key': 'Name', 'Value': 'existing-name'}],
+            ):
+                with self.subTest(token=token, first_tags=first_tags):
+                    class PaginatedAthena:
+                        calls = 0
+                        workgroup_calls = 0
+
+                        def list_tags_for_resource(self, ResourceARN):
+                            self.calls += 1
+                            self.asserted_arn = ResourceARN
+                            return {'Tags': first_tags, 'NextToken': token}
+
+                        def get_work_group(self, WorkGroup):
+                            self.workgroup_calls += 1
+                            return {'WorkGroup': {'Name': 'scs2-prd-athena'}}
+
+                    api = PaginatedAthena()
+                    out = t.Investigator(
+                        FakeSession({'athena': api}), ACCOUNT
+                    ).resolve(row_for('athena_workgroup', arn))
+                    self.assertEqual(api.calls, 1)
+                    self.assertEqual(api.asserted_arn, arn)
+                    self.assertEqual(api.workgroup_calls, 0)
+                    self.assertEqual(out['name_state'], 'UNKNOWN')
+                    self.assertIsNone(out['name_key_present'])
+                    self.assertEqual(out['status'], 'manual_review')
+                    self.assertEqual(out['proposed_name'], '')
+                    self.assertIn('paginated', out['evidence'])
+
+    def test_wafv2_next_marker_blocks_candidate_before_acl_lookup(self):
+        arn = (f'arn:aws:wafv2:{REGION}:{ACCOUNT}:'
+               'regional/webacl/scs2-prd-web-waf/a1b2c3d4')
+        for token in ('next-page', '', 42):
+            for first_tags in (
+                [{'Key': 'Product', 'Value': 'app'}],
+                [{'Key': 'Name', 'Value': ''}],
+                [{'Key': 'Name', 'Value': 'existing-name'}],
+            ):
+                with self.subTest(token=token, first_tags=first_tags):
+                    class PaginatedWAF:
+                        calls = 0
+                        acl_calls = 0
+
+                        def list_tags_for_resource(self, ResourceARN):
+                            self.calls += 1
+                            self.asserted_arn = ResourceARN
+                            return {
+                                'NextMarker': token,
+                                'TagInfoForResource': {
+                                    'ResourceARN': ResourceARN,
+                                    'TagList': first_tags,
+                                },
+                            }
+
+                        def get_web_acl(self, **kwargs):
+                            self.acl_calls += 1
+                            return {'WebACL': {'ARN': arn,
+                                               'Name': 'scs2-prd-web-waf'}}
+
+                    api = PaginatedWAF()
+                    out = t.Investigator(
+                        FakeSession({'wafv2': api}), ACCOUNT
+                    ).resolve(row_for('wafv2', arn))
+                    self.assertEqual(api.calls, 1)
+                    self.assertEqual(api.asserted_arn, arn)
+                    self.assertEqual(api.acl_calls, 0)
+                    self.assertEqual(out['name_state'], 'UNKNOWN')
+                    self.assertIsNone(out['name_key_present'])
+                    self.assertEqual(out['status'], 'manual_review')
+                    self.assertEqual(out['proposed_name'], '')
+                    self.assertIn('paginated', out['evidence'])
+
+    def test_complete_single_page_remains_actionable_or_protected(self):
+        athena_arn = f'arn:aws:athena:{REGION}:{ACCOUNT}:workgroup/scs2-prd-athena'
+        waf_arn = (f'arn:aws:wafv2:{REGION}:{ACCOUNT}:'
+                   'regional/webacl/scs2-prd-web-waf/a1b2c3d4')
+
+        class SingleAthena:
+            def __init__(self, name, include_none_token):
+                self.name = name
+                self.include_none_token = include_none_token
+
+            def list_tags_for_resource(self, ResourceARN):
+                page = {'Tags': ([] if self.name is None else
+                         [{'Key': 'Name', 'Value': self.name}])}
+                if self.include_none_token:
+                    page['NextToken'] = None
+                return page
+
+            def get_work_group(self, WorkGroup):
+                return {'WorkGroup': {'Name': 'scs2-prd-athena'}}
+
+        class SingleWAF:
+            def __init__(self, name, include_none_token):
+                self.name = name
+                self.include_none_token = include_none_token
+
+            def list_tags_for_resource(self, ResourceARN):
+                page = {'TagInfoForResource': {
+                    'ResourceARN': ResourceARN,
+                    'TagList': ([] if self.name is None else
+                                [{'Key': 'Name', 'Value': self.name}])}}
+                if self.include_none_token:
+                    page['NextMarker'] = None
+                return page
+
+            def get_web_acl(self, **kwargs):
+                return {'WebACL': {'ARN': waf_arn, 'Name': 'scs2-prd-web-waf'}}
+
+        for name, state, status in (
+            (None, 'ABSENT', 'proposed'),
+            ('', 'EMPTY', 'proposed'),
+            ('existing-name', 'NONEMPTY', 'already_named'),
+        ):
+            for include_none_token in (False, True):
+                for kind, api, arn in (
+                    ('athena_workgroup', SingleAthena(name, include_none_token), athena_arn),
+                    ('wafv2', SingleWAF(name, include_none_token), waf_arn),
+                ):
+                    with self.subTest(kind=kind, name=name,
+                                      include_none_token=include_none_token):
+                        service = 'athena' if kind == 'athena_workgroup' else 'wafv2'
+                        out = t.Investigator(
+                            FakeSession({service: api}), ACCOUNT
+                        ).resolve(row_for(kind, arn))
+                        self.assertEqual((out['name_state'], out['status']),
+                                         (state, status))
+                        self.assertEqual(bool(out['proposed_name']),
+                                         status == 'proposed')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
