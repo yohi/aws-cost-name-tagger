@@ -1365,5 +1365,182 @@ class ReportPublishSafetyPRCTests(unittest.TestCase):
             self.assertEqual(len([p for p in sources if p.exists()]), 3)
 
 
+
+class ReportPublishCompatibilityR1Tests(unittest.TestCase):
+    """Approved Ubuntu/private-output contract and pre-AWS fail-closed checks."""
+
+    def test_t15_a_public_output_rejected_before_cur_or_aws_for_plan_and_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            public = root / 'public'
+            public.mkdir(mode=0o755)
+            public.chmod(0o755)
+            output = public / 'name_tag_plan.json'
+            args = t.parse_cli([
+                'plan', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--output', str(output),
+            ])
+            with patch.object(t, 'cur_candidates') as cur, \
+                 patch.object(t, 'build_session') as session:
+                with self.assertRaisesRegex(PermissionError, 'destination'):
+                    t.plan(args)
+                cur.assert_not_called()
+                session.assert_not_called()
+
+            run_args = t.parse_cli([
+                'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--login', 'skip', '--mode', 'dryrun', '--output', str(output),
+            ])
+            with patch.object(t, 'offer_remote_login') as login, \
+                 patch.object(t, 'build_session') as session:
+                with self.assertRaisesRegex(PermissionError, 'destination'):
+                    t.run_interactive(run_args)
+                login.assert_not_called()
+                session.assert_not_called()
+            self.assertEqual(list(public.iterdir()), [])
+
+    def test_t15_b_default_private_output_and_explicit_0700_are_usable(self):
+        import os
+        import stat
+
+        for command in ('plan', 'run'):
+            args = t.parse_cli([command, '--cur', 'unused.csv.gz', '--account', ACCOUNT])
+            self.assertEqual(args.output, '.aws-cost-name-tagger/name_tag_plan.json')
+        with tempfile.TemporaryDirectory() as tmp:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                args = t.parse_cli([
+                    'plan', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                ])
+                with patch.object(t, 'cur_candidates', return_value=('2026-10', [])), \
+                     patch.object(t, 'assert_account'):
+                    t.plan(args, session=FakeSession({}))
+                out = Path(args.output)
+                self.assertTrue(out.is_file())
+                self.assertEqual(stat.S_IMODE(out.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+                self.assertTrue(out.with_suffix('.review.csv').is_file())
+                self.assertTrue(out.with_suffix('.report.csv').is_file())
+            finally:
+                os.chdir(original_cwd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination_dir = root / 'existing-private'
+            destination_dir.mkdir(mode=0o700)
+            destination_dir.chmod(0o700)
+            source = root / 'source.json'
+            t.write_json(source, {'ok': True})
+            destination = destination_dir / 'published.json'
+            t.publish_staged_reports([(source, destination)])
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+
+    def test_t15_c_owner_mismatch_denied_before_publication(self):
+        import os
+        import stat
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'not-owned.json'
+            original_fstat = os.fstat
+
+            def foreign_directory(fd):
+                record = original_fstat(fd)
+                if stat.S_ISDIR(record.st_mode):
+                    return SimpleNamespace(st_uid=os.geteuid() + 1,
+                                           st_mode=record.st_mode)
+                return record
+
+            with patch.object(t.os, 'fstat', side_effect=foreign_directory):
+                with self.assertRaisesRegex(PermissionError, 'owned by'):
+                    t.preflight_report_destination(out)
+            self.assertFalse(out.exists())
+
+    def test_t15_d_unsupported_macos_refused_before_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = t.parse_cli([
+                'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--login', 'skip', '--mode', 'dryrun',
+                '--output', str(Path(tmp) / 'result.json'),
+            ])
+            with patch.object(t.sys, 'platform', 'darwin'), \
+                 patch.object(t, 'offer_remote_login') as login, \
+                 patch.object(t, 'build_session') as session:
+                with self.assertRaisesRegex(RuntimeError, 'only on Ubuntu Linux'):
+                    t.run_interactive(args)
+                login.assert_not_called()
+                session.assert_not_called()
+            self.assertFalse((Path(tmp) / 'result.json').exists())
+
+    def test_t09_b_missing_posix_capabilities_fail_before_aws_or_local_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'future' / 'result.json'
+            args = t.parse_cli([
+                'plan', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--output', str(out),
+            ])
+            for capability, function in (
+                ('supports_dir_fd', t.os.stat),
+                ('supports_follow_symlinks', t.os.link),
+            ):
+                with self.subTest(capability=capability, function=function.__name__):
+                    saved = set(getattr(t.os, capability))
+                    saved.discard(function)
+                    with patch.object(t.os, capability, saved), \
+                         patch.object(t, 'cur_candidates') as cur, \
+                         patch.object(t, 'build_session') as session:
+                        with self.assertRaisesRegex(RuntimeError, 'requires'):
+                            t.plan(args)
+                        cur.assert_not_called()
+                        session.assert_not_called()
+                    self.assertFalse(out.parent.exists())
+
+    def test_t14_b_multiple_cleanup_errors_preserve_primary_and_all_attempts(self):
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = [root / f'source-{i}.json' for i in range(4)]
+            outputs = [root / f'destination-{i}.json' for i in range(4)]
+            for index, source in enumerate(sources):
+                t.write_json(source, {'index': index})
+            original_fsync, original_unlink = os.fsync, os.unlink
+            root_meta = root.stat()
+            attempted = []
+            failed = {outputs[0].name, outputs[2].name}
+
+            def fail_destination_fsync(fd):
+                info = os.fstat(fd)
+                if (stat.S_ISDIR(info.st_mode)
+                        and (info.st_dev, info.st_ino) ==
+                        (root_meta.st_dev, root_meta.st_ino)):
+                    raise OSError('primary fsync failure')
+                return original_fsync(fd)
+
+            def fail_two_unlinks(name, **kwargs):
+                attempted.append(Path(name).name)
+                if Path(name).name in failed:
+                    raise OSError(f"cleanup failure: {Path(name).name}")
+                return original_unlink(name, **kwargs)
+
+            with patch.object(t.os, 'fsync', side_effect=fail_destination_fsync), \
+                 patch.object(t.os, 'unlink', side_effect=fail_two_unlinks):
+                with self.assertRaises(t.ReportPublishCleanupError) as captured:
+                    t.publish_staged_reports(list(zip(sources, outputs)))
+
+            error = captured.exception
+            self.assertIn('primary fsync failure', str(error.primary_error))
+            self.assertIs(error.__cause__, error.primary_error)
+            self.assertEqual(len(error.cleanup_errors), 2)
+            self.assertEqual({name for name, _ in error.cleanup_errors}, failed)
+            self.assertEqual({str(p) for p in outputs if p.exists()},
+                             set(error.possibly_remaining))
+            self.assertEqual(attempted, [p.name for p in reversed(outputs)])
+            self.assertTrue(all(p.exists() for p in sources))
+
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
