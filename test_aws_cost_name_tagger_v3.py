@@ -181,7 +181,11 @@ class AlgorithmTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp)/'empty.csv.gz'
             with gzip.open(p,'wt',encoding='utf-8',newline='') as f:
-                csv.writer(f).writerow(['bill_billing_period_start_date'])
+                csv.writer(f).writerow([
+                    'bill_billing_period_start_date', 'line_item_usage_account_id',
+                    'line_item_line_item_type', 'line_item_resource_id',
+                    'line_item_unblended_cost', 'product_region_code',
+                    'line_item_product_code', 'line_item_currency_code'])
             with self.assertRaisesRegex(ValueError,'no billing rows.*--month'):
                 t.cur_candidates([str(p)],None,1,100,ACCOUNT)
 
@@ -1623,6 +1627,7 @@ class PreLoginCollisionPRCR2Tests(unittest.TestCase):
                  patch.object(t, 'build_session', return_value=object()), \
                  patch.object(t, 'show_aws_identity', return_value={}), \
                  patch.object(t, 'choose_mode', return_value='dryrun'), \
+                 patch.object(t, 'cur_candidates', return_value=('2026-10', [])), \
                  patch.object(t, 'plan') as plan:
                 with self.assertRaisesRegex(SystemExit, 'output already exists'):
                     t.run_interactive(args)
@@ -2175,13 +2180,15 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'duplicate'):
                 self.call_cur([p])
             with gzip.open(p, 'wt', encoding='utf-8',newline='') as out:
-                out.write('bill_billing_period_start_date,line_item_line_item_type\n')
-                out.write('2026-10-01,Usage,EXTRA\n')
+                writer=csv.writer(out)
+                writer.writerow(self.COLS)
+                writer.writerow(list(self.row().values()) + ['EXTRA'])
             with self.assertRaisesRegex(ValueError, 'extra or missing'):
                 self.call_cur([p])
             with gzip.open(p, 'wt', encoding='utf-8',newline='') as out:
-                out.write('bill_billing_period_start_date,line_item_line_item_type\n')
-                out.write('2026-10-01\n')
+                writer=csv.writer(out)
+                writer.writerow(self.COLS)
+                writer.writerow(['2026-10-01'])
             with self.assertRaisesRegex(ValueError, 'extra or missing'):
                 self.call_cur([p])
 
@@ -2253,6 +2260,144 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
                 identity.assert_not_called()
             self.assertFalse(output.exists())
             self.assertEqual(list(output.parent.iterdir()), [])
+
+
+
+
+class CURR1LimitedCorrectionsTests(unittest.TestCase):
+    """FND-13-R1-001..003: offline fail-closed + valid multiline CSV."""
+
+    COLS = CURIntegrityBoundsPR13Tests.COLS
+
+    def row(self, **kwargs):
+        return CURIntegrityBoundsPR13Tests().row(**kwargs)
+
+    def write_cur(self, path, rows):
+        return CURIntegrityBoundsPR13Tests().write_cur(path, rows)
+
+    def run_args(self, root, mode, cur):
+        args = ['run', '--cur', str(cur), '--account', ACCOUNT,
+                '--login', 'skip', '--output', str(root/'reports'/'out.json')]
+        if mode is not None:
+            args += ['--mode', mode]
+        return t.parse_cli(args)
+
+    def test_r1_run_dryrun_and_y_invalid_cur_refuse_all_aws_and_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            cur=self.write_cur(root/'bad.csv.gz', [
+                self.row(line_item_unblended_cost='NaN')
+            ])
+            for mode in ('dryrun', 'y'):
+                with self.subTest(mode=mode):
+                    args=self.run_args(root, mode, cur)
+                    with patch.object(t, 'offer_remote_login') as login, \
+                         patch.object(t, 'build_session') as session, \
+                         patch.object(t, 'show_aws_identity') as identity, \
+                         patch.object(t, 'choose_mode') as choose, \
+                         patch.object(t, 'plan') as plan, \
+                         patch.object(t, 'publish_staged_reports') as publish:
+                        with self.assertRaisesRegex(ValueError, 'CUR monetary'):
+                            t.run_interactive(args)
+                        for mock in (login, session, identity, choose, plan, publish):
+                            mock.assert_not_called()
+                    self.assertFalse(Path(args.output).exists())
+                    self.assertEqual(list(Path(args.output).parent.iterdir()), [])
+
+    def test_r1_run_reuses_exact_prevalidated_batch_no_second_cur_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            cur=self.write_cur(root/'good.csv.gz', [self.row()])
+            args=self.run_args(root, 'dryrun', cur)
+            ec2=FakeEC2()
+            session=FakeSession({'ec2': ec2, 'sts': FakeSTS(), 'iam': FakeIAM()})
+            actual=t.cur_candidates
+            with patch.object(t, 'cur_candidates', wraps=actual) as parser, \
+                 patch.object(t, 'build_session', return_value=session):
+                t.run_interactive(args)
+                parser.assert_called_once()
+            doc=json.loads(Path(args.output).read_text(encoding='utf-8'))
+            self.assertEqual(doc['records'][0]['status'], 'proposed')
+            self.assertEqual(ec2.writes, [])
+
+    def test_r1_cur_file_replaced_after_prevalidation_refuses_report(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            cur=self.write_cur(root/'source.csv.gz',[self.row()])
+            args=self.run_args(root, 'dryrun', cur)
+            replacement=self.write_cur(root/'replacement.csv.gz',
+                                       [self.row(line_item_unblended_cost='99')])
+            session=FakeSession({'ec2': FakeEC2(), 'sts': FakeSTS(), 'iam': FakeIAM()})
+            def replace_after_login(_args):
+                os.replace(replacement, cur)
+                return True
+            with patch.object(t,'offer_remote_login',side_effect=replace_after_login), \
+                 patch.object(t,'build_session',return_value=session), \
+                 patch.object(t,'plan') as plan:
+                with self.assertRaisesRegex(ValueError, 'since pre-login'):
+                    t.run_interactive(args)
+                plan.assert_not_called()
+            self.assertFalse(Path(args.output).exists())
+
+    def test_r1_multiline_quoted_value_within_budget_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            note='long,\nwith,comma\nand ""literal"" quotes'
+            path=self.write_cur(root/'multiline.csv.gz',[
+                self.row(line_item_product_code=note)
+            ])
+            period,candidates=t.cur_candidates([str(path)],None,0,2,ACCOUNT)
+            self.assertEqual(period, '2026-10')
+            self.assertEqual(candidates[0]['source_services'], [note])
+            self.assertEqual(candidates[0]['effective_usage_cost_usd'],7)
+
+    def test_r1_many_physical_lines_one_logical_record_rejected_preparse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=self.write_cur(Path(tmp)/'multiline.csv.gz', [
+                self.row(line_item_product_code='A\nB\nC\nD\nE')
+            ])
+            with patch.object(t, 'MAX_CUR_LOGICAL_RECORD_BYTES',100):
+                with self.assertRaisesRegex(ValueError, 'logical record byte limit'):
+                    t.cur_candidates([str(path)],None,0,3,ACCOUNT)
+
+    def test_r1_field_limit_rejected_before_parser_allocates_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=self.write_cur(Path(tmp)/'many-fields.csv.gz', [self.row()])
+            with patch.object(t, 'MAX_CUR_FIELDS',7):
+                with self.assertRaisesRegex(ValueError, 'field limit'):
+                    t.cur_candidates([str(path)],None,0,3,ACCOUNT)
+
+    def test_r1_empty_gzip_requires_header_even_with_explicit_month(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'empty.csv.gz'
+            with gzip.open(path,'wb') as f:
+                pass
+            with self.assertRaisesRegex(ValueError, 'header is missing'):
+                t.cur_candidates([str(path)],'2026-10',0,3,ACCOUNT)
+
+    def test_r1_header_only_valid_and_missing_required_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'header.csv.gz'
+            self.write_cur(path,[])
+            period,records=t.cur_candidates([str(path)],'2026-10',0,3,ACCOUNT)
+            self.assertEqual(period,'2026-10')
+            self.assertEqual(records, [])
+            with gzip.open(path,'wt',encoding='utf-8',newline='') as f:
+                csv.writer(f).writerow(['bill_billing_period_start_date'])
+            with self.assertRaisesRegex(ValueError, 'missing required columns'):
+                t.cur_candidates([str(path)],'2026-10',0,3,ACCOUNT)
+
+    def test_r1_truncated_gzip_or_crc_error_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            path=self.write_cur(root/'good.csv.gz',[self.row()])
+            full=path.read_bytes()
+            for blob in (full[:-8], full[:-1], full[:-8]+b'\0'*8):
+                with self.subTest(length=len(blob),tail=blob[-8:]):
+                    path.write_bytes(blob)
+                    with self.assertRaises((EOFError, OSError, gzip.BadGzipFile)):
+                        t.cur_candidates([str(path)],None,0,3,ACCOUNT)
 
 
 if __name__ == '__main__':
