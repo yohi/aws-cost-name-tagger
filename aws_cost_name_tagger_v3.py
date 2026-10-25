@@ -480,12 +480,16 @@ class AWSReadBudget:
         self.calls = 0
         self.exhausted = False
 
-    def require_remaining(self):
+    def require_completion(self):
+        """The last permitted call can finish without requiring a spare call."""
         if self.exhausted:
             raise AWSReadBudgetExceeded("AWS read budget already exhausted")
         if time.monotonic() - self.started >= self.max_elapsed:
             self.exhausted = True
             raise AWSReadBudgetExceeded("AWS read elapsed-time budget exceeded")
+
+    def require_remaining(self):
+        self.require_completion()
         if self.calls >= self.max_calls:
             self.exhausted = True
             raise AWSReadBudgetExceeded("AWS read API-call budget exceeded")
@@ -1621,7 +1625,7 @@ def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
          "min_cost_usd":args.min_cost,"count":len(records),"records":records}
     if prepared_cur is not None:
         _require_run_cur_unchanged(args, prepared_cur)
-    session.read_budget.require_remaining()
+    session.read_budget.require_completion()
     ensure_private_output_dir(out.parent)
     # NEW-003 mitigation: create the complete file set in a mode-0700 staging
     # directory; publish only after every file has been flushed and fsync'd.
