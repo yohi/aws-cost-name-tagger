@@ -2064,5 +2064,196 @@ class PaginationFailClosedPRBR3Tests(unittest.TestCase):
                                          status == 'proposed')
 
 
+
+
+class CURIntegrityBoundsPR13Tests(unittest.TestCase):
+    """AUD-001/003: CUR input checks always run before AWS/session access."""
+
+    COLS = ('bill_billing_period_start_date', 'line_item_usage_account_id',
+            'line_item_line_item_type', 'line_item_resource_id',
+            'line_item_unblended_cost', 'reservation_effective_cost',
+            'savings_plan_savings_plan_effective_cost', 'product_region_code',
+            'line_item_product_code', 'line_item_currency_code')
+
+    def row(self, **overrides):
+        row = {
+            'bill_billing_period_start_date': '2026-10-01',
+            'line_item_usage_account_id': ACCOUNT,
+            'line_item_line_item_type': 'Usage',
+            'line_item_resource_id': INSTANCE,
+            'line_item_unblended_cost': '7',
+            'reservation_effective_cost': '',
+            'savings_plan_savings_plan_effective_cost': '',
+            'product_region_code': REGION,
+            'line_item_product_code': 'AmazonEC2',
+            'line_item_currency_code': 'USD',
+        }
+        row.update(overrides)
+        return row
+
+    def write_cur(self, path, rows, headers=None):
+        with gzip.open(path, 'wt', encoding='utf-8', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=headers or self.COLS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        return path
+
+    def call_cur(self, files, *, max_resources=100):
+        return t.cur_candidates([str(p) for p in files], None, 0,
+                                max_resources, ACCOUNT)
+
+    def test_pr13_normal_inputs_preserve_effective_cost_and_max_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'cur.csv.gz'
+            self.write_cur(path, [
+                self.row(line_item_unblended_cost='10.5'),
+                self.row(line_item_line_item_type='DiscountedUsage',
+                         line_item_unblended_cost='',
+                         reservation_effective_cost='2.5'),
+                self.row(line_item_line_item_type='SavingsPlanCoveredUsage',
+                         line_item_unblended_cost='',
+                         savings_plan_savings_plan_effective_cost='3'),
+                self.row(line_item_line_item_type='Fee',
+                         line_item_resource_id='', line_item_unblended_cost=''),
+                self.row(bill_billing_period_start_date='2026-09-01',
+                         line_item_resource_id=VOLUME, line_item_unblended_cost='900'),
+            ])
+            month, rows = self.call_cur([path])
+            self.assertEqual(month, '2026-10')
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['effective_usage_cost_usd'], 16.0)
+            self.assertEqual(rows[0]['billing_rows'], 3)
+            self.assertEqual(self.call_cur([path], max_resources=0)[1], [])
+
+    def test_pr13_duplicate_paths_hardlinks_and_symlink_aliases_rejected(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            path=self.write_cur(root/'cur.csv.gz', [self.row()])
+            hardlink=root/'hardlink.csv.gz'
+            symlink=root/'alias.csv.gz'
+            os.link(path, hardlink)
+            symlink.symlink_to(path)
+            for files in ([path,path], [path,hardlink], [path,symlink]):
+                with self.subTest(files=[str(p) for p in files]):
+                    with self.assertRaisesRegex(ValueError,'Duplicate CUR'):
+                        self.call_cur(files)
+
+    def test_pr13_reject_invalid_nonfinite_and_missing_selected_costs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'cost.csv.gz'
+            for amount in ('NaN', 'Infinity', '-Infinity', 'bad', '', '  ', '1e999'):
+                with self.subTest(amount=amount):
+                    self.write_cur(p,[self.row(line_item_unblended_cost=amount)])
+                    with self.assertRaisesRegex(ValueError, 'CUR monetary'):
+                        self.call_cur([p])
+            for kind, col in (
+                ('DiscountedUsage','reservation_effective_cost'),
+                ('SavingsPlanCoveredUsage','savings_plan_savings_plan_effective_cost'),
+            ):
+                with self.subTest(kind=kind):
+                    self.write_cur(p,[self.row(line_item_line_item_type=kind,
+                                               **{col: ''})])
+                    with self.assertRaisesRegex(ValueError, 'CUR monetary'):
+                        self.call_cur([p])
+
+    def test_pr13_aggregate_overflow_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'huge.csv.gz'
+            self.write_cur(p,[self.row(line_item_unblended_cost='1e308'),
+                              self.row(line_item_unblended_cost='1e308')])
+            with self.assertRaisesRegex(ValueError, 'aggregated amount'):
+                self.call_cur([p])
+
+    def test_pr13_duplicate_headers_and_malformed_rows_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'malformed.csv.gz'
+            with gzip.open(p, 'wt', encoding='utf-8',newline='') as out:
+                out.write('bill_billing_period_start_date,bill_billing_period_start_date\n')
+                out.write('2026-10-01,2026-10-01\n')
+            with self.assertRaisesRegex(ValueError, 'duplicate'):
+                self.call_cur([p])
+            with gzip.open(p, 'wt', encoding='utf-8',newline='') as out:
+                out.write('bill_billing_period_start_date,line_item_line_item_type\n')
+                out.write('2026-10-01,Usage,EXTRA\n')
+            with self.assertRaisesRegex(ValueError, 'extra or missing'):
+                self.call_cur([p])
+            with gzip.open(p, 'wt', encoding='utf-8',newline='') as out:
+                out.write('bill_billing_period_start_date,line_item_line_item_type\n')
+                out.write('2026-10-01\n')
+            with self.assertRaisesRegex(ValueError, 'extra or missing'):
+                self.call_cur([p])
+
+    def test_pr13_changed_file_between_passes_is_rejected(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            p=self.write_cur(root/'input.csv.gz',[self.row()])
+            original=t._scan_cur_file
+            count=[0]
+
+            def mutate_after_first_scan(path, budget, accept_row):
+                value=original(path,budget,accept_row)
+                count[0]+=1
+                if count[0]==1:
+                    replacement=self.write_cur(root/'replacement.csv.gz',
+                                               [self.row(line_item_unblended_cost='800')])
+                    os.replace(replacement,p)
+                return value
+
+            with patch.object(t,'_scan_cur_file',side_effect=mutate_after_first_scan):
+                with self.assertRaisesRegex(ValueError, 'between passes'):
+                    self.call_cur([p])
+            self.assertEqual(count[0],2)
+
+    def test_pr13_bounded_row_budget_fails_before_second_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=self.write_cur(Path(tmp)/'rows.csv.gz',[self.row(),self.row()])
+            with patch.object(t,'MAX_CUR_ROWS',1):
+                with self.assertRaisesRegex(ValueError, 'row budget'):
+                    self.call_cur([p])
+
+    def test_pr13_distinct_resource_budget_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=self.write_cur(Path(tmp)/'distinct.csv.gz',[
+                self.row(line_item_resource_id=INSTANCE),
+                self.row(line_item_resource_id=VOLUME),
+            ])
+            with patch.object(t,'MAX_CUR_DISTINCT_RESOURCES',1):
+                with self.assertRaisesRegex(ValueError, 'distinct-resource budget'):
+                    self.call_cur([p])
+
+    def test_pr13_decompressed_line_and_file_count_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=self.write_cur(Path(tmp)/'bytes.csv.gz',[self.row()])
+            with patch.object(t,'MAX_CUR_UNCOMPRESSED_BYTES',30):
+                with self.assertRaisesRegex(ValueError, 'byte budget'):
+                    self.call_cur([p])
+            with patch.object(t,'MAX_CUR_LINE_BYTES',30):
+                with self.assertRaisesRegex(ValueError, 'line size'):
+                    self.call_cur([p])
+            with patch.object(t,'MAX_CUR_FILES',0):
+                with self.assertRaisesRegex(ValueError, 'file count'):
+                    self.call_cur([p])
+
+    def test_pr13_corrupt_cur_fails_before_aws_session_and_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            p=self.write_cur(root/'bad.csv.gz',
+                             [self.row(line_item_unblended_cost='NaN')])
+            output=root/'private'/'plan.json'
+            args=t.parse_cli(['plan','--cur',str(p),'--account',ACCOUNT,
+                              '--output',str(output)])
+            with patch.object(t,'build_session') as session, \
+                 patch.object(t,'assert_account') as identity:
+                with self.assertRaisesRegex(ValueError, 'monetary'):
+                    t.plan(args)
+                session.assert_not_called()
+                identity.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertEqual(list(output.parent.iterdir()), [])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
