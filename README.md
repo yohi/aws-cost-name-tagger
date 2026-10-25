@@ -20,6 +20,8 @@
 
 **PR-BのAWSサービス別入力契約:** タグ取得元のAPIごとに、`list`形式（EC2系・RDS・OpenSearch・ELBv2・CloudFront・Athena・WAFv2・S3）または`dict`形式（API Gateway・CloudWatch Logs・Lambda）を明示し、不一致・不正なキー型・値型・同一キー重複は`UNKNOWN`としてName候補を生成しません。タグ値の`Value`がSDKレスポンスモデル上任意であるlist形式のEC2系・RDS・ELBv2・CloudFront・Athenaでは、**非Nameキーだけ**`Value`省略を空文字に正規化します。`Name`の`Value`欠落はサービスを問わず拒否します。OpenSearch・WAFv2・S3のlist形式は`Value`必須です。親リソースのタグも同じ形式契約で検証し、不正なら候補生成を止めます（子側の正常なABSENT状態自体は変更しません）。サービスがタグ項目そのものを省略したときは、既存の空集合既定値を維持します。正常な空文字・非NameのProductエイリアス不一致は拒否理由にしません。Pythonのdictは重複キーを表現できないため、重複検査はlist形式が対象です。ここでいう省略許容はbotocoreモデル上のスキーマ互換性であり、実AWSが必ずその形で返すことを証明するものではありません。
 
+**PR-B FND-12-R2-003（ページネーション）:** Athenaの`ListTagsForResource`は`NextToken`、WAFv2の同APIは**トップレベル**の`NextMarker`で未取得ページを通知します。本版は追加ページを取得せず、継続トークンが返された時点で**Name状態を`UNKNOWN`・候補なし・`manual_review`**としてfail-closedにします。1ページ目のタグから`ABSENT`/`EMPTY`を確定しません。継続トークンがない（または`null`）単一ページは従来どおり評価します。この判断はAWS読み取り件数を増やさない限定防御で、複数ページのタグを網羅取得する機能や実AWSでのページ分割の確認ではありません。
+
 **出力の互換性:** `plan.json` の `schema_version` を **2** に上げ、全候補に `name_state`・`name_key_present`・`name_raw_value`・`existing_name` を付与。CSV（review/report/result/監査/selected）でもNameの状態を独立した列で出力します。`name_key_present` は `true`/`false`、取得不能のときは `null` です。`name_raw_value` は、正常に取得できたName文字列（未設定は `null`、EMPTYは `""`）を保持します。異常な型ではRAWは利用せず `null` とし、UNKNOWNで拒否します。
 
 **候補IDの互換性:** v3.6の `proposal_id` は旧v3.5と異なる専用名前空間にし、ABSENTとEMPTYを必ず区別します。旧レビューCSVや承認候補を流用せず、新しいdryrun結果をレビューしてください。`proposal_id` はレビュー識別子であり、書き込み認可ではありません。
