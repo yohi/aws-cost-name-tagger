@@ -610,7 +610,13 @@ class Investigator:
                 confidence="medium" # CloudFront may be shared; require explicit approval
             elif kind=="athena_workgroup":
                 c=self.client("athena",region)
-                tags=tagmap(c.list_tags_for_resource(ResourceARN=loc).get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
+                tag_page=c.list_tags_for_resource(ResourceARN=loc)
+                # The first page is not evidence of an ABSENT/EMPTY Name if
+                # additional tags might be on later pages. Fail closed instead
+                # of drawing conclusions from an incomplete collection.
+                if tag_page.get("NextToken") is not None:
+                    raise ValueError("Athena tag response is paginated; Name state UNKNOWN until all tags are read")
+                tags=tagmap(tag_page.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                 wg=loc.rsplit("/",1)[-1];o=c.get_work_group(WorkGroup=wg)["WorkGroup"]
                 anchor=meaningful(o["Name"])
                 if not anchor:raise ValueError("Athena workgroup name is not product-identifiable")
@@ -640,7 +646,13 @@ class Investigator:
                 evidence=f"Lambda {loc} -> function={conf['FunctionName']}";res["write_target"]=conf["FunctionArn"]
             elif kind=="wafv2":
                 c=self.client("wafv2",region)
-                tags=tagmap(c.list_tags_for_resource(ResourceARN=loc).get("TagInfoForResource",{}).get("TagList",[]), expected_shape="list")
+                tag_page=c.list_tags_for_resource(ResourceARN=loc)
+                # WAFv2 NextMarker is at the top level, not inside
+                # TagInfoForResource. A partial page must never authorize a
+                # Name candidate, even if its TagList has no Name key.
+                if tag_page.get("NextMarker") is not None:
+                    raise ValueError("WAFv2 tag response is paginated; Name state UNKNOWN until all tags are read")
+                tags=tagmap(tag_page.get("TagInfoForResource",{}).get("TagList",[]), expected_shape="list")
                 acl_name,idpart=loc.split("/webacl/",1)[-1].split("/",1)
                 scope="CLOUDFRONT" if ":global/" in loc else "REGIONAL"
                 webacl=c.get_web_acl(Name=acl_name,Scope=scope,Id=idpart)["WebACL"]
