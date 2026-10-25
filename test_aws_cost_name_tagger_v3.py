@@ -2307,7 +2307,7 @@ class CURR1LimitedCorrectionsTests(unittest.TestCase):
     def test_r1_run_reuses_exact_prevalidated_batch_no_second_cur_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
-            cur=self.write_cur(root/'good.csv.gz', [self.row()])
+            cur=self.write_cur(root/'good.csv.gz', [self.row(line_item_unblended_cost='20')])
             args=self.run_args(root, 'dryrun', cur)
             ec2=FakeEC2()
             session=FakeSession({'ec2': ec2, 'sts': FakeSTS(), 'iam': FakeIAM()})
