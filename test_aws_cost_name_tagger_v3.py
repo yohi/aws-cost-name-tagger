@@ -1962,7 +1962,7 @@ class PaginationFailClosedPRBR3Tests(unittest.TestCase):
     def test_wafv2_next_marker_blocks_candidate_before_acl_lookup(self):
         arn = (f'arn:aws:wafv2:{REGION}:{ACCOUNT}:'
                'regional/webacl/scs2-prd-web-waf/a1b2c3d4')
-        for token in ('next-page', '', 42):
+        for token in ('next-page', 42, []):
             for first_tags in (
                 [{'Key': 'Product', 'Value': 'app'}],
                 [{'Key': 'Name', 'Value': ''}],
@@ -2023,17 +2023,17 @@ class PaginationFailClosedPRBR3Tests(unittest.TestCase):
                 return {'WorkGroup': {'Name': 'scs2-prd-athena'}}
 
         class SingleWAF:
-            def __init__(self, name, include_none_token):
+            def __init__(self, name, marker_case):
                 self.name = name
-                self.include_none_token = include_none_token
+                self.marker_case = marker_case
 
             def list_tags_for_resource(self, ResourceARN):
                 page = {'TagInfoForResource': {
                     'ResourceARN': ResourceARN,
                     'TagList': ([] if self.name is None else
                                 [{'Key': 'Name', 'Value': self.name}])}}
-                if self.include_none_token:
-                    page['NextMarker'] = None
+                if self.marker_case != 'omitted':
+                    page['NextMarker'] = self.marker_case
                 return page
 
             def get_web_acl(self, **kwargs):
@@ -2044,13 +2044,16 @@ class PaginationFailClosedPRBR3Tests(unittest.TestCase):
             ('', 'EMPTY', 'proposed'),
             ('existing-name', 'NONEMPTY', 'already_named'),
         ):
-            for include_none_token in (False, True):
+            # WAFv2 officially demonstrates NextMarker='' for a terminal
+            # single page; missing and None remain terminal too. Athena's
+            # separate NextToken semantics are unchanged.
+            for marker_case in ('omitted', None, ''):
                 for kind, api, arn in (
-                    ('athena_workgroup', SingleAthena(name, include_none_token), athena_arn),
-                    ('wafv2', SingleWAF(name, include_none_token), waf_arn),
+                    ('athena_workgroup', SingleAthena(name, marker_case is None), athena_arn),
+                    ('wafv2', SingleWAF(name, marker_case), waf_arn),
                 ):
                     with self.subTest(kind=kind, name=name,
-                                      include_none_token=include_none_token):
+                                      marker_case=marker_case):
                         service = 'athena' if kind == 'athena_workgroup' else 'wafv2'
                         out = t.Investigator(
                             FakeSession({service: api}), ACCOUNT
