@@ -1258,5 +1258,112 @@ class OfflineSafetyBoundariesR1Tests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), expected_source_bytes)
 
 
+
+
+class ReportPublishSafetyPRCTests(unittest.TestCase):
+    """Offline PR-C contracts: source type, private directories and cleanup."""
+
+    def test_t09_symlink_fifo_and_directory_sources_are_not_published(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.json'
+            t.write_json(source, {'report': 'source'})
+            symlink = root / 'alias.json'
+            symlink.symlink_to(source)
+            directory = root / 'directory-source'
+            directory.mkdir()
+            candidates = [('symlink', symlink), ('directory', directory)]
+            if hasattr(os, 'mkfifo'):
+                fifo = root / 'fifo-source'
+                os.mkfifo(fifo)
+                candidates.append(('fifo', fifo))
+            for label, invalid_source in candidates:
+                with self.subTest(source_type=label):
+                    destination = root / f'dest-{label}.json'
+                    with self.assertRaisesRegex(ValueError, 'non-regular staged report'):
+                        t.publish_staged_reports([(invalid_source, destination)])
+                    self.assertFalse(destination.exists())
+            self.assertTrue(symlink.is_symlink())
+            self.assertEqual(source.read_bytes(), b'{\n  "report": "source"\n}\n')
+
+    def test_t15_untrusted_output_or_staging_directory_refused(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.json'
+            t.write_json(source, {'report': 'source'})
+            output_dir = root / 'untrusted-output'
+            output_dir.mkdir()
+            output_dir.chmod(0o777)
+            try:
+                with self.assertRaisesRegex(PermissionError, 'destination'):
+                    t.publish_staged_reports([(source, output_dir / 'report.json')])
+                self.assertFalse((output_dir / 'report.json').exists())
+            finally:
+                output_dir.chmod(0o700)
+
+            staging_dir = root / 'untrusted-stage'
+            staging_dir.mkdir()
+            staged_source = staging_dir / 'source.json'
+            t.write_json(staged_source, {'report': 'source'})
+            staging_dir.chmod(0o777)
+            try:
+                with self.assertRaisesRegex(PermissionError, 'staging'):
+                    t.publish_staged_reports([(staged_source, root / 'report.json')])
+                self.assertFalse((root / 'report.json').exists())
+            finally:
+                staging_dir.chmod(0o700)
+            self.assertEqual(source.read_bytes(), staged_source.read_bytes())
+
+    def test_t14_cleanup_failure_preserves_original_and_continues(self):
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = [root / f'source-{i}.json' for i in range(3)]
+            outputs = [root / f'destination-{i}.json' for i in range(3)]
+            for index, source in enumerate(sources):
+                t.write_json(source, {'index': index})
+            original_fsync = os.fsync
+            original_unlink = os.unlink
+            root_meta = root.stat()
+            attempted = []
+
+            def fail_destination_directory_fsync(fd):
+                info = os.fstat(fd)
+                if (stat.S_ISDIR(info.st_mode)
+                        and (info.st_dev, info.st_ino) ==
+                        (root_meta.st_dev, root_meta.st_ino)):
+                    raise OSError('primary directory fsync failure')
+                return original_fsync(fd)
+
+            def fail_one_unlink(name, **kwargs):
+                attempted.append(Path(name).name)
+                if Path(name).name == outputs[1].name:
+                    raise OSError('secondary cleanup failure')
+                return original_unlink(name, **kwargs)
+
+            with patch.object(t.os, 'fsync', side_effect=fail_destination_directory_fsync), \
+                 patch.object(t.os, 'unlink', side_effect=fail_one_unlink):
+                with self.assertRaises(t.ReportPublishCleanupError) as cm:
+                    t.publish_staged_reports(list(zip(sources, outputs)))
+            error = cm.exception
+            self.assertIsInstance(error.primary_error, OSError)
+            self.assertIn('primary directory fsync failure', str(error.primary_error))
+            self.assertEqual(len(error.cleanup_errors), 1)
+            self.assertEqual(error.cleanup_errors[0][0], outputs[1].name)
+            self.assertIn('secondary cleanup failure', str(error.cleanup_errors[0][1]))
+            self.assertEqual(error.possibly_remaining, (str(outputs[1]),))
+            self.assertEqual(attempted, [p.name for p in reversed(outputs)])
+            self.assertFalse(outputs[0].exists())
+            self.assertTrue(outputs[1].exists())
+            self.assertFalse(outputs[2].exists())
+            self.assertEqual(len([p for p in sources if p.exists()]), 3)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
