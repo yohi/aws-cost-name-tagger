@@ -2477,5 +2477,161 @@ class CURStrictCSVPR13R3Tests(unittest.TestCase):
             self.assertEqual(candidates[0]['effective_usage_cost_usd'], 12.5)
 
 
+
+
+class AWSReadBudgetPR14Tests(unittest.TestCase):
+    """AUD-002: all explicit AWS read operations share one fail-closed budget."""
+
+    def test_pr14_budget_counts_calls_and_disables_automatic_sdk_retries(self):
+        class ObservingSession(FakeSession):
+            configs = []
+            def client(self, service, region_name=None, config=None):
+                self.configs.append((service, region_name, config))
+                return super().client(service, region_name=region_name, config=config)
+
+        ec2=FakeEC2()
+        raw=ObservingSession({'ec2':ec2, 'sts':FakeSTS(), 'iam':FakeIAM()})
+        budget=t.AWSReadBudget(max_calls=4, max_elapsed=1000)
+        session=t._BudgetedAWSSession(raw,budget)
+        self.assertEqual(t.assert_account(session,ACCOUNT),None)
+        result=t.Investigator(session,ACCOUNT).resolve(row_for('volume',VOLUME))
+        self.assertEqual(result['status'],'proposed')
+        self.assertEqual(budget.calls,3)  # STS + EBS + parent EC2
+        self.assertEqual({s for s, _, _ in raw.configs}, {'sts','ec2'})
+        for _, _, config in raw.configs:
+            self.assertEqual(config.retries['total_max_attempts'],1)
+            self.assertEqual(config.connect_timeout,t.AWS_READ_CONNECT_TIMEOUT_SECONDS)
+            self.assertEqual(config.read_timeout,t.AWS_READ_TIMEOUT_SECONDS)
+        self.assertEqual(ec2.writes,[])
+
+    def test_pr14_exhaustion_marks_target_unknown_never_proposed(self):
+        ec2=FakeEC2()
+        budget=t.AWSReadBudget(max_calls=1,max_elapsed=1000)
+        session=t._BudgetedAWSSession(FakeSession({'ec2':ec2}),budget)
+        result=t.Investigator(session,ACCOUNT).resolve(row_for('volume',VOLUME))
+        self.assertTrue(budget.exhausted)
+        self.assertEqual(budget.calls,1)
+        self.assertEqual(result['status'],'manual_review')
+        self.assertEqual(result['name_state'],'UNKNOWN')
+        self.assertEqual(result['proposed_name'],'')
+        self.assertIn('AWSReadBudgetExceeded',result['evidence'])
+        self.assertEqual(ec2.writes,[])
+
+    def test_pr14_budget_exhaustion_prohibits_partial_plan_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            out=root/'plan.json'
+            args=t.parse_cli(['plan','--cur','unused.csv.gz','--account',ACCOUNT,
+                              '--output',str(out)])
+            raw=FakeSession({'sts':FakeSTS(),'ec2':FakeEC2()})
+            wrapped=t._BudgetedAWSSession(
+                raw,t.AWSReadBudget(max_calls=1,max_elapsed=1000))
+            with patch.object(t,'cur_candidates',return_value=('2026-10',[
+                    row_for('volume',VOLUME)])), \
+                 patch.object(t,'publish_staged_reports') as publish:
+                with self.assertRaisesRegex(t.AWSReadBudgetExceeded,
+                                            'partial candidate report'):
+                    t.plan(args,session=wrapped)
+                publish.assert_not_called()
+            self.assertFalse(out.exists())
+            self.assertEqual(list(root.iterdir()),[])
+
+    def test_pr14_expired_deadline_stops_before_first_api(self):
+        ec2=FakeEC2()
+        with patch.object(t.time,'monotonic',side_effect=(0.0,1.1)):
+            budget=t.AWSReadBudget(max_calls=9,max_elapsed=1.0)
+            with self.assertRaisesRegex(t.AWSReadBudgetExceeded,'elapsed-time'):
+                budget.before_read('ec2','describe_volumes')
+        self.assertEqual(budget.calls,0)
+        self.assertTrue(budget.exhausted)
+        with self.assertRaises(t.AWSReadBudgetExceeded):
+            budget.require_remaining()
+
+    def test_pr14_nonread_operation_and_sdk_paginator_refused(self):
+        ec2=FakeEC2()
+        session=t._budgeted_session(FakeSession({'ec2':ec2}))
+        client=session.client('ec2',region_name=REGION)
+        with self.assertRaises(RuntimeError):
+            client.create_tags(Resources=[VOLUME],Tags=[{'Key':'Name','Value':'bad'}])
+        with self.assertRaises(AttributeError):
+            client.get_paginator('describe_volumes')
+        self.assertEqual(session.read_budget.calls,0)
+        self.assertEqual(ec2.writes,[])
+
+    def test_pr14_rds_cyclic_marker_never_reaches_candidate(self):
+        class CyclicRDS(FakeRDS):
+            def describe_db_clusters(self, **kwargs):
+                self.calls.append(('DescribeDBClusters',kwargs))
+                return {'DBClusters':[], 'Marker':'stuck'}
+        fake=CyclicRDS()
+        inv=t.Investigator(FakeSession({'rds':fake}),ACCOUNT)
+        out=inv.resolve(row_for('rds_cluster',fake.cluster_rid.lower()))
+        self.assertEqual(out['status'],'manual_review')
+        self.assertEqual(out['proposed_name'],'')
+        self.assertEqual(out['name_state'],'UNKNOWN')
+        self.assertIn('repeated',out['evidence'])
+        self.assertEqual(len(fake.calls),2)
+
+    def test_pr14_rds_page_limit_never_uses_partial_results(self):
+        class ContinuingRDS(FakeRDS):
+            def describe_db_clusters(self, **kwargs):
+                self.calls.append(('DescribeDBClusters',kwargs))
+                return {'DBClusters':[], 'Marker':f'page-{len(self.calls)}'}
+        fake=ContinuingRDS()
+        with patch.object(t,'MAX_RDS_CLUSTER_PAGES',2):
+            out=t.Investigator(FakeSession({'rds':fake}),ACCOUNT).resolve(
+                row_for('rds_cluster',fake.cluster_rid.lower()))
+        self.assertEqual(out['status'],'manual_review')
+        self.assertEqual(out['proposed_name'],'')
+        self.assertIn('page budget exceeded',out['evidence'])
+        self.assertEqual(len(fake.calls),2)
+
+    def test_pr14_rds_invalid_nonstring_marker_rejected(self):
+        class BadMarkerRDS(FakeRDS):
+            def describe_db_clusters(self, **kwargs):
+                self.calls.append(('DescribeDBClusters',kwargs))
+                return {'DBClusters':[], 'Marker':17}
+        fake=BadMarkerRDS()
+        out=t.Investigator(FakeSession({'rds':fake}),ACCOUNT).resolve(
+            row_for('rds_cluster',fake.cluster_rid.lower()))
+        self.assertEqual(out['status'],'manual_review')
+        self.assertEqual(out['proposed_name'],'')
+        self.assertIn('invalid or repeated',out['evidence'])
+        self.assertEqual(len(fake.calls),1)
+
+    def test_pr14_rds_two_complete_pages_preserves_valid_name_protection(self):
+        class TwoPageRDS(FakeRDS):
+            def describe_db_clusters(self, **kwargs):
+                self.calls.append(('DescribeDBClusters',kwargs))
+                if 'Marker' not in kwargs:
+                    return {'DBClusters':[], 'Marker':'another'}
+                return super().describe_db_clusters(**kwargs)
+        fake=TwoPageRDS(parent_name='')
+        result=t.Investigator(FakeSession({'rds':fake}),ACCOUNT).resolve(
+            row_for('rds_cluster',fake.cluster_rid.lower()))
+        self.assertEqual(result['status'],'proposed')
+        self.assertGreaterEqual(len(fake.calls),2)
+
+    def test_pr14_athena_and_waf_terminal_pagination_contract_unchanged(self):
+        # Budgeting does not relax the existing pagination fail-closed rule.
+        class Athena:
+            def list_tags_for_resource(self, ResourceARN):
+                return {'Tags':[], 'NextToken':'more'}
+        class Waf:
+            def list_tags_for_resource(self, ResourceARN):
+                return {'TagInfoForResource':{'TagList':[]}, 'NextMarker':'more'}
+        cases=[
+            ('athena_workgroup', 'athena', Athena(),
+             f'arn:aws:athena:{REGION}:{ACCOUNT}:workgroup/scs2-prd-athena'),
+            ('wafv2', 'wafv2', Waf(),
+             f'arn:aws:wafv2:{REGION}:{ACCOUNT}:regional/webacl/scs2-prd-web-waf/id1'),
+        ]
+        for kind,service,api,arn in cases:
+            with self.subTest(kind=kind):
+                inv=t.Investigator(FakeSession({service:api}),ACCOUNT)
+                result=inv.resolve(row_for(kind,arn))
+                self.assertEqual(result['status'],'manual_review')
+                self.assertEqual(result['proposed_name'],'')
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
