@@ -1630,5 +1630,439 @@ class PreLoginCollisionPRCR2Tests(unittest.TestCase):
             self.assertEqual(collision.read_bytes(), b'keep existing')
 
 
+
+
+class StrictMalformedTagsPRBTests(unittest.TestCase):
+    """PR-B: corrupt non-Name tags invalidate the entire observed tag set."""
+
+    def test_prb_t04_malformed_dict_and_list_inputs_are_unknown(self):
+        malformed = [
+            {'Name': '', 1: 'bad'},
+            {'Name': '', 'Product': None},
+            {'Name': '', 'Product': 7},
+            {'Name': 'already-named', 'Product': []},
+            {'Name': '', '': 'empty-key'},
+            {None: 'bad'},
+            [{'Key': 'Name'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other', 'Value': 22}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other', 'Value': None}],
+            [{'Key': 'Product', 'Value': 5}],
+            [{'Key': '', 'Value': 'bad'}],
+            [{'Key': 'Product', 'Value': 'one'},
+             {'Key': 'Product', 'Value': 'two'}],
+            [{'Key': 'Name', 'Value': ''},
+             {'Key': 'Other', 'Value': 'one'},
+             {'Key': 'Other', 'Value': 'two'}],
+        ]
+        for tags in malformed:
+            with self.subTest(tags=tags):
+                with self.assertRaises(ValueError):
+                    t.tagmap(tags)
+                self.assertEqual(t.name_state(tags), 'UNKNOWN')
+
+    def test_prb_t04_ebs_invalid_other_tags_fail_closed_without_writes(self):
+        variants = [
+            [{'Key': 'Name'}],
+            [{'Key': 'Product', 'Value': 'a'},
+             {'Key': 'Product', 'Value': 'b'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other', 'Value': 99}],
+            {'Name': '', 1: 'bad'},
+            {'Name': '', 'Product': None},
+            {'Name': 'already-named', 'Product': 7},
+        ]
+
+        class CorruptedVolume(FakeEC2):
+            def __init__(self, bad_tags):
+                super().__init__()
+                self.bad_tags = bad_tags
+
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                result['Volumes'][0]['Tags'] = self.bad_tags
+                return result
+
+        for tags in variants:
+            with self.subTest(tags=tags):
+                ec2 = CorruptedVolume(tags)
+                result = t.Investigator(
+                    FakeSession({'ec2': ec2}), ACCOUNT
+                ).resolve(row_for('volume', VOLUME))
+                self.assertEqual(result['status'], 'manual_review')
+                self.assertEqual(result['name_state'], 'UNKNOWN')
+                self.assertEqual(result['proposed_name'], '')
+                self.assertEqual(result['confidence'], 'none')
+                self.assertEqual(ec2.writes, [])
+
+    def test_prb_t04_rds_and_cloudfront_corruption_blocks_candidates(self):
+        class CorruptedRDS(FakeRDS):
+            def list_tags_for_resource(self, ResourceName):
+                result = super().list_tags_for_resource(ResourceName)
+                if ResourceName == self.instance_arn:
+                    result['TagList'] = [{'Key': 'Product', 'Value': None}]
+                return result
+
+        rds = CorruptedRDS()
+        result = t.Investigator(
+            FakeSession({'rds': rds}), ACCOUNT
+        ).resolve(row_for('rds_instance', rds.instance_id))
+        self.assertEqual((result['name_state'], result['status']),
+                         ('UNKNOWN', 'manual_review'))
+        self.assertFalse(result['proposed_name'])
+
+        cf = FakeCloudFront()
+        cf.tags['Items'] = [
+            {'Key': 'Product', 'Value': 'a'},
+            {'Key': 'Product', 'Value': 'b'},
+        ]
+        arn = f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
+        result = t.Investigator(
+            FakeSession({'cloudfront': cf}), ACCOUNT
+        ).resolve(row_for('cloudfront', arn, 'us-east-1'))
+        self.assertEqual((result['name_state'], result['status']),
+                         ('UNKNOWN', 'manual_review'))
+        self.assertFalse(result['proposed_name'])
+
+    def test_prb_t04_malformed_parent_tags_block_inheritance(self):
+        class InvalidParent(FakeEC2):
+            def describe_instances(self, InstanceIds):
+                result = super().describe_instances(InstanceIds)
+                result['Reservations'][0]['Instances'][0]['Tags'].append(
+                    {'Key': 'Product', 'Value': None}
+                )
+                return result
+
+        ec2 = InvalidParent()
+        result = t.Investigator(
+            FakeSession({'ec2': ec2}), ACCOUNT
+        ).resolve(row_for('volume', VOLUME))
+        self.assertEqual(result['status'], 'manual_review')
+        self.assertFalse(result['proposed_name'])
+        # The target volume has valid absent Name; parent lineage is invalid.
+        self.assertEqual(result['name_state'], 'ABSENT')
+        self.assertEqual(ec2.writes, [])
+
+    def test_prb_t04_valid_tag_shapes_and_omitted_tags_preserved(self):
+        valid = [
+            ({}, 'ABSENT', {}),
+            ([], 'ABSENT', {}),
+            ({'Product': 'different-service'}, 'ABSENT',
+             {'Product': 'different-service'}),
+            ([{'Key': 'Product', 'Value': 'different-service'}],
+             'ABSENT', {'Product': 'different-service'}),
+            ({'Name': '', 'Product': 'alias'}, 'EMPTY',
+             {'Name': '', 'Product': 'alias'}),
+            ([{'Key': 'Name', 'Value': ''},
+              {'Key': 'Product', 'Value': 'alias'}],
+             'EMPTY', {'Name': '', 'Product': 'alias'}),
+            ({'Name': ' ', 'Product': ''}, 'NONEMPTY',
+             {'Name': ' ', 'Product': ''}),
+            ([{'Key': 'Name', 'Value': '\t'}], 'NONEMPTY',
+             {'Name': '\t'}),
+        ]
+        for tags, expected_state, expected_map in valid:
+            with self.subTest(tags=tags):
+                self.assertEqual(t.tagmap(tags), expected_map)
+                self.assertEqual(t.name_state(tags), expected_state)
+
+        # A service's omitted Tags field is intentionally represented by [].
+        # It is not equivalent to a failed/unknown AWS API response.
+        class MissingTagsVolume(FakeEC2):
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                del result['Volumes'][0]['Tags']
+                return result
+
+        ec2 = MissingTagsVolume()
+        result = t.Investigator(
+            FakeSession({'ec2': ec2}), ACCOUNT
+        ).resolve(row_for('volume', VOLUME))
+        self.assertEqual((result['name_state'], result['status']),
+                         ('ABSENT', 'proposed'))
+        self.assertTrue(result['proposed_name'])
+        self.assertEqual(ec2.writes, [])
+
+        alias = FakeRDS(child_product='ogne')
+        result = t.Investigator(
+            FakeSession({'rds': alias}), ACCOUNT
+        ).resolve(row_for('rds_instance', alias.instance_id))
+        self.assertEqual(result['status'], 'proposed')
+        self.assertEqual(result['name_state'], 'ABSENT')
+
+
+
+
+class AWSServiceTagSchemaPRBR2Tests(unittest.TestCase):
+    """Model-aware list/map validation; optional non-Name values stay benign."""
+
+    def test_prb_r2_wrong_outer_shapes_never_propose(self):
+        class WrongEC2(FakeEC2):
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                result['Volumes'][0]['Tags'] = {'Product': 'app'}
+                return result
+
+        class WrongRDS(FakeRDS):
+            def list_tags_for_resource(self, ResourceName):
+                result = super().list_tags_for_resource(ResourceName)
+                if ResourceName == self.instance_arn:
+                    result['TagList'] = {'Product': 'app'}
+                return result
+
+        ec2 = WrongEC2()
+        rds = WrongRDS()
+        cf = FakeCloudFront()
+        cf.tags['Items'] = {'Product': 'app'}
+
+        class WrongAPI:
+            def get_rest_api(self, restApiId):
+                return {'name': 'scs2-prd-web-api'}
+            def get_tags(self, resourceArn):
+                return {'tags': [{'Key': 'Product', 'Value': 'app'}]}
+
+        arn = f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
+        api = 'api1|prod|arn:aws:apigateway:ap-northeast-1::/restapis/api1/stages/prod'
+        cases = [
+            (FakeSession({'ec2': ec2}), row_for('volume', VOLUME)),
+            (FakeSession({'rds': rds}), row_for('rds_instance', rds.instance_id)),
+            (FakeSession({'cloudfront': cf}), row_for('cloudfront', arn, 'us-east-1')),
+            (FakeSession({'apigateway': WrongAPI()}), row_for('apigw_stage', api)),
+        ]
+        for session, row in cases:
+            with self.subTest(kind=row['kind']):
+                result = t.Investigator(session, ACCOUNT).resolve(row)
+                self.assertEqual(result['status'], 'manual_review')
+                self.assertEqual(result['name_state'], 'UNKNOWN')
+                self.assertEqual(result['proposed_name'], '')
+        self.assertEqual(ec2.writes, [])
+
+    def test_prb_r2_optional_non_name_value_for_ec2_rds_cloudfront_elbv2(self):
+        class EC2Optional(FakeEC2):
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                result['Volumes'][0]['Tags'] = [{'Key': 'Product'}]
+                return result
+
+        class RDSOptional(FakeRDS):
+            def list_tags_for_resource(self, ResourceName):
+                result = super().list_tags_for_resource(ResourceName)
+                if ResourceName == self.instance_arn:
+                    result['TagList'] = [{'Key': 'Product'}]
+                return result
+
+        class ELBOptional:
+            def describe_load_balancers(self, LoadBalancerArns):
+                return {'LoadBalancers': [{'LoadBalancerName': 'scs2-prd-web-alb',
+                                           'Type': 'application'}]}
+            def describe_tags(self, ResourceArns):
+                return {'TagDescriptions': [{'Tags': [{'Key': 'Product'}]}]}
+
+        ec2 = EC2Optional()
+        rds = RDSOptional()
+        cf = FakeCloudFront()
+        cf.tags['Items'] = [{'Key': 'Product'}]
+        arn = f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
+        elb_arn = (f'arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:'
+                   'loadbalancer/app/scs2-prd-web-alb/abc012')
+        cases = [
+            (FakeSession({'ec2': ec2}), row_for('volume', VOLUME)),
+            (FakeSession({'rds': rds}), row_for('rds_instance', rds.instance_id)),
+            (FakeSession({'cloudfront': cf}), row_for('cloudfront', arn, 'us-east-1')),
+            (FakeSession({'elbv2': ELBOptional()}), row_for('elbv2', elb_arn)),
+        ]
+        for session, row in cases:
+            with self.subTest(kind=row['kind']):
+                result = t.Investigator(session, ACCOUNT).resolve(row)
+                self.assertEqual(result['name_state'], 'ABSENT')
+                self.assertEqual(result['status'], 'proposed')
+                self.assertTrue(result['proposed_name'])
+        self.assertEqual(ec2.writes, [])
+
+    def test_prb_r2_optional_value_never_normalizes_missing_name(self):
+        for raw in (
+            [{'Key': 'Name'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'name'}],
+            [{'Key': 'Product'}, {'Key': 'Name'}],
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    t.tagmap(raw, expected_shape='list',
+                             allow_missing_non_name_value=True)
+        normalized = t.tagmap([{'Key': 'Product'}, {'Key': 'Environment', 'Value': 'prod'}],
+                              expected_shape='list', allow_missing_non_name_value=True)
+        self.assertEqual(normalized, {'Product': '', 'Environment': 'prod'})
+        self.assertEqual(t.name_state(normalized), 'ABSENT')
+        for service in ('opensearch', 'wafv2', 's3'):
+            with self.subTest(service=service):
+                with self.assertRaisesRegex(ValueError, 'Value is missing'):
+                    t.tagmap([{'Key': 'Product'}], expected_shape='list')
+
+    def test_prb_r2_parent_optional_vs_invalid_lineage(self):
+        class ParentOptional(FakeEC2):
+            def describe_instances(self, InstanceIds):
+                result = super().describe_instances(InstanceIds)
+                result['Reservations'][0]['Instances'][0]['Tags'].append({'Key': 'Product'})
+                return result
+
+        class ParentInvalid(FakeEC2):
+            def describe_instances(self, InstanceIds):
+                result = super().describe_instances(InstanceIds)
+                result['Reservations'][0]['Instances'][0]['Tags'] = {'Name': 'scs2-prd-web-ec2'}
+                return result
+
+        for fake, expected in [(ParentOptional(), 'proposed'),
+                               (ParentInvalid(), 'manual_review')]:
+            result = t.Investigator(FakeSession({'ec2': fake}), ACCOUNT).resolve(
+                row_for('volume', VOLUME))
+            self.assertEqual(result['status'], expected)
+            self.assertEqual(result['name_state'], 'ABSENT')
+            self.assertEqual(bool(result['proposed_name']), expected == 'proposed')
+            self.assertEqual(fake.writes, [])
+
+
+
+
+class PaginationFailClosedPRBR3Tests(unittest.TestCase):
+    """FND-12-R2-003: incomplete tag pages cannot establish Name state."""
+
+    def test_athena_next_token_blocks_candidate_before_workgroup_lookup(self):
+        arn = f'arn:aws:athena:{REGION}:{ACCOUNT}:workgroup/scs2-prd-athena'
+        for token in ('page-2', '', 123):
+            for first_tags in (
+                [{'Key': 'Product', 'Value': 'app'}],
+                [{'Key': 'Name', 'Value': ''}],
+                [{'Key': 'Name', 'Value': 'existing-name'}],
+            ):
+                with self.subTest(token=token, first_tags=first_tags):
+                    class PaginatedAthena:
+                        calls = 0
+                        workgroup_calls = 0
+
+                        def list_tags_for_resource(self, ResourceARN):
+                            self.calls += 1
+                            self.asserted_arn = ResourceARN
+                            return {'Tags': first_tags, 'NextToken': token}
+
+                        def get_work_group(self, WorkGroup):
+                            self.workgroup_calls += 1
+                            return {'WorkGroup': {'Name': 'scs2-prd-athena'}}
+
+                    api = PaginatedAthena()
+                    out = t.Investigator(
+                        FakeSession({'athena': api}), ACCOUNT
+                    ).resolve(row_for('athena_workgroup', arn))
+                    self.assertEqual(api.calls, 1)
+                    self.assertEqual(api.asserted_arn, arn)
+                    self.assertEqual(api.workgroup_calls, 0)
+                    self.assertEqual(out['name_state'], 'UNKNOWN')
+                    self.assertIsNone(out['name_key_present'])
+                    self.assertEqual(out['status'], 'manual_review')
+                    self.assertEqual(out['proposed_name'], '')
+                    self.assertIn('paginated', out['evidence'])
+
+    def test_wafv2_next_marker_blocks_candidate_before_acl_lookup(self):
+        arn = (f'arn:aws:wafv2:{REGION}:{ACCOUNT}:'
+               'regional/webacl/scs2-prd-web-waf/a1b2c3d4')
+        for token in ('next-page', 42, []):
+            for first_tags in (
+                [{'Key': 'Product', 'Value': 'app'}],
+                [{'Key': 'Name', 'Value': ''}],
+                [{'Key': 'Name', 'Value': 'existing-name'}],
+            ):
+                with self.subTest(token=token, first_tags=first_tags):
+                    class PaginatedWAF:
+                        calls = 0
+                        acl_calls = 0
+
+                        def list_tags_for_resource(self, ResourceARN):
+                            self.calls += 1
+                            self.asserted_arn = ResourceARN
+                            return {
+                                'NextMarker': token,
+                                'TagInfoForResource': {
+                                    'ResourceARN': ResourceARN,
+                                    'TagList': first_tags,
+                                },
+                            }
+
+                        def get_web_acl(self, **kwargs):
+                            self.acl_calls += 1
+                            return {'WebACL': {'ARN': arn,
+                                               'Name': 'scs2-prd-web-waf'}}
+
+                    api = PaginatedWAF()
+                    out = t.Investigator(
+                        FakeSession({'wafv2': api}), ACCOUNT
+                    ).resolve(row_for('wafv2', arn))
+                    self.assertEqual(api.calls, 1)
+                    self.assertEqual(api.asserted_arn, arn)
+                    self.assertEqual(api.acl_calls, 0)
+                    self.assertEqual(out['name_state'], 'UNKNOWN')
+                    self.assertIsNone(out['name_key_present'])
+                    self.assertEqual(out['status'], 'manual_review')
+                    self.assertEqual(out['proposed_name'], '')
+                    self.assertIn('paginated', out['evidence'])
+
+    def test_complete_single_page_remains_actionable_or_protected(self):
+        athena_arn = f'arn:aws:athena:{REGION}:{ACCOUNT}:workgroup/scs2-prd-athena'
+        waf_arn = (f'arn:aws:wafv2:{REGION}:{ACCOUNT}:'
+                   'regional/webacl/scs2-prd-web-waf/a1b2c3d4')
+
+        class SingleAthena:
+            def __init__(self, name, include_none_token):
+                self.name = name
+                self.include_none_token = include_none_token
+
+            def list_tags_for_resource(self, ResourceARN):
+                page = {'Tags': ([] if self.name is None else
+                         [{'Key': 'Name', 'Value': self.name}])}
+                if self.include_none_token:
+                    page['NextToken'] = None
+                return page
+
+            def get_work_group(self, WorkGroup):
+                return {'WorkGroup': {'Name': 'scs2-prd-athena'}}
+
+        class SingleWAF:
+            def __init__(self, name, marker_case):
+                self.name = name
+                self.marker_case = marker_case
+
+            def list_tags_for_resource(self, ResourceARN):
+                page = {'TagInfoForResource': {
+                    'ResourceARN': ResourceARN,
+                    'TagList': ([] if self.name is None else
+                                [{'Key': 'Name', 'Value': self.name}])}}
+                if self.marker_case != 'omitted':
+                    page['NextMarker'] = self.marker_case
+                return page
+
+            def get_web_acl(self, **kwargs):
+                return {'WebACL': {'ARN': waf_arn, 'Name': 'scs2-prd-web-waf'}}
+
+        for name, state, status in (
+            (None, 'ABSENT', 'proposed'),
+            ('', 'EMPTY', 'proposed'),
+            ('existing-name', 'NONEMPTY', 'already_named'),
+        ):
+            # WAFv2 officially demonstrates NextMarker='' for a terminal
+            # single page; missing and None remain terminal too. Athena's
+            # separate NextToken semantics are unchanged.
+            for marker_case in ('omitted', None, ''):
+                for kind, api, arn in (
+                    ('athena_workgroup', SingleAthena(name, marker_case is None), athena_arn),
+                    ('wafv2', SingleWAF(name, marker_case), waf_arn),
+                ):
+                    with self.subTest(kind=kind, name=name,
+                                      marker_case=marker_case):
+                        service = 'athena' if kind == 'athena_workgroup' else 'wafv2'
+                        out = t.Investigator(
+                            FakeSession({service: api}), ACCOUNT
+                        ).resolve(row_for(kind, arn))
+                        self.assertEqual((out['name_state'], out['status']),
+                                         (state, status))
+                        self.assertEqual(bool(out['proposed_name']),
+                                         status == 'proposed')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
