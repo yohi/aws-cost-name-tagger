@@ -322,7 +322,10 @@ def _scan_cur_file(path: Path, budget: dict, accept_row) -> tuple:
                     scan_delimiters(decoded)
                     yield decoded
 
-            reader = csv.DictReader(bounded_lines())
+            # Reject malformed quoting (notably an unclosed quoted field at
+            # EOF). csv.DictReader's default strict=False can otherwise
+            # silently accept a truncated logical CSV record.
+            reader = csv.DictReader(bounded_lines(), strict=True)
             header = reader.fieldnames
             if header is None:
                 raise ValueError("CUR CSV header is missing")
