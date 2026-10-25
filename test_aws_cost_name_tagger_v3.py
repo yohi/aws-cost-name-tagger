@@ -2653,5 +2653,150 @@ class AWSReadBudgetPR14Tests(unittest.TestCase):
                 self.assertEqual(result['status'],'manual_review')
                 self.assertEqual(result['proposed_name'],'')
 
+
+
+class AWSReadBudgetPR14R1CorrectionsTests(unittest.TestCase):
+    """FND-14-R1-001/002: publication and stderr remain atomic to completion."""
+
+    def test_r1_deadline_expiry_during_staging_blocks_publication_and_stderr(self):
+        import contextlib
+        import io
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root/'plan.json'
+            args = t.parse_cli(['plan','--cur','unused.csv.gz',
+                                '--account',ACCOUNT,'--output',str(out)])
+            budget = t.AWSReadBudget(max_calls=20,max_elapsed=1000)
+            session = t._BudgetedAWSSession(
+                FakeSession({'sts':FakeSTS(),'ec2':FakeEC2()}),budget)
+            original_write = t.write_action_csv
+            written = []
+
+            def expire_after_staging(path, records, account, **kwargs):
+                original_write(path, records, account, **kwargs)
+                written.append(path)
+                budget.started = time.monotonic() - budget.max_elapsed - 1
+
+            stderr=io.StringIO()
+            with patch.object(t,'cur_candidates',return_value=(
+                    '2026-10',[row_for('volume',VOLUME)])), \
+                 patch.object(t,'write_action_csv',side_effect=expire_after_staging), \
+                 patch.object(t,'publish_staged_reports') as publish, \
+                 contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(t.AWSReadBudgetExceeded, 'elapsed-time'):
+                    t.plan(args,session=session)
+                publish.assert_not_called()
+            self.assertTrue(written)
+            self.assertFalse(out.exists())
+            self.assertFalse(out.with_suffix('.review.csv').exists())
+            self.assertFalse(out.with_suffix('.report.csv').exists())
+            self.assertEqual(stderr.getvalue(),'')
+            self.assertEqual(list(root.iterdir()),[])
+
+    def test_r1_later_budget_exhaustion_never_logs_earlier_proposal(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root/'plan.json'
+            args = t.parse_cli(['plan','--cur','unused.csv.gz',
+                                '--account',ACCOUNT,'--output',str(out)])
+            budget = t.AWSReadBudget(max_calls=3,max_elapsed=1000)
+            session = t._BudgetedAWSSession(
+                FakeSession({'sts':FakeSTS(),'ec2':FakeEC2()}),budget)
+            items=[row_for('volume',VOLUME),row_for('snapshot',SNAPSHOT)]
+            stderr=io.StringIO()
+            with patch.object(t,'cur_candidates',return_value=('2026-10',items)), \
+                 patch.object(t,'publish_staged_reports') as publish, \
+                 contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(t.AWSReadBudgetExceeded,
+                                            'partial candidate report'):
+                    t.plan(args,session=session)
+                publish.assert_not_called()
+            self.assertEqual(budget.calls,3)
+            self.assertEqual(stderr.getvalue(),'')
+            self.assertNotIn('scs2-prd-web-ec2-ebs',stderr.getvalue())
+            self.assertFalse(out.exists())
+            self.assertEqual(list(root.iterdir()),[])
+
+    def test_r1_run_sts_iam_plan_sts_ec2_share_five_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            input_path=root/'cur.csv.gz'
+            input_path.write_bytes(b'CUR is stubbed after file-identity verification')
+            out=root/'result'/'plan.json'
+            args=t.parse_cli(['run','--cur',str(input_path),
+                              '--account',ACCOUNT,'--output',str(out),
+                              '--login','skip','--mode','dryrun'])
+            budget=t.AWSReadBudget(max_calls=5,max_elapsed=1000)
+            session=t._BudgetedAWSSession(
+                FakeSession({'sts':FakeSTS(),'iam':FakeIAM(),'ec2':FakeEC2()}),
+                budget)
+            with patch.object(t,'cur_candidates',return_value=(
+                     '2026-10',[row_for('volume',VOLUME)])) as cur, \
+                 patch.object(t,'build_session',return_value=session):
+                t.run_interactive(args)
+                cur.assert_called_once()
+            self.assertEqual(budget.calls,5)
+            self.assertFalse(budget.exhausted)
+            self.assertTrue(out.is_file())
+            self.assertEqual(json.loads(out.read_text(encoding='utf-8'))
+                             ['records'][0]['status'],'proposed')
+
+    def test_r1_iam_budget_exhaustion_aborts_before_plan_and_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            input_path=root/'cur.csv.gz'
+            input_path.write_bytes(b'local CUR stub')
+            out=root/'reports'/'plan.json'
+            args=t.parse_cli(['run','--cur',str(input_path),
+                              '--account',ACCOUNT,'--output',str(out),
+                              '--login','skip','--mode','dryrun'])
+            budget=t.AWSReadBudget(max_calls=1,max_elapsed=1000)
+            session=t._BudgetedAWSSession(
+                FakeSession({'sts':FakeSTS(),'iam':FakeIAM(),'ec2':FakeEC2()}),
+                budget)
+            with patch.object(t,'cur_candidates',return_value=(
+                     '2026-10',[row_for('volume',VOLUME)])), \
+                 patch.object(t,'build_session',return_value=session), \
+                 patch.object(t,'plan') as plan, \
+                 patch.object(t,'publish_staged_reports') as publish:
+                with self.assertRaises(t.AWSReadBudgetExceeded):
+                    t.run_interactive(args)
+                plan.assert_not_called()
+                publish.assert_not_called()
+            self.assertEqual(budget.calls,1)
+            self.assertTrue(budget.exhausted)
+            self.assertFalse(out.exists())
+            self.assertEqual(list(out.parent.iterdir()),[])
+
+    def test_r1_rds_fixed_25_page_boundaries(self):
+        for pages,expected in ((24,'already_named'),
+                               (25,'already_named'),
+                               (26,'manual_review')):
+            with self.subTest(pages=pages):
+                class ManyPageRDS(FakeRDS):
+                    def describe_db_clusters(self, **kwargs):
+                        seen=len([c for c in self.calls
+                                  if c[0]=='DescribeDBClusters'])+1
+                        if seen < pages:
+                            self.calls.append(('DescribeDBClusters',kwargs))
+                            return {'DBClusters':[], 'Marker':f'page-{seen}'}
+                        result=super().describe_db_clusters(**kwargs)
+                        if seen < 26 and pages == 26:
+                            result['Marker'] = f'page-{seen}'
+                        return result
+                fake=ManyPageRDS()
+                out=t.Investigator(FakeSession({'rds':fake}),ACCOUNT).resolve(
+                    row_for('rds_cluster',fake.cluster_rid.lower()))
+                self.assertEqual(out['status'],expected)
+                self.assertEqual(out['proposed_name'],'')
+                if pages==26:
+                    self.assertEqual(out['name_state'],'UNKNOWN')
+                    self.assertIn('page budget exceeded',out['evidence'])
+                self.assertEqual(len([c for c in fake.calls
+                                      if c[0]=='DescribeDBClusters']),min(pages,25))
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
