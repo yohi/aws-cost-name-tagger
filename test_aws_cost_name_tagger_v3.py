@@ -664,12 +664,21 @@ class SafetyV32Tests(unittest.TestCase):
             t.create_audit_journal(p)
             t.journal_event(p,{'event':'write_blocked','proposal_id':'one'})
             t.journal_event(p,{'event':'write_blocked','proposal_id':'two'})
-            events=[json.loads(x) for x in p.read_text().splitlines()]
-            self.assertEqual([x['proposal_id'] for x in events],['one','two'])
-            with patch.object(t.os,'fsync',side_effect=OSError('disk failure')):
-                with self.assertRaises(OSError):
-                    t.journal_event(p,{'event':'write_blocked','proposal_id':'three'})
-            self.assertEqual(events[0]['proposal_id'],'one')
+            original_bytes = p.read_bytes()
+            events = [json.loads(x) for x in original_bytes.splitlines()]
+            self.assertEqual([x['proposal_id'] for x in events], ['one', 'two'])
+            with patch.object(t.os, 'fsync', side_effect=OSError('disk failure')):
+                with self.assertRaisesRegex(OSError, 'disk failure'):
+                    t.journal_event(p, {'event': 'write_blocked', 'proposal_id': 'three'})
+            # The failure must not corrupt previously acknowledged bytes.
+            # Do not infer persistence (or rollback) of the third append.
+            observed_bytes = p.read_bytes()
+            self.assertTrue(observed_bytes.startswith(original_bytes))
+            self.assertEqual(
+                [json.loads(line)['proposal_id'] for line in
+                 observed_bytes[:len(original_bytes)].splitlines()],
+                ['one', 'two'],
+            )
 
     def test_snapshot_requires_historical_evidence_even_if_current_ec2_named(self):
         i=t.Investigator(FakeSession({'ec2':FakeEC2()}),ACCOUNT)
@@ -1026,6 +1035,228 @@ class StrictNameStateV36Tests(unittest.TestCase):
             inv.write_name({'name_state':'EMPTY','name_key_present':True,'proposed_name':'x'})
         with self.assertRaises(SystemExit):
             t.apply(object())
+
+
+
+class OfflineSafetyBoundariesR1Tests(unittest.TestCase):
+    """Existing Safety Hold contracts only; no AWS access or product changes."""
+
+    def test_t03_malformed_tag_collection_fails_closed(self):
+        malformed = [
+            [None],
+            [42],
+            [{'Key': 12, 'Value': 'invalid'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': None, 'Value': 'invalid'}],
+            'not-a-tag-list',
+            12,
+            ('Name',),
+        ]
+        class MalformedVolumeEC2(FakeEC2):
+            def __init__(self, bad_tags):
+                super().__init__()
+                self.bad_tags = bad_tags
+
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                result['Volumes'][0]['Tags'] = self.bad_tags
+                return result
+
+        for tags in malformed:
+            with self.subTest(tags=tags):
+                self.assertEqual(t.name_state(tags), 'UNKNOWN')
+                ec2 = MalformedVolumeEC2(tags)
+                result = t.Investigator(
+                    FakeSession({'ec2': ec2}), ACCOUNT
+                ).resolve(row_for('volume', VOLUME))
+                self.assertEqual(result['name_state'], 'UNKNOWN')
+                self.assertEqual(result['status'], 'manual_review')
+                self.assertFalse(result['proposed_name'])
+                self.assertEqual(ec2.writes, [])
+
+    def test_t06_t07_terminal_symlink_and_dangling_symlink_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / 'existing.txt'
+            existing.write_text('unchanged', encoding='utf-8')
+            missing = root / 'missing.txt'
+            for label, destination in [('existing', existing), ('dangling', missing)]:
+                with self.subTest(kind=label):
+                    output = root / f'{label}-report.json'
+                    output.symlink_to(destination)
+                    with self.assertRaises(FileExistsError):
+                        t.write_json(output, {'report': 'private'})
+                    self.assertTrue(output.is_symlink())
+                    self.assertEqual(output.readlink(), destination)
+                    self.assertEqual(existing.read_text(encoding='utf-8'), 'unchanged')
+                    self.assertFalse(missing.exists())
+
+    def test_t08_mkdir_race_installs_symlink_but_cannot_redirect(self):
+        import errno
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / 'outside'
+            outside.mkdir()
+            real_mkdir = os.mkdir
+            injected = []
+
+            def raced_mkdir(name, mode=0o777, *, dir_fd=None):
+                if name == 'raced' and dir_fd is not None:
+                    injected.append(name)
+                    os.symlink(str(outside), name, dir_fd=dir_fd)
+                    raise FileExistsError(errno.EEXIST, 'competing symlink')
+                return real_mkdir(name, mode, dir_fd=dir_fd)
+
+            with patch.object(t.os, 'mkdir', side_effect=raced_mkdir):
+                with self.assertRaises(ValueError):
+                    t.write_json(root / 'raced' / 'report.json', {'sensitive': True})
+            self.assertEqual(injected, ['raced'])
+            self.assertTrue((root / 'raced').is_symlink())
+            self.assertFalse((outside / 'report.json').exists())
+
+    def test_t10_destination_created_after_preflight_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.json'
+            destination = root / 'plan.json'
+            t.write_json(source, {'owner': 'publisher'})
+            original_preflight = t.preflight_outputs
+            injected = []
+
+            def competing_preflight(paths):
+                original_preflight(paths)
+                destination.write_bytes(b'competing creator data')
+                injected.append(True)
+
+            with patch.object(t, 'preflight_outputs', side_effect=competing_preflight):
+                with self.assertRaises(FileExistsError):
+                    t.publish_staged_reports([(source, destination)])
+            self.assertEqual(injected, [True])
+            self.assertEqual(destination.read_bytes(), b'competing creator data')
+            self.assertTrue(source.exists())
+
+    def test_t11_two_publishers_cannot_both_claim_same_destination(self):
+        import os
+        import threading
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_a = root / 'source-a.json'
+            source_b = root / 'source-b.json'
+            destination = root / 'plan.json'
+            t.write_json(source_a, {'publisher': 'a'})
+            t.write_json(source_b, {'publisher': 'b'})
+            original_link = os.link
+            barrier = threading.Barrier(2)
+            results = []
+            lock = threading.Lock()
+
+            def synchronized_link(src, dst, **kwargs):
+                barrier.wait(timeout=10)
+                return original_link(src, dst, **kwargs)
+
+            def publisher(source):
+                try:
+                    t.publish_staged_reports([(source, destination)])
+                    result = 'published'
+                except FileExistsError:
+                    result = 'collision'
+                except BaseException as exc:
+                    result = f'unexpected:{type(exc).__name__}:{exc}'
+                with lock:
+                    results.append(result)
+
+            threads = [
+                # Daemon threads cannot keep the test process alive if an
+                # unexpected blocking syscall outlives the bounded joins.
+                threading.Thread(target=publisher, args=(source_a,), daemon=True),
+                threading.Thread(target=publisher, args=(source_b,), daemon=True),
+            ]
+            started = []
+            with patch.object(t.os, 'link', side_effect=synchronized_link):
+                try:
+                    deadline = time.monotonic() + 12
+                    for thread in threads:
+                        thread.start()
+                        started.append(thread)
+                    for thread in started:
+                        thread.join(timeout=max(0, deadline - time.monotonic()))
+                finally:
+                    # Release waiters on abnormal start/timeout; even if a
+                    # worker blocks elsewhere, process shutdown stays bounded.
+                    barrier.abort()
+                    for thread in started:
+                        thread.join(timeout=0.5)
+
+            self.assertFalse(
+                any(thread.is_alive() for thread in started),
+                'publisher worker failed to stop within the bounded join',
+            )
+            self.assertEqual(len(started), 2)
+            self.assertCountEqual(results, ['published', 'collision'])
+            self.assertIn(
+                destination.read_bytes(),
+                (source_a.read_bytes(), source_b.read_bytes()),
+            )
+            self.assertTrue(source_a.exists())
+            self.assertTrue(source_b.exists())
+
+    def test_t13_destination_directory_fsync_failure_rolls_back_links(self):
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.json'
+            destination = root / 'published.json'
+            t.write_json(source, {'status': 'staged'})
+            expected_source_bytes = source.read_bytes()
+            directory_stat = root.stat()
+            original_link = os.link
+            original_fsync = os.fsync
+            original_unlink = os.unlink
+            linked = []
+            injected = []
+            cleaned = []
+
+            def tracked_link(src, dst, **kwargs):
+                result = original_link(src, dst, **kwargs)
+                linked.append(Path(dst).name)
+                return result
+
+            def fail_target_directory_fsync(fd):
+                fd_stat = os.fstat(fd)
+                is_destination_dir = (
+                    stat.S_ISDIR(fd_stat.st_mode)
+                    and (fd_stat.st_dev, fd_stat.st_ino)
+                    == (directory_stat.st_dev, directory_stat.st_ino)
+                )
+                if is_destination_dir:
+                    # A pre-link fsync must not satisfy this fault injection.
+                    self.assertEqual(linked, [destination.name])
+                    self.assertTrue(destination.is_file())
+                    injected.append(fd_stat.st_ino)
+                    raise OSError('forced directory fsync failure')
+                return original_fsync(fd)
+
+            def tracked_unlink(path, **kwargs):
+                result = original_unlink(path, **kwargs)
+                cleaned.append(Path(path).name)
+                return result
+
+            with patch.object(t.os, 'link', side_effect=tracked_link), \
+                 patch.object(t.os, 'fsync', side_effect=fail_target_directory_fsync), \
+                 patch.object(t.os, 'unlink', side_effect=tracked_unlink):
+                with self.assertRaisesRegex(OSError, 'forced directory fsync failure'):
+                    t.publish_staged_reports([(source, destination)])
+            self.assertEqual(linked, [destination.name])
+            self.assertEqual(len(injected), 1)
+            self.assertEqual(cleaned, [destination.name])
+            self.assertFalse(destination.exists())
+            self.assertEqual(source.read_bytes(), expected_source_bytes)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
