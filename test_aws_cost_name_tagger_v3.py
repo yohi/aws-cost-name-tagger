@@ -1630,5 +1630,164 @@ class PreLoginCollisionPRCR2Tests(unittest.TestCase):
             self.assertEqual(collision.read_bytes(), b'keep existing')
 
 
+
+
+class StrictMalformedTagsPRBTests(unittest.TestCase):
+    """PR-B: corrupt non-Name tags invalidate the entire observed tag set."""
+
+    def test_prb_t04_malformed_dict_and_list_inputs_are_unknown(self):
+        malformed = [
+            {'Name': '', 1: 'bad'},
+            {'Name': '', 'Product': None},
+            {'Name': '', 'Product': 7},
+            {'Name': 'already-named', 'Product': []},
+            {'Name': '', '': 'empty-key'},
+            {None: 'bad'},
+            [{'Key': 'Product'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other', 'Value': None}],
+            [{'Key': 'Product', 'Value': 5}],
+            [{'Key': '', 'Value': 'bad'}],
+            [{'Key': 'Product', 'Value': 'one'},
+             {'Key': 'Product', 'Value': 'two'}],
+            [{'Key': 'Name', 'Value': ''},
+             {'Key': 'Other', 'Value': 'one'},
+             {'Key': 'Other', 'Value': 'two'}],
+        ]
+        for tags in malformed:
+            with self.subTest(tags=tags):
+                with self.assertRaises(ValueError):
+                    t.tagmap(tags)
+                self.assertEqual(t.name_state(tags), 'UNKNOWN')
+
+    def test_prb_t04_ebs_invalid_other_tags_fail_closed_without_writes(self):
+        variants = [
+            [{'Key': 'Product'}],
+            [{'Key': 'Product', 'Value': 'a'},
+             {'Key': 'Product', 'Value': 'b'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other'}],
+            {'Name': '', 1: 'bad'},
+            {'Name': '', 'Product': None},
+            {'Name': 'already-named', 'Product': 7},
+        ]
+
+        class CorruptedVolume(FakeEC2):
+            def __init__(self, bad_tags):
+                super().__init__()
+                self.bad_tags = bad_tags
+
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                result['Volumes'][0]['Tags'] = self.bad_tags
+                return result
+
+        for tags in variants:
+            with self.subTest(tags=tags):
+                ec2 = CorruptedVolume(tags)
+                result = t.Investigator(
+                    FakeSession({'ec2': ec2}), ACCOUNT
+                ).resolve(row_for('volume', VOLUME))
+                self.assertEqual(result['status'], 'manual_review')
+                self.assertEqual(result['name_state'], 'UNKNOWN')
+                self.assertEqual(result['proposed_name'], '')
+                self.assertEqual(result['confidence'], 'none')
+                self.assertEqual(ec2.writes, [])
+
+    def test_prb_t04_rds_and_cloudfront_corruption_blocks_candidates(self):
+        class CorruptedRDS(FakeRDS):
+            def list_tags_for_resource(self, ResourceName):
+                result = super().list_tags_for_resource(ResourceName)
+                if ResourceName == self.instance_arn:
+                    result['TagList'] = [{'Key': 'Product'}]
+                return result
+
+        rds = CorruptedRDS()
+        result = t.Investigator(
+            FakeSession({'rds': rds}), ACCOUNT
+        ).resolve(row_for('rds_instance', rds.instance_id))
+        self.assertEqual((result['name_state'], result['status']),
+                         ('UNKNOWN', 'manual_review'))
+        self.assertFalse(result['proposed_name'])
+
+        cf = FakeCloudFront()
+        cf.tags['Items'] = [
+            {'Key': 'Product', 'Value': 'a'},
+            {'Key': 'Product', 'Value': 'b'},
+        ]
+        arn = f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
+        result = t.Investigator(
+            FakeSession({'cloudfront': cf}), ACCOUNT
+        ).resolve(row_for('cloudfront', arn, 'us-east-1'))
+        self.assertEqual((result['name_state'], result['status']),
+                         ('UNKNOWN', 'manual_review'))
+        self.assertFalse(result['proposed_name'])
+
+    def test_prb_t04_malformed_parent_tags_block_inheritance(self):
+        class InvalidParent(FakeEC2):
+            def describe_instances(self, InstanceIds):
+                result = super().describe_instances(InstanceIds)
+                result['Reservations'][0]['Instances'][0]['Tags'].append(
+                    {'Key': 'Product'}
+                )
+                return result
+
+        ec2 = InvalidParent()
+        result = t.Investigator(
+            FakeSession({'ec2': ec2}), ACCOUNT
+        ).resolve(row_for('volume', VOLUME))
+        self.assertEqual(result['status'], 'manual_review')
+        self.assertFalse(result['proposed_name'])
+        # The target volume has valid absent Name; parent lineage is invalid.
+        self.assertEqual(result['name_state'], 'ABSENT')
+        self.assertEqual(ec2.writes, [])
+
+    def test_prb_t04_valid_tag_shapes_and_omitted_tags_preserved(self):
+        valid = [
+            ({}, 'ABSENT', {}),
+            ([], 'ABSENT', {}),
+            ({'Product': 'different-service'}, 'ABSENT',
+             {'Product': 'different-service'}),
+            ([{'Key': 'Product', 'Value': 'different-service'}],
+             'ABSENT', {'Product': 'different-service'}),
+            ({'Name': '', 'Product': 'alias'}, 'EMPTY',
+             {'Name': '', 'Product': 'alias'}),
+            ([{'Key': 'Name', 'Value': ''},
+              {'Key': 'Product', 'Value': 'alias'}],
+             'EMPTY', {'Name': '', 'Product': 'alias'}),
+            ({'Name': ' ', 'Product': ''}, 'NONEMPTY',
+             {'Name': ' ', 'Product': ''}),
+            ([{'Key': 'Name', 'Value': '\t'}], 'NONEMPTY',
+             {'Name': '\t'}),
+        ]
+        for tags, expected_state, expected_map in valid:
+            with self.subTest(tags=tags):
+                self.assertEqual(t.tagmap(tags), expected_map)
+                self.assertEqual(t.name_state(tags), expected_state)
+
+        # A service's omitted Tags field is intentionally represented by [].
+        # It is not equivalent to a failed/unknown AWS API response.
+        class MissingTagsVolume(FakeEC2):
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                del result['Volumes'][0]['Tags']
+                return result
+
+        ec2 = MissingTagsVolume()
+        result = t.Investigator(
+            FakeSession({'ec2': ec2}), ACCOUNT
+        ).resolve(row_for('volume', VOLUME))
+        self.assertEqual((result['name_state'], result['status']),
+                         ('ABSENT', 'proposed'))
+        self.assertTrue(result['proposed_name'])
+        self.assertEqual(ec2.writes, [])
+
+        alias = FakeRDS(child_product='ogne')
+        result = t.Investigator(
+            FakeSession({'rds': alias}), ACCOUNT
+        ).resolve(row_for('rds_instance', alias.instance_id))
+        self.assertEqual(result['status'], 'proposed')
+        self.assertEqual(result['name_state'], 'ABSENT')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
