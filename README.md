@@ -18,6 +18,8 @@
 
 **取得値をtrimして空を判定しません。** 空白1文字でも`NONEMPTY`です。`Name`キーの重複や値欠落はUNKNOWNとして扱います。
 
+**PR-Bの不正タグ形式fail-closed契約:** AWSタグは `dict[str, str]` または `[{"Key": str, "Value": str}, ...]` として検証します。Name以外も含め、キーが非文字列・空文字、値が非文字列、list形式での`Value`欠落・同一キー重複があればタグ集合を不正とし、対象リソースのName状態を`UNKNOWN`として候補を作りません。親リソース側のタグ異常も候補生成を停止します（子の正常な`ABSENT`状態自体は変更しません）。一方、AWSレスポンスのタグ項目省略を既存の`.get(..., [])` / `.get(..., {})`によって空集合とする経路、正常な空文字Value、Product名の不一致は拒否理由にしません。Pythonのdict入力は同一キーの重複表現ができないため、重複検査はlist形式が対象です。
+
 **出力の互換性:** `plan.json` の `schema_version` を **2** に上げ、全候補に `name_state`・`name_key_present`・`name_raw_value`・`existing_name` を付与。CSV（review/report/result/監査/selected）でもNameの状態を独立した列で出力します。`name_key_present` は `true`/`false`、取得不能のときは `null` です。`name_raw_value` は、正常に取得できたName文字列（未設定は `null`、EMPTYは `""`）を保持します。異常な型ではRAWは利用せず `null` とし、UNKNOWNで拒否します。
 
 **候補IDの互換性:** v3.6の `proposal_id` は旧v3.5と異なる専用名前空間にし、ABSENTとEMPTYを必ず区別します。旧レビューCSVや承認候補を流用せず、新しいdryrun結果をレビューしてください。`proposal_id` はレビュー識別子であり、書き込み認可ではありません。
