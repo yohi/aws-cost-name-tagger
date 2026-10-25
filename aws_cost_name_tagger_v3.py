@@ -9,11 +9,13 @@ Python >= 3.10, boto3 >= 1.41.0. No additional dependencies.
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import errno
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -27,6 +29,13 @@ from pathlib import Path
 
 DEFAULT_THRESHOLD = 10.0
 DEFAULT_REPORT_OUTPUT = ".aws-cost-name-tagger/name_tag_plan.json"
+# Offline limits apply to each complete CUR scan, before session creation.
+# They cap gzip expansion, parsed rows, file count, and in-memory cardinality.
+MAX_CUR_FILES = 64
+MAX_CUR_ROWS = 2_000_000
+MAX_CUR_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_CUR_LINE_BYTES = 1024 * 1024
+MAX_CUR_DISTINCT_RESOURCES = 250_000
 # Capture the actual OS implementation functions at import time: offline fault
 # injection tests intentionally mock os.link/unlink/mkdir/stat later.
 _REQUIRED_REPORT_DIR_FD_APIS = (os.open, os.mkdir, os.stat, os.link, os.unlink)
@@ -208,10 +217,16 @@ def rid_class(resource_id: str) -> tuple[str, str, str | None]:
 
 
 def fnum(x) -> float:
+    """An included CUR monetary field must be a finite number, never a guess."""
+    if not isinstance(x, str) or not x.strip():
+        raise ValueError("CUR monetary amount missing or not a numeric string")
     try:
-        return float(x) if x else 0.0
-    except (ValueError, TypeError):
-        return 0.0
+        number = float(x)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError("CUR monetary amount is not numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError("CUR monetary amount is not finite")
+    return number
 
 
 def cost_of(row: dict) -> float:
@@ -220,68 +235,165 @@ def cost_of(row: dict) -> float:
         return fnum(row.get("reservation_effective_cost"))
     if typ == "SavingsPlanCoveredUsage":
         return fnum(row.get("savings_plan_savings_plan_effective_cost"))
-    if typ in ("Usage", "SavingsPlanNegation"):
-        # SavingsPlanNegation is deliberately excluded by caller; no double counting.
+    if typ == "Usage":
         return fnum(row.get("line_item_unblended_cost"))
     return 0.0
 
 
-def cur_candidates(files: list[str], month: str | None, min_cost: float, max_resources: int, account: str, kind_filter: set[str] | None = None):
-    # Two streaming passes avoid loading ~600k full CSV records into memory.
-    periods = set()
-    for filename in files:
-        with gzip.open(filename, "rt", newline="", encoding="utf-8-sig") as stream:
-            reader = csv.DictReader(stream)
+def _cur_file_identity(info) -> tuple:
+    # Detect ordinary file replacement, truncation, rewrites, and hardlinks.
+    # This is not a same-UID hostile mutation or network-filesystem proof.
+    return (info.st_dev, info.st_ino, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _scan_cur_file(path: Path, budget: dict, accept_row) -> tuple:
+    """Stream a bounded gzip CSV once and return a decoded-content receipt.
+
+    The physical line and total expansion limits prevent a large decompressed
+    line from being materialized before checking its size. The receipt,
+    compressed-file identity and row count are compared across both passes.
+    """
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("CUR input must be a regular file")
+    count = 0
+    expanded = 0
+    checksum = hashlib.sha256()
+    with path.open("rb") as raw:
+        opened = os.fstat(raw.fileno())
+        if _cur_file_identity(opened) != _cur_file_identity(before):
+            raise ValueError("CUR input changed before opening")
+        with gzip.GzipFile(fileobj=raw, mode="rb") as compressed:
+            decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
+
+            def bounded_lines():
+                nonlocal expanded
+                while True:
+                    chunk = compressed.readline(MAX_CUR_LINE_BYTES + 1)
+                    if not chunk:
+                        tail = decoder.decode(b"", final=True)
+                        if tail:
+                            yield tail
+                        return
+                    if len(chunk) > MAX_CUR_LINE_BYTES:
+                        raise ValueError("CUR physical line size limit exceeded")
+                    expanded += len(chunk)
+                    budget["bytes"] += len(chunk)
+                    if budget["bytes"] > MAX_CUR_UNCOMPRESSED_BYTES:
+                        raise ValueError("CUR decompressed byte budget exceeded")
+                    checksum.update(chunk)
+                    yield decoder.decode(chunk, final=False)
+
+            reader = csv.DictReader(bounded_lines())
+            header = reader.fieldnames
+            if header is not None and (len(header) != len(set(header))
+                                        or any(not h for h in header)):
+                raise ValueError("CUR header has duplicate or empty column names")
             for row in reader:
-                period = row.get("bill_billing_period_start_date", "")[:7]
-                if period:
-                    periods.add(period)
+                count += 1
+                budget["rows"] += 1
+                if budget["rows"] > MAX_CUR_ROWS:
+                    raise ValueError("CUR row budget exceeded")
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError("CUR record has extra or missing fields")
+                accept_row(row)
+    after = path.stat()
+    if (_cur_file_identity(before) != _cur_file_identity(after)
+            or _cur_file_identity(opened) != _cur_file_identity(after)):
+        raise ValueError("CUR input changed during scan")
+    return (_cur_file_identity(after), expanded, count, checksum.hexdigest())
+
+
+def cur_candidates(files: list[str], month: str | None, min_cost: float,
+                   max_resources: int, account: str, kind_filter: set[str] | None = None):
+    """Two bounded, receipt-matched passes; no AWS access or report on error."""
+    if not files or len(files) > MAX_CUR_FILES:
+        raise ValueError("CUR input file count out of bounds")
+    paths = [Path(filename) for filename in files]
+    seen_inodes = set()
+    for path in paths:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("CUR input must be a regular file")
+        identity = (info.st_dev, info.st_ino)
+        if identity in seen_inodes:
+            raise ValueError("Duplicate CUR input, including hardlink/path aliases")
+        seen_inodes.add(identity)
+
+    periods = set()
+    receipts = []
+    first_budget = {"bytes": 0, "rows": 0}
+
+    def record_month(row):
+        period = row.get("bill_billing_period_start_date", "")
+        if not isinstance(period, str):
+            raise ValueError("CUR billing period missing")
+        if period:
+            if not re.match(r"^\d{4}-(?:0[1-9]|1[0-2])-\d{2}", period):
+                raise ValueError("CUR billing period invalid")
+            periods.add(period[:7])
+
+    for path in paths:
+        receipts.append(_scan_cur_file(path, first_budget, record_month))
     if month is None and not periods:
         raise ValueError("CUR input contains no billing rows; specify --month")
     active_month = month or max(periods)
     aggregates = defaultdict(float)
     provenance = defaultdict(lambda: {"services": set(), "billing_rows": 0, "currency": set()})
-    for filename in files:
-        with gzip.open(filename, "rt", newline="", encoding="utf-8-sig") as stream:
-            for row in csv.DictReader(stream):
-                if row["bill_billing_period_start_date"][:7] != active_month:
-                    continue
-                if row["line_item_usage_account_id"] != account:
-                    continue
-                if row["line_item_line_item_type"] not in ("Usage", "DiscountedUsage", "SavingsPlanCoveredUsage"):
-                    continue
-                if row.get("line_item_currency_code") != "USD":
-                    raise ValueError("Non-USD CUR line item; currency conversion is not implemented")
-                raw_id = row["line_item_resource_id"].strip()
-                if not raw_id:
-                    continue  # Fees, unallocated charges, and untaggable rows.
-                kind, locator, arn_region = rid_class(raw_id)
-                if raw_id.startswith("arn:"):
-                    # CUR's usage account and the target ARN's owner must agree.
-                    # API Gateway ARNs normally omit account; service exceptions
-                    # must be handled individually, never with a guessed owner.
-                    arn_account = raw_id.split(":", 5)[4]
-                    if arn_account and arn_account != account:
-                        continue
-                if kind == "unsupported" or (kind_filter is not None and kind not in kind_filter):
-                    continue
-                region = arn_region or row.get("product_region_code", "")
-                if not region and kind == "s3_bucket":
-                    region = "global"
-                if not region:
-                    continue
-                key = (kind, locator, region)
-                aggregates[key] += cost_of(row)
-                provenance[key]["services"].add(row["line_item_product_code"])
-                provenance[key]["billing_rows"] += 1
-                provenance[key]["currency"].add(row.get("line_item_currency_code", ""))
+
+    def aggregate_row(row):
+        period = row.get("bill_billing_period_start_date", "")
+        if not isinstance(period, str):
+            raise ValueError("CUR billing period missing")
+        if period[:7] != active_month:
+            return
+        if row["line_item_usage_account_id"] != account:
+            return
+        typ = row["line_item_line_item_type"]
+        if typ not in ("Usage", "DiscountedUsage", "SavingsPlanCoveredUsage"):
+            return
+        if row.get("line_item_currency_code") != "USD":
+            raise ValueError("Non-USD CUR line item; currency conversion is not implemented")
+        raw_id = row["line_item_resource_id"].strip()
+        if not raw_id:
+            return
+        kind, locator, arn_region = rid_class(raw_id)
+        if raw_id.startswith("arn:"):
+            arn_account = raw_id.split(":", 5)[4]
+            if arn_account and arn_account != account:
+                return
+        if kind == "unsupported" or (kind_filter is not None and kind not in kind_filter):
+            return
+        region = arn_region or row.get("product_region_code", "")
+        if not region and kind == "s3_bucket":
+            region = "global"
+        if not region:
+            return
+        amount = cost_of(row)
+        key = (kind, locator, region)
+        if key not in aggregates and len(aggregates) >= MAX_CUR_DISTINCT_RESOURCES:
+            raise ValueError("CUR distinct-resource budget exceeded")
+        proposed_total = aggregates[key] + amount
+        if not math.isfinite(proposed_total):
+            raise ValueError("CUR aggregated amount is not finite")
+        aggregates[key] = proposed_total
+        provenance[key]["services"].add(row["line_item_product_code"])
+        provenance[key]["billing_rows"] += 1
+        provenance[key]["currency"].add(row["line_item_currency_code"])
+
+    second_budget = {"bytes": 0, "rows": 0}
+    for idx, path in enumerate(paths):
+        second_receipt = _scan_cur_file(path, second_budget, aggregate_row)
+        if receipts[idx] != second_receipt:
+            raise ValueError("CUR content or metadata changed between passes")
     ranked = sorted(aggregates.items(), key=lambda x: -x[1])
-    ranked = [(k,v) for k,v in ranked if v >= min_cost][:max_resources]
+    ranked = [(k, v) for k, v in ranked if v >= min_cost][:max_resources]
     return active_month, [{"kind": k[0], "locator": k[1], "region": k[2],
         "effective_usage_cost_usd": round(v, 6),
         "source_services": sorted(provenance[k]["services"]),
         "billing_rows": provenance[k]["billing_rows"],
-        "currency": sorted(provenance[k]["currency"])} for k,v in ranked]
+        "currency": sorted(provenance[k]["currency"])} for k, v in ranked]
 
 
 class Investigator:
