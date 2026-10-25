@@ -1287,6 +1287,10 @@ def show_aws_identity(session, expected: str) -> dict:
             print(f"IAM Role path : {meta.get('Path', '')}")
             print(f"Role max duration : {meta.get('MaxSessionDuration', '')} seconds")
             print(f"Role description : {meta.get('Description', '')}")
+        except AWSReadBudgetExceeded:
+            # Budget exhaustion is NOT an optional IAM-metadata failure.
+            # It must stop the entire interactive run before planning.
+            raise
         except Exception as exc:
             # STS alone proves the current identity. IAM GetRole might be denied.
             print(f"IAM role metadata : unavailable ({type(exc).__name__}); STS identity confirmed")
@@ -1606,7 +1610,9 @@ def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
         rec["proposal_id"]=proposal_key(rec)
         rec["resource_arn"] = resource_arn(rec, args.account)
         records.append(rec)
-        print(f"[{idx:>3}/{len(candidates)}] {item['effective_usage_cost_usd']:8.2f} {rec['status']:>14} {rec['kind']:16} {rec['proposed_name'] or rec['locator'][:55]}",file=sys.stderr)
+        # Candidate names are not emitted before full validation succeeds.
+        # A later budget failure must leave neither a report nor leaked stderr
+        # records of a plan that never completed.
     # A truncated ID suffix can collide. Never auto-propose the same Name
     # for two distinct write targets inside the same reviewed batch.
     byname=defaultdict(set)
@@ -1639,7 +1645,12 @@ def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
             rows=[{**r,"result":"dryrun_not_modified" if r["status"] == "proposed" else r["status"]}
                   for r in records]
             write_action_csv(staged[3],rows,args.account,mode="dryrun")
+        # Offline serialization/fsync may consume the remaining deadline.
+        # Do not publish previously validated proposals after it expires.
+        session.read_budget.require_completion()
         publish_staged_reports(list(zip(staged,destinations)))
+    for idx, rec in enumerate(records, 1):
+        print(f"[{idx:>3}/{len(records)}] {rec['effective_usage_cost_usd']:8.2f} {rec['status']:>14} {rec['kind']:16} {rec['proposed_name'] or rec['locator'][:55]}", file=sys.stderr)
     print(f"PLAN={out} SHA256={sha256(out)}\nREVIEW={review}\nREPORT={report}\nNo AWS tags were changed.")
     return doc
 
