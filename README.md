@@ -18,7 +18,7 @@
 
 **取得値をtrimして空を判定しません。** 空白1文字でも`NONEMPTY`です。`Name`キーの重複や値欠落はUNKNOWNとして扱います。
 
-**PR-Bの不正タグ形式fail-closed契約:** AWSタグは `dict[str, str]` または `[{"Key": str, "Value": str}, ...]` として検証します。Name以外も含め、キーが非文字列・空文字、値が非文字列、list形式での`Value`欠落・同一キー重複があればタグ集合を不正とし、対象リソースのName状態を`UNKNOWN`として候補を作りません。親リソース側のタグ異常も候補生成を停止します（子の正常な`ABSENT`状態自体は変更しません）。一方、AWSレスポンスのタグ項目省略を既存の`.get(..., [])` / `.get(..., {})`によって空集合とする経路、正常な空文字Value、Product名の不一致は拒否理由にしません。Pythonのdict入力は同一キーの重複表現ができないため、重複検査はlist形式が対象です。
+**PR-BのAWSサービス別入力契約:** タグ取得元のAPIごとに、`list`形式（EC2系・RDS・OpenSearch・ELBv2・CloudFront・Athena・WAFv2・S3）または`dict`形式（API Gateway・CloudWatch Logs・Lambda）を明示し、不一致・不正なキー型・値型・同一キー重複は`UNKNOWN`としてName候補を生成しません。タグ値の`Value`がSDKレスポンスモデル上任意であるlist形式のEC2系・RDS・ELBv2・CloudFront・Athenaでは、**非Nameキーだけ**`Value`省略を空文字に正規化します。`Name`の`Value`欠落はサービスを問わず拒否します。OpenSearch・WAFv2・S3のlist形式は`Value`必須です。親リソースのタグも同じ形式契約で検証し、不正なら候補生成を止めます（子側の正常なABSENT状態自体は変更しません）。サービスがタグ項目そのものを省略したときは、既存の空集合既定値を維持します。正常な空文字・非NameのProductエイリアス不一致は拒否理由にしません。Pythonのdictは重複キーを表現できないため、重複検査はlist形式が対象です。ここでいう省略許容はbotocoreモデル上のスキーマ互換性であり、実AWSが必ずその形で返すことを証明するものではありません。
 
 **出力の互換性:** `plan.json` の `schema_version` を **2** に上げ、全候補に `name_state`・`name_key_present`・`name_raw_value`・`existing_name` を付与。CSV（review/report/result/監査/selected）でもNameの状態を独立した列で出力します。`name_key_present` は `true`/`false`、取得不能のときは `null` です。`name_raw_value` は、正常に取得できたName文字列（未設定は `null`、EMPTYは `""`）を保持します。異常な型ではRAWは利用せず `null` とし、UNKNOWNで拒否します。
 
