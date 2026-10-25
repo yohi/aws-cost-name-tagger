@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1060,11 +1061,45 @@ def run_interactive(args):
     print(f"REVIEW_AUDIT={journal}; REVIEW_REPORT={report}; writes=0; AWS変更なし")
 
 
-def publish_staged_reports(pairs: list[tuple[Path, Path]]):
-    """Best-effort grouped publication using dirfd-anchored, nofollow links.
+class ReportPublishCleanupError(RuntimeError):
+    """A publish failure followed by one or more incomplete cleanup attempts."""
 
-    This mitigates symlink substitution but does not make multi-file
-    publication atomic. After SIGKILL or power loss, partial outputs can remain.
+    def __init__(self, primary_error, cleanup_errors, possibly_remaining):
+        self.primary_error = primary_error
+        self.cleanup_errors = tuple(cleanup_errors)
+        self.possibly_remaining = tuple(possibly_remaining)
+        super().__init__(
+            f"Report publish failed: {primary_error!r}; "
+            f"cleanup failed for {len(self.cleanup_errors)} path(s); "
+            f"possibly remaining outputs: {self.possibly_remaining!r}"
+        )
+
+
+def _require_private_publish_directory(fd, purpose):
+    """Trust contract for publication: private, caller-owned directory.
+
+    Other UIDs cannot mutate entries in this directory through normal POSIX
+    permissions. This is NOT isolation from another process with the same UID
+    or a privileged process; parent path and ACL assumptions still apply.
+    """
+    info = os.fstat(fd)
+    if (not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077):
+        raise PermissionError(
+            f"Report {purpose} directory must be owned by the effective UID "
+            "and deny group/other access (private mode, e.g. 0700)"
+        )
+
+
+def publish_staged_reports(pairs: list[tuple[Path, Path]]):
+    """Publish regular staged files to private directories, without overwrites.
+
+    Existing destination directories with group/other access are rejected;
+    callers must choose an owned private output directory. This contract does
+    not defend against hostile same-UID/privileged processes or mutable
+    ancestor paths. A pathname check alone cannot close those races.
+    Multi-file crash/power-loss atomicity is NOT guaranteed.
     """
     if not pairs:
         return
@@ -1078,15 +1113,36 @@ def publish_staged_reports(pairs: list[tuple[Path, Path]]):
     published = []
     with _private_directory_fd(source_dir, create=False) as src_fd:
         with _private_directory_fd(dest_dir, create=False) as dst_fd:
+            _require_private_publish_directory(src_fd, "staging")
+            _require_private_publish_directory(dst_fd, "destination")
+            # Pre-validate all sources while the private source directory is
+            # anchored. os.link(follow_symlinks=False) alone accepts symlinks.
+            for src, _ in pairs:
+                source_meta = os.stat(
+                    Path(src).name, dir_fd=src_fd, follow_symlinks=False
+                )
+                if not stat.S_ISREG(source_meta.st_mode):
+                    raise ValueError(f"Refusing non-regular staged report: {Path(src).name}")
             try:
                 for src, dst in pairs:
                     os.link(Path(src).name, Path(dst).name,
                             src_dir_fd=src_fd, dst_dir_fd=dst_fd, follow_symlinks=False)
                     published.append(Path(dst).name)
                 os.fsync(dst_fd)
-            except BaseException:
+            except BaseException as primary:
+                cleanup_errors = []
+                possibly_remaining = []
+                # Continue independent cleanup attempts even if one fails.
                 for name in reversed(published):
-                    os.unlink(name, dir_fd=dst_fd)
+                    try:
+                        os.unlink(name, dir_fd=dst_fd)
+                    except OSError as cleanup_error:
+                        cleanup_errors.append((name, cleanup_error))
+                        possibly_remaining.append(str(dest_dir / name))
+                if cleanup_errors:
+                    raise ReportPublishCleanupError(
+                        primary, cleanup_errors, possibly_remaining
+                    ) from primary
                 raise
 
 
