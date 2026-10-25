@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_THRESHOLD = 10.0
+DEFAULT_REPORT_OUTPUT = ".aws-cost-name-tagger/name_tag_plan.json"
 SCOPE_PATTERN = re.compile(r"^([a-z0-9][a-z0-9-]*?)-(prd|prod|stg|stage|dev|test|qa)(?=-|$)")
 OPAQUE = re.compile(r"^(?:i|vol|snap|eni|eipalloc|nat|vpce)-[0-9a-f]{8,}$")
 ID_PART = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
@@ -694,6 +695,33 @@ def assert_account(session, expected: str):
         raise SystemExit(f"ABORT: AWS STS account {actual} != expected {expected}")
 
 
+def _require_report_filesystem_support():
+    """Fail closed before AWS access on unverified OS/API combinations.
+
+    Current supported runtime is Ubuntu Linux. macOS/APFS (ACL and ownership
+    behavior), other Linux distributions and other POSIX systems are not
+    validated for secure publication in this release.
+    """
+    if sys.platform != "linux":
+        raise RuntimeError("Secure report publishing is supported only on Ubuntu Linux")
+    try:
+        release = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError("Cannot verify Ubuntu Linux for secure reports") from exc
+    distro = next((line.split("=", 1)[1].strip().strip('"').strip("'")
+                   for line in release.splitlines() if line.startswith("ID=")), "")
+    if distro != "ubuntu":
+        raise RuntimeError("Secure report publishing is supported only on Ubuntu Linux")
+
+    if not all(hasattr(os, flag) for flag in ("O_DIRECTORY", "O_NOFOLLOW")):
+        raise RuntimeError("Secure report publishing requires O_DIRECTORY and O_NOFOLLOW")
+    required_dir_fd = (os.open, os.mkdir, os.stat, os.link, os.unlink)
+    if any(fn not in os.supports_dir_fd for fn in required_dir_fd):
+        raise RuntimeError("Secure report publishing requires dir_fd support for open/mkdir/stat/link/unlink")
+    if any(fn not in os.supports_follow_symlinks for fn in (os.stat, os.link)):
+        raise RuntimeError("Secure report publishing requires nofollow stat/link support")
+
+
 @contextmanager
 def _private_directory_fd(path: Path, *, create: bool = True):
     """Open every ancestor with O_NOFOLLOW, rooted at / (POSIX).
@@ -706,9 +734,7 @@ def _private_directory_fd(path: Path, *, create: bool = True):
     path = Path(path)
     if ".." in path.parts:
         raise ValueError(f"Output path must not contain '..': {path}")
-    for feature in ("O_DIRECTORY", "O_NOFOLLOW"):
-        if not hasattr(os, feature) or os.name != "posix":
-            raise RuntimeError("Secure report output requires POSIX O_DIRECTORY and O_NOFOLLOW")
+    _require_report_filesystem_support()
     absolute = path.absolute()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     dfd = os.open("/", flags)
@@ -979,6 +1005,8 @@ def run_interactive(args):
     """Human-controlled single entry point. Dryrun never invokes an AWS write API."""
     if not re.fullmatch(r"\d{12}", args.account):
         raise SystemExit("--account must be 12 digits")
+    # Validate output filesystem/permissions before any credential or AWS call.
+    preflight_report_destination(Path(args.output))
     # Validate local paths before offering credentials or any network access.
     for filename in args.cur:
         if not Path(filename).is_file():
@@ -1092,6 +1120,19 @@ def _require_private_publish_directory(fd, purpose):
         )
 
 
+def preflight_report_destination(output_path: Path):
+    """Validate the output directory before login, CUR or AWS metadata reads.
+
+    New directories are created as 0700. Existing directories are never
+    chmod'd; a non-private or foreign-owned destination fails closed.
+    Collision handling remains in preflight_outputs and private_output.
+    """
+    output_path = Path(output_path)
+    _require_report_filesystem_support()
+    with _private_directory_fd(output_path.parent) as dfd:
+        _require_private_publish_directory(dfd, "destination")
+
+
 def publish_staged_reports(pairs: list[tuple[Path, Path]]):
     """Publish regular staged files to private directories, without overwrites.
 
@@ -1103,6 +1144,7 @@ def publish_staged_reports(pairs: list[tuple[Path, Path]]):
     """
     if not pairs:
         return
+    _require_report_filesystem_support()
     preflight_outputs([dst for _, dst in pairs])
     sources = {Path(src).parent for src, _ in pairs}
     destinations = {Path(dst).parent for _, dst in pairs}
@@ -1167,6 +1209,8 @@ def plan(args, session=None, *, extra_mode=None):
     report=out.with_suffix(".report.csv")
     result=out.with_suffix(".result.csv")
     destinations=[out, review, report] + ([result] if extra_mode == "dryrun" else [])
+    # Validate the output trust contract before CUR parsing and AWS session use.
+    preflight_report_destination(out)
     preflight_outputs(destinations)
     kind_filter = None
     if args.kinds is not None:
@@ -1236,7 +1280,7 @@ def parse_cli(argv=None):
     p.add_argument("--min-cost",type=float,default=DEFAULT_THRESHOLD,help="Effective monthly-to-date cost minimum, USD")
     p.add_argument("--max-resources",type=int,default=100,help="Limit number of AWS metadata lookups")
     p.add_argument("--kinds", help="Comma-separated types, e.g. volume,snapshot,instance,eni; optional")
-    p.add_argument("--output",default="name_tag_plan.json")
+    p.add_argument("--output",default=DEFAULT_REPORT_OUTPUT)
     p.set_defaults(func=plan)
     r=sub.add_parser("run",help="Interactive: remote login prompt -> role info -> Y/N/dryrun -> reports")
     r.add_argument("--cur",action="append",required=True,help="Gzipped CUR v2 CSV")
@@ -1248,7 +1292,7 @@ def parse_cli(argv=None):
     r.add_argument("--min-cost",type=float,default=DEFAULT_THRESHOLD)
     r.add_argument("--max-resources",type=int,default=100)
     r.add_argument("--kinds")
-    r.add_argument("--output",default="name_tag_plan.json")
+    r.add_argument("--output",default=DEFAULT_REPORT_OUTPUT)
     r.add_argument("--max-writes",type=int,default=20)
     r.add_argument("--allow-medium",action="store_true",help="Also present medium-confidence proposals for per-row approval")
     r.set_defaults(func=run_interactive)
