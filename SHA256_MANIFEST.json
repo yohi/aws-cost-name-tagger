@@ -40,8 +40,8 @@
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
-      "sha256": "c25dd859a4bfdf77dd5ac3417bdeee95ff18474eadca595307de49f834d969cd",
-      "bytes": 57006
+      "sha256": "30fa039562ab4567867169b716493b255c7512d7e8447ff78ef843c63519e64a",
+      "bytes": 64493
     },
     {
       "path": "test_results.txt",
