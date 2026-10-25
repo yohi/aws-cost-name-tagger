@@ -1542,5 +1542,93 @@ class ReportPublishCompatibilityR1Tests(unittest.TestCase):
 
 
 
+
+class PreLoginCollisionPRCR2Tests(unittest.TestCase):
+    """FND-11-R2-001: reject local collisions before run login or STS."""
+
+    def test_run_existing_common_outputs_refused_before_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / 'plan.json'
+            for existing in (out, out.with_suffix('.review.csv'),
+                             out.with_suffix('.report.csv')):
+                with self.subTest(existing=existing.name):
+                    existing.write_bytes(b'previous report - must remain unchanged')
+                    args = t.parse_cli([
+                        'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                        '--login', 'skip', '--mode', 'dryrun', '--output', str(out),
+                    ])
+                    with patch.object(t, 'offer_remote_login') as login, \
+                         patch.object(t, 'build_session') as session, \
+                         patch.object(t, 'show_aws_identity') as identity, \
+                         patch.object(t, 'plan') as plan:
+                        with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                            t.run_interactive(args)
+                        login.assert_not_called()
+                        session.assert_not_called()
+                        identity.assert_not_called()
+                        plan.assert_not_called()
+                    self.assertEqual(existing.read_bytes(),
+                                     b'previous report - must remain unchanged')
+                    existing.unlink()
+
+    def test_run_preselected_mode_outputs_refused_before_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / 'plan.json'
+            mode_cases = (
+                ('dryrun', out.with_suffix('.result.csv')),
+                ('y', out.with_suffix('.selected.csv')),
+                ('y', out.with_suffix('.audit.jsonl')),
+                ('y', out.with_suffix('.audit.csv')),
+            )
+            for mode, existing in mode_cases:
+                with self.subTest(mode=mode, existing=existing.name):
+                    # A dangling symlink is a collision too: lexists, not exists.
+                    outside = root / 'missing-external'
+                    existing.symlink_to(outside)
+                    args = t.parse_cli([
+                        'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                        '--login', 'skip', '--mode', mode, '--output', str(out),
+                    ])
+                    with patch.object(t, 'offer_remote_login') as login, \
+                         patch.object(t, 'build_session') as session, \
+                         patch.object(t, 'show_aws_identity') as identity, \
+                         patch.object(t, 'plan') as plan:
+                        with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                            t.run_interactive(args)
+                        login.assert_not_called()
+                        session.assert_not_called()
+                        identity.assert_not_called()
+                        plan.assert_not_called()
+                    self.assertTrue(existing.is_symlink())
+                    self.assertFalse(outside.exists())
+                    existing.unlink()
+
+    def test_interactive_choice_checks_new_mode_outputs_before_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / 'plan.json'
+            collision = out.with_suffix('.result.csv')
+            collision.write_bytes(b'keep existing')
+            args = t.parse_cli([
+                'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--login', 'skip', '--output', str(out),
+            ])
+            # The mode is unknown until after login; the common outputs are
+            # still checked pre-login, and mode-specific outputs pre-plan.
+            args.cur = [str(root / 'input.csv.gz')]
+            (root / 'input.csv.gz').write_bytes(b'placeholder')
+            with patch.object(t, 'offer_remote_login', return_value=True), \
+                 patch.object(t, 'build_session', return_value=object()), \
+                 patch.object(t, 'show_aws_identity', return_value={}), \
+                 patch.object(t, 'choose_mode', return_value='dryrun'), \
+                 patch.object(t, 'plan') as plan:
+                with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                    t.run_interactive(args)
+                plan.assert_not_called()
+            self.assertEqual(collision.read_bytes(), b'keep existing')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
