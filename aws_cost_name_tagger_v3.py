@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -38,6 +39,14 @@ MAX_CUR_LINE_BYTES = 1024 * 1024
 MAX_CUR_LOGICAL_RECORD_BYTES = 1024 * 1024
 MAX_CUR_FIELDS = 512
 MAX_CUR_DISTINCT_RESOURCES = 250_000
+# PR #14: explicit application-level AWS read budgets. These counts cover SDK
+# operation invocations by this process, not credential-provider network calls
+# or the wall-clock duration of an in-flight request.
+MAX_AWS_READ_CALLS = 500
+MAX_AWS_READ_ELAPSED_SECONDS = 120
+MAX_RDS_CLUSTER_PAGES = 25
+AWS_READ_CONNECT_TIMEOUT_SECONDS = 5
+AWS_READ_TIMEOUT_SECONDS = 10
 # Capture the actual OS implementation functions at import time: offline fault
 # injection tests intentionally mock os.link/unlink/mkdir/stat later.
 _REQUIRED_REPORT_DIR_FD_APIS = (os.open, os.mkdir, os.stat, os.link, os.unlink)
@@ -454,12 +463,100 @@ def cur_candidates(files: list[str], month: str | None, min_cost: float,
         "currency": sorted(provenance[k]["currency"])} for k, v in ranked]
 
 
+class AWSReadBudgetExceeded(RuntimeError):
+    """Application read budget exhausted; no partial result may be published."""
+
+
+class AWSReadBudget:
+    """Share one monotonic deadline and request budget across STS/IAM/resources."""
+
+    def __init__(self, *, max_calls=None, max_elapsed=None):
+        self.max_calls = MAX_AWS_READ_CALLS if max_calls is None else max_calls
+        self.max_elapsed = (MAX_AWS_READ_ELAPSED_SECONDS
+                            if max_elapsed is None else max_elapsed)
+        if self.max_calls < 1 or self.max_elapsed <= 0:
+            raise ValueError("AWS read limits must be positive")
+        self.started = time.monotonic()
+        self.calls = 0
+        self.exhausted = False
+
+    def require_remaining(self):
+        if self.exhausted:
+            raise AWSReadBudgetExceeded("AWS read budget already exhausted")
+        if time.monotonic() - self.started >= self.max_elapsed:
+            self.exhausted = True
+            raise AWSReadBudgetExceeded("AWS read elapsed-time budget exceeded")
+        if self.calls >= self.max_calls:
+            self.exhausted = True
+            raise AWSReadBudgetExceeded("AWS read API-call budget exceeded")
+
+    def before_read(self, service, operation):
+        self.require_remaining()
+        self.calls += 1
+
+
+class _BudgetedAWSClient:
+    """Restrict every explicit SDK operation to reads; count calls before use."""
+
+    def __init__(self, client, budget, service):
+        self._client = client
+        self._budget = budget
+        self._service = service
+
+    def __getattr__(self, operation):
+        # No generic forwarding of arbitrary callable client methods: doing
+        # so could silently expose a write path to the reviewer.
+        if operation.startswith("_") or operation in ("get_paginator", "get_waiter"):
+            raise AttributeError("Only direct, budgeted AWS reads are permitted")
+        attr = getattr(self._client, operation)
+        if not callable(attr):
+            return attr
+        if not operation.startswith(("describe_", "list_", "get_", "head_", "lookup_")):
+            raise RuntimeError("AWS operation outside the read allowlist")
+        def invoke(*args, **kwargs):
+            self._budget.before_read(self._service, operation)
+            return attr(*args, **kwargs)
+        return invoke
+
+
+class _BudgetedAWSSession:
+    """Use one-attempt SDK clients to make explicit invocation counts bounded."""
+
+    def __init__(self, session, budget=None):
+        self._session = session
+        self.read_budget = budget if budget is not None else AWSReadBudget()
+        self._clients = {}
+
+    def client(self, service, region_name=None, config=None):
+        self.read_budget.require_remaining()
+        key = (service, region_name)
+        if key not in self._clients:
+            from botocore.config import Config
+            # Setting total_max_attempts=1 disables SDK retry amplification.
+            # DNS, credential-provider refresh and in-flight socket deadlines
+            # are NOT hard-realtime guaranteed by this invocation budget.
+            safe_config = Config(
+                retries={"mode": "standard", "total_max_attempts": 1},
+                connect_timeout=AWS_READ_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=AWS_READ_TIMEOUT_SECONDS,
+            )
+            client = self._session.client(service, region_name=region_name,
+                                          config=safe_config)
+            self._clients[key] = _BudgetedAWSClient(client, self.read_budget, service)
+        return self._clients[key]
+
+
+def _budgeted_session(session):
+    return session if isinstance(session, _BudgetedAWSSession) else _BudgetedAWSSession(session)
+
+
 class Investigator:
     def __init__(self, session, account: str, retries: int = 3):
         from botocore.config import Config
-        self.session = session
+        self.session = _budgeted_session(session)
         self.account = account
-        self.config = Config(retries={"mode": "standard", "total_max_attempts": retries})
+        # The session wrapper enforces one SDK attempt per explicit API call.
+        self.config = Config(retries={"mode": "standard", "total_max_attempts": 1})
         self._clients = {}
         self._instances = {}
         self._volumes = {}
@@ -656,17 +753,22 @@ class Investigator:
                         # DbClusterResourceId with uppercase characters.
                         # AWS filters are case-sensitive: scan read-only pages
                         # and compare case-insensitively before proposing.
-                        results=[];marker=None
-                        for _ in range(1000):
+                        results=[];marker=None;seen_markers=set()
+                        for _ in range(MAX_RDS_CLUSTER_PAGES):
                             query={"MaxRecords":100}
-                            if marker:query["Marker"]=marker
+                            if marker is not None:query["Marker"]=marker
                             page=rds.describe_db_clusters(**query)
                             results.extend(c for c in page.get("DBClusters",[])
                                            if c.get("DbClusterResourceId","").casefold()==loc.casefold())
-                            marker=page.get("Marker")
-                            if not marker:break
+                            next_marker=page.get("Marker")
+                            if next_marker in (None, ""):
+                                break
+                            if not isinstance(next_marker, str) or next_marker in seen_markers:
+                                raise ValueError("RDS cluster pagination marker invalid or repeated")
+                            seen_markers.add(next_marker)
+                            marker=next_marker
                         else:
-                            raise ValueError("RDS cluster listing exceeded 1000 pages")
+                            raise ValueError("RDS cluster pagination page budget exceeded")
                     else:
                         results=rds.describe_db_clusters(DBClusterIdentifier=loc).get("DBClusters",[])
                     if len(results)!=1:raise ValueError("RDS cluster not found/unique")
@@ -874,6 +976,12 @@ class Investigator:
                 evidence += "; shared infrastructure: descriptive Name only, no product classification"
             res.update(status="proposed", proposed_name=candidate, confidence=confidence,evidence=evidence)
         except Exception as e:
+            if isinstance(e, AWSReadBudgetExceeded):
+                res.update(status="manual_review", proposed_name="", confidence="none",
+                           name_state="UNKNOWN", name_key_present=None,
+                           name_raw_value=None, existing_name="",
+                           evidence=f"{type(e).__name__}: {e}")
+                return res
             observed = name_state(tags)
             res.update(name_state=observed,
                        name_key_present="Name" in tags if isinstance(tags, dict) else None,
@@ -903,6 +1011,7 @@ def build_session(profile: str | None):
 
 
 def assert_account(session, expected: str):
+    session = _budgeted_session(session)
     actual=session.client("sts").get_caller_identity()["Account"]
     if actual!=expected:
         raise SystemExit(f"ABORT: AWS STS account {actual} != expected {expected}")
@@ -1154,6 +1263,7 @@ def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str
 
 def show_aws_identity(session, expected: str) -> dict:
     """Read-only STS + best-effort IAM GetRole; never assume role name proves privileges."""
+    session = _budgeted_session(session)
     ident = session.client("sts").get_caller_identity()
     actual, principal = ident.get("Account", ""), ident.get("Arn", "")
     if actual != expected:
@@ -1277,7 +1387,7 @@ def run_interactive(args):
     prepared_cur = _run_cur_snapshot(args)
     if not offer_remote_login(args):
         return
-    session = build_session(args.profile)
+    session = _budgeted_session(build_session(args.profile))
     ident = show_aws_identity(session, args.account)
     selected = choose_mode(args)
     if selected == "n":
@@ -1482,7 +1592,7 @@ def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
     else:
         _require_run_cur_unchanged(args, prepared_cur)
         month,candidates=prepared_cur[:2]
-    session = session or build_session(args.profile)
+    session = _budgeted_session(session if session is not None else build_session(args.profile))
     assert_account(session,args.account)
     investigator=Investigator(session,args.account, retries=3)
     records=[]
@@ -1504,11 +1614,14 @@ def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
             rec.update(status="manual_review",confidence="none",
                        evidence=f"Proposed Name collision in batch: {rec['proposed_name']}",proposed_name="")
             rec["proposal_id"]=proposal_key(rec)
+    if session.read_budget.exhausted:
+        raise AWSReadBudgetExceeded("AWS read budget exhausted: no partial candidate report")
     doc={"schema_version":2,"generated_at_utc":datetime.now(timezone.utc).isoformat(),"account":args.account,"period":month,
          "metric":"Usage/DiscountedUsage(RI effective)/SavingsPlanCoveredUsage(SP effective); excludes one-time fees, unallocated and no-resource charges",
          "min_cost_usd":args.min_cost,"count":len(records),"records":records}
     if prepared_cur is not None:
         _require_run_cur_unchanged(args, prepared_cur)
+    session.read_budget.require_remaining()
     ensure_private_output_dir(out.parent)
     # NEW-003 mitigation: create the complete file set in a mode-0700 staging
     # directory; publish only after every file has been flushed and fsync'd.
