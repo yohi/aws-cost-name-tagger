@@ -15,8 +15,8 @@
     },
     {
       "path": "aws_cost_name_tagger_v3.py",
-      "sha256": "d9de86e102af3a42c4a97717e17768c6f26590180cd273d06f7a0afcf66c46dc",
-      "bytes": 71024
+      "sha256": "b3e929f06d80ddb78ccbc3d0db1d34d58248159515bd2ead5f7964a7a1430698",
+      "bytes": 71259
     },
     {
       "path": "example_report_FORMAT_ONLY.csv",
