@@ -87,15 +87,22 @@ SUPPORTED_KINDS = frozenset((
 ))
 
 
-def tagmap(tags) -> dict:
-    """Validate AWS tag shapes before any Name-based proposal is considered.
+def tagmap(tags, *, expected_shape=None, allow_missing_non_name_value=False) -> dict:
+    """Validate the AWS API's response shape before Name candidate inference.
 
-    Both list[{"Key": str, "Value": str}] and dict[str, str] are accepted.
-    Missing values, non-string keys/values and exact duplicate list keys are
-    malformed even when they concern non-Name tags. Name case variants remain
-    UNKNOWN in name_state(). A missing service tag field is handled by the
-    caller's documented empty collection default, not by accepting None here.
+    AWS ingestion sites MUST pass expected_shape='list' or 'map'. None is
+    reserved for pure helpers examining an already-normalized tag collection.
+    Several list-tag service models allow an absent Value for non-Name keys;
+    only those call sites pass allow_missing_non_name_value=True. Such values
+    become '' and are never Name candidates. Missing Name Value remains
+    UNKNOWN, irrespective of the service model.
     """
+    if expected_shape not in (None, "list", "map"):
+        raise ValueError("Unsupported tag collection shape contract")
+    if expected_shape == "list" and not isinstance(tags, list):
+        raise ValueError("AWS tag response requires a list")
+    if expected_shape == "map" and not isinstance(tags, dict):
+        raise ValueError("AWS tag response requires a map")
     if isinstance(tags, dict):
         if any(not isinstance(key, str) or not key or not isinstance(value, str)
                for key, value in tags.items()):
@@ -107,14 +114,20 @@ def tagmap(tags) -> dict:
     for entry in tags:
         if (not isinstance(entry, dict)
                 or not isinstance(entry.get("Key"), str)
-                or not entry["Key"]
-                or "Value" not in entry
-                or not isinstance(entry["Value"], str)):
-            raise ValueError("AWS tag entry must have string Key and Value")
+                or not entry["Key"]):
+            raise ValueError("AWS tag entry has an invalid Key")
         key = entry["Key"]
         if key in result:
             raise ValueError("AWS tag key is duplicated")
-        result[key] = entry["Value"]
+        if "Value" not in entry:
+            if key.casefold() == "name" or not allow_missing_non_name_value:
+                raise ValueError("AWS tag Value is missing")
+            value = ""
+        else:
+            value = entry["Value"]
+            if not isinstance(value, str):
+                raise ValueError("AWS tag Value must be a string")
+        result[key] = value
     return result
 
 
@@ -331,7 +344,7 @@ class Investigator:
 
     def parent_instance(self, region, iid):
         obj=self.instance(region,iid)
-        parent_tags=tagmap(obj.get("Tags", []))
+        parent_tags=tagmap(obj.get("Tags", []), expected_shape="list", allow_missing_non_name_value=True)
         anchor=meaningful(name_of(parent_tags))
         if not anchor:
             raise ValueError(f"EC2 {iid} lacks a meaningful Name; cannot inherit")
@@ -341,7 +354,7 @@ class Investigator:
 
     def volume_owner(self, region, vid):
         vol=self.volume(region,vid)
-        direct=meaningful(name_of(vol.get("Tags",[])))
+        direct=meaningful(name_of(tagmap(vol.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)))
         if direct:
             return direct, f"EBS {vid} Name={direct}"
         attachments=vol.get("Attachments",[])
@@ -377,8 +390,8 @@ class Investigator:
         # VPC to carry a consistent naming namespace; mark MEDIUM.
         subnet=self.subnet(region,nat["SubnetId"])
         vpc=self.vpc(region,nat["VpcId"])
-        sn=meaningful(name_of(subnet.get("Tags",[])))
-        vn=meaningful(name_of(vpc.get("Tags",[])))
+        sn=meaningful(name_of(tagmap(subnet.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)))
+        vn=meaningful(name_of(tagmap(vpc.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)))
         if not sn or not vn or name_scope_prefix(sn)!=name_scope_prefix(vn):
             raise ValueError("NAT subnet and VPC Names have conflicting namespaces")
         az=subnet.get("AvailabilityZone", "")
@@ -395,7 +408,7 @@ class Investigator:
             if kind in ("instance","volume","snapshot","eni","eip","nat","endpoint"):
                 ec2=self.client("ec2",region)
                 if kind=="instance":
-                    o=self.instance(region,loc);tags=tagmap(o.get("Tags",[]))
+                    o=self.instance(region,loc);tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                     if name_state(tags) in NAME_CANDIDATE_STATES:
                         relations=[]
                         for key,label in (("aws:autoscaling:groupName","AutoScaling Group"),
@@ -412,7 +425,7 @@ class Investigator:
                         evidence=f"EC2 {loc} -> " + ", ".join(x[1] for x in relations)
                         confidence="medium"  # team should confirm a distinct EC2 role
                 if kind=="volume":
-                    o=self.volume(region,loc);tags=tagmap(o.get("Tags",[]))
+                    o=self.volume(region,loc);tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                     if name_state(tags) in NAME_CANDIDATE_STATES:
                         base,evidence=self.volume_owner(region,loc)
                         # EBS without Name inherits uniquely attached EC2's Name.
@@ -421,7 +434,7 @@ class Investigator:
                     snaps=ec2.describe_snapshots(SnapshotIds=[loc],OwnerIds=["self"]).get("Snapshots",[])
                     if len(snaps)!=1 or snaps[0].get("OwnerId")!=self.account:
                         raise ValueError("snapshot is absent or not owned by target account")
-                    o=snaps[0];tags=tagmap(o.get("Tags",[]))
+                    o=snaps[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                     if name_state(tags) in NAME_CANDIDATE_STATES:
                         src=o.get("VolumeId","")
                         if not src: raise ValueError("snapshot missing source volume")
@@ -431,7 +444,7 @@ class Investigator:
                 elif kind=="eni":
                     eni=ec2.describe_network_interfaces(NetworkInterfaceIds=[loc]).get("NetworkInterfaces",[])
                     if len(eni)!=1: raise ValueError("ENI not found")
-                    o=eni[0];tags=tagmap(o.get("TagSet",[]))
+                    o=eni[0];tags=tagmap(o.get("TagSet",[]), expected_shape="list", allow_missing_non_name_value=True)
                     if name_state(tags) in NAME_CANDIDATE_STATES:
                         iid=o.get("Attachment",{}).get("InstanceId")
                         if not iid: raise ValueError("ENI not attached to EC2 instance")
@@ -442,23 +455,23 @@ class Investigator:
                 elif kind=="eip":
                     obj=ec2.describe_addresses(AllocationIds=[loc]).get("Addresses",[])
                     if len(obj)!=1: raise ValueError("EIP not found")
-                    tags=tagmap(obj[0].get("Tags",[]))
+                    tags=tagmap(obj[0].get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                     if name_state(tags) in NAME_CANDIDATE_STATES:candidate,evidence,_=self.eip_owner(region,loc)
                 elif kind=="nat":
                     nat=ec2.describe_nat_gateways(NatGatewayIds=[loc]).get("NatGateways",[])
                     if len(nat)!=1:raise ValueError("NAT not found")
-                    o=nat[0];tags=tagmap(o.get("Tags",[]))
+                    o=nat[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                     if name_state(tags) in NAME_CANDIDATE_STATES:
                         candidate,evidence=self.nat_owner(region,o);confidence="medium"
                 elif kind=="endpoint":
                     end=ec2.describe_vpc_endpoints(VpcEndpointIds=[loc]).get("VpcEndpoints",[])
                     if len(end)!=1:raise ValueError("VPC endpoint not found")
-                    o=end[0];tags=tagmap(o.get("Tags",[]))
+                    o=end[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                     if name_state(tags) in NAME_CANDIDATE_STATES:
                         vpc=self.vpc(region,o["VpcId"])
-                        vn=meaningful(name_of(vpc.get("Tags",[])))
+                        vn=meaningful(name_of(tagmap(vpc.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)))
                         ss=[self.subnet(region,id) for id in o.get("SubnetIds",[])]
-                        names=[meaningful(name_of(s.get("Tags",[]))) for s in ss]
+                        names=[meaningful(name_of(tagmap(s.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True))) for s in ss]
                         if not vn or not names or any(n is None or name_scope_prefix(n)!=name_scope_prefix(vn) for n in names):
                             raise ValueError("VPC endpoint shared/ambiguous; require uniformly named VPC and all subnets")
                         svc=o["ServiceName"].split(".")[-1]
@@ -490,7 +503,7 @@ class Investigator:
                     o=results[0];arn=o["DBClusterArn"]
                     if loc.lower().startswith("cluster-") and loc.casefold()!=o.get("DbClusterResourceId","").casefold():
                         raise ValueError("CUR RDS cluster resource id differs from resolved cluster")
-                    tags=tagmap(rds.list_tags_for_resource(ResourceName=arn).get("TagList",[]))
+                    tags=tagmap(rds.list_tags_for_resource(ResourceName=arn).get("TagList",[]), expected_shape="list", allow_missing_non_name_value=True)
                     anchor=meaningful(o.get("DBClusterIdentifier",""))
                     if not anchor:
                         raise ValueError("RDS cluster identifier is opaque; inspect member names manually")
@@ -501,7 +514,7 @@ class Investigator:
                     results=rds.describe_db_instances(DBInstanceIdentifier=loc).get("DBInstances",[])
                     if len(results)!=1:raise ValueError("RDS DB instance not found")
                     o=results[0];arn=o["DBInstanceArn"]
-                    tags=tagmap(rds.list_tags_for_resource(ResourceName=arn).get("TagList",[]))
+                    tags=tagmap(rds.list_tags_for_resource(ResourceName=arn).get("TagList",[]), expected_shape="list", allow_missing_non_name_value=True)
                     identity=o["DBInstanceIdentifier"]
                     anchor=meaningful(identity)
                     cluster_id=o.get("DBClusterIdentifier")
@@ -513,7 +526,7 @@ class Investigator:
                         members={m.get("DBInstanceIdentifier") for m in parent.get("DBClusterMembers",[])}
                         if identity not in members:
                             raise ValueError("RDS instance not listed among DBClusterMembers; refusing inference")
-                        cluster_tags=tagmap(rds.list_tags_for_resource(ResourceName=parent["DBClusterArn"]).get("TagList",[]))
+                        cluster_tags=tagmap(rds.list_tags_for_resource(ResourceName=parent["DBClusterArn"]).get("TagList",[]), expected_shape="list", allow_missing_non_name_value=True)
                         parent_name=meaningful(name_of(cluster_tags)) or meaningful(parent["DBClusterIdentifier"])
                         if not parent_name:
                             raise ValueError("RDS parent cluster has no identifiable Name/identifier")
@@ -537,7 +550,7 @@ class Investigator:
             elif kind=="opensearch":
                 os=self.client("opensearch",region)
                 o=os.describe_domain(DomainName=loc)["DomainStatus"];arn=o["ARN"]
-                tags=tagmap(os.list_tags(ARN=arn).get("TagList",[]))
+                tags=tagmap(os.list_tags(ARN=arn).get("TagList",[]), expected_shape="list")
                 anchor=meaningful(o["DomainName"])
                 if not anchor:raise ValueError("OpenSearch domain lacks a structured namespace")
                 candidate=anchor if "opensearch" in anchor else suffix_name(anchor,"opensearch")
@@ -546,7 +559,7 @@ class Investigator:
                 c=self.client("elbv2",region)
                 o=c.describe_load_balancers(LoadBalancerArns=[loc]).get("LoadBalancers",[])
                 if len(o)!=1:raise ValueError("load balancer not found")
-                tags=tagmap(c.describe_tags(ResourceArns=[loc])["TagDescriptions"][0]["Tags"])
+                tags=tagmap(c.describe_tags(ResourceArns=[loc])["TagDescriptions"][0]["Tags"], expected_shape="list", allow_missing_non_name_value=True)
                 anchor=meaningful(o[0]["LoadBalancerName"])
                 if not anchor:raise ValueError("LB name lacks a structured namespace")
                 role={"application":"alb","network":"nlb","gateway":"gwlb"}.get(o[0]["Type"],"lb")
@@ -555,7 +568,7 @@ class Investigator:
             elif kind=="apigw_stage":
                 api_id,stage,arn=loc.split("|",2); c=self.client("apigateway",region)
                 o=c.get_rest_api(restApiId=api_id)
-                tags=tagmap(c.get_tags(resourceArn=arn).get("tags",{}))
+                tags=tagmap(c.get_tags(resourceArn=arn).get("tags",{}), expected_shape="map")
                 anchor=meaningful(o.get("name",""))
                 if not anchor:raise ValueError("REST API name lacks a structured namespace")
                 stage_anchor=meaningful(stage)
@@ -567,7 +580,7 @@ class Investigator:
             elif kind=="cloudfront":
                 c=self.client("cloudfront","us-east-1")
                 distid=loc.rsplit("/",1)[-1]
-                tags=tagmap(c.list_tags_for_resource(Resource=loc)["Tags"].get("Items",[]))
+                tags=tagmap(c.list_tags_for_resource(Resource=loc)["Tags"].get("Items",[]), expected_shape="list", allow_missing_non_name_value=True)
                 conf=c.get_distribution_config(Id=distid)["DistributionConfig"]
                 origins=[o["DomainName"].lower() for o in conf.get("Origins",{}).get("Items",[])]
                 # Origins are provenance, not arbitrary opaque distribution ids.
@@ -597,7 +610,7 @@ class Investigator:
                 confidence="medium" # CloudFront may be shared; require explicit approval
             elif kind=="athena_workgroup":
                 c=self.client("athena",region)
-                tags=tagmap(c.list_tags_for_resource(ResourceARN=loc).get("Tags",[]))
+                tags=tagmap(c.list_tags_for_resource(ResourceARN=loc).get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
                 wg=loc.rsplit("/",1)[-1];o=c.get_work_group(WorkGroup=wg)["WorkGroup"]
                 anchor=meaningful(o["Name"])
                 if not anchor:raise ValueError("Athena workgroup name is not product-identifiable")
@@ -607,7 +620,7 @@ class Investigator:
                 c=self.client("logs",region)
                 # Complete LogGroup ARN requires account; do NOT append :*.
                 arn=f"arn:aws:logs:{region}:{self.account}:log-group:{loc}"
-                tags=tagmap(c.list_tags_for_resource(resourceArn=arn).get("tags",{}))
+                tags=tagmap(c.list_tags_for_resource(resourceArn=arn).get("tags",{}), expected_shape="map")
                 anchor=meaningful(loc)
                 if anchor is None and loc.startswith("/aws/lambda/"):
                     function=loc.rsplit("/",1)[-1]
@@ -620,14 +633,14 @@ class Investigator:
                 res["write_target"]=arn
             elif kind=="lambda":
                 c=self.client("lambda",region);conf=c.get_function_configuration(FunctionName=loc)
-                tags=tagmap(c.list_tags(Resource=conf["FunctionArn"]).get("Tags",{}))
+                tags=tagmap(c.list_tags(Resource=conf["FunctionArn"]).get("Tags",{}), expected_shape="map")
                 anchor=meaningful(conf.get("FunctionName",""))
                 if not anchor:raise ValueError("Lambda function name lacks a structured namespace")
                 candidate=anchor if anchor.endswith("-lambda") else suffix_name(anchor,"lambda")
                 evidence=f"Lambda {loc} -> function={conf['FunctionName']}";res["write_target"]=conf["FunctionArn"]
             elif kind=="wafv2":
                 c=self.client("wafv2",region)
-                tags=tagmap(c.list_tags_for_resource(ResourceARN=loc).get("TagInfoForResource",{}).get("TagList",[]))
+                tags=tagmap(c.list_tags_for_resource(ResourceARN=loc).get("TagInfoForResource",{}).get("TagList",[]), expected_shape="list")
                 acl_name,idpart=loc.split("/webacl/",1)[-1].split("/",1)
                 scope="CLOUDFRONT" if ":global/" in loc else "REGIONAL"
                 webacl=c.get_web_acl(Name=acl_name,Scope=scope,Id=idpart)["WebACL"]
@@ -641,7 +654,7 @@ class Investigator:
                 c=self.client("s3","us-east-1")
                 # Neither CUR nor account ownership is sufficient: ExpectedBucketOwner is mandatory.
                 try:
-                    tags=tagmap(c.get_bucket_tagging(Bucket=loc,ExpectedBucketOwner=self.account).get("TagSet",[]))
+                    tags=tagmap(c.get_bucket_tagging(Bucket=loc,ExpectedBucketOwner=self.account).get("TagSet",[]), expected_shape="list")
                 except Exception as e:
                     code=getattr(e,"response",{}).get("Error",{}).get("Code","")
                     if code in ("NoSuchTagSet","NoSuchTagSetError"):
