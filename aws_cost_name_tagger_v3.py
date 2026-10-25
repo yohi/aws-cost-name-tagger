@@ -88,23 +88,33 @@ SUPPORTED_KINDS = frozenset((
 
 
 def tagmap(tags) -> dict:
-    """Normalize AWS tag shapes without silently converting malformed Name to EMPTY.
+    """Validate AWS tag shapes before any Name-based proposal is considered.
 
-    A missing Value or duplicate Name in a list is not an empty Name. Fail
-    closed: resolver reports UNKNOWN rather than proposing from corrupt data.
+    Both list[{"Key": str, "Value": str}] and dict[str, str] are accepted.
+    Missing values, non-string keys/values and exact duplicate list keys are
+    malformed even when they concern non-Name tags. Name case variants remain
+    UNKNOWN in name_state(). A missing service tag field is handled by the
+    caller's documented empty collection default, not by accepting None here.
     """
     if isinstance(tags, dict):
+        if any(not isinstance(key, str) or not key or not isinstance(value, str)
+               for key, value in tags.items()):
+            raise ValueError("AWS tag map must contain nonempty string keys and string values")
         return dict(tags)
     if not isinstance(tags, list):
         raise ValueError("AWS tag collection is missing or malformed")
     result = {}
     for entry in tags:
-        if not isinstance(entry, dict) or not isinstance(entry.get("Key"), str):
-            raise ValueError("AWS tag entry is malformed")
+        if (not isinstance(entry, dict)
+                or not isinstance(entry.get("Key"), str)
+                or not entry["Key"]
+                or "Value" not in entry
+                or not isinstance(entry["Value"], str)):
+            raise ValueError("AWS tag entry must have string Key and Value")
         key = entry["Key"]
-        if key.casefold() == "name" and ("Value" not in entry or key in result):
-            raise ValueError("Name tag value missing or duplicated")
-        result[key] = entry.get("Value")
+        if key in result:
+            raise ValueError("AWS tag key is duplicated")
+        result[key] = entry["Value"]
     return result
 
 
