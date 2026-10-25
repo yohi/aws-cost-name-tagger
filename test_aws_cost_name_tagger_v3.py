@@ -2536,6 +2536,26 @@ class AWSReadBudgetPR14Tests(unittest.TestCase):
             self.assertFalse(out.exists())
             self.assertEqual(list(root.iterdir()),[])
 
+    def test_pr14_exact_call_allowance_may_complete_without_extra_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            out=root/'complete.json'
+            args=t.parse_cli(['plan','--cur','unused.csv.gz','--account',ACCOUNT,
+                              '--output',str(out)])
+            wrapped=t._BudgetedAWSSession(
+                FakeSession({'sts':FakeSTS(),'ec2':FakeEC2()}),
+                t.AWSReadBudget(max_calls=3,max_elapsed=1000))
+            with patch.object(t,'cur_candidates',return_value=('2026-10',[
+                    row_for('volume',VOLUME)])):
+                doc=t.plan(args,session=wrapped)
+            self.assertEqual(wrapped.read_budget.calls,3)
+            self.assertFalse(wrapped.read_budget.exhausted)
+            self.assertEqual(doc['records'][0]['status'],'proposed')
+            self.assertTrue(out.is_file())
+            with self.assertRaisesRegex(t.AWSReadBudgetExceeded,'API-call'):
+                wrapped.client('sts').get_caller_identity()
+            self.assertTrue(wrapped.read_budget.exhausted)
+
     def test_pr14_expired_deadline_stops_before_first_api(self):
         ec2=FakeEC2()
         with patch.object(t.time,'monotonic',side_effect=(0.0,1.1)):
