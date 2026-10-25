@@ -15,8 +15,8 @@
     },
     {
       "path": "aws_cost_name_tagger_v3.py",
-      "sha256": "eef242713d4b42b850ca5bd1337232c715428c0ab0547f60004166fce6e724c8",
-      "bytes": 75320
+      "sha256": "1a9e9f27070a1cc441a2d4e6153dbe6920a6d3dbd04bc883404c057a447cb0b1",
+      "bytes": 75606
     },
     {
       "path": "example_report_FORMAT_ONLY.csv",
@@ -30,8 +30,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "7bfa5d8fea070cd9969fcb0d7daef799161077ba38f7b38598d05c8524890406",
-      "bytes": 15158
+      "sha256": "eaafd23a41974b703c54e5f8aa6b1c99bc9093eab5eb4df77225f0bd554ea33d",
+      "bytes": 15624
     },
     {
       "path": "SAFETY_REVIEW_RESULT.md",
@@ -40,8 +40,8 @@
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
-      "sha256": "712150ef35b734e7d95aabb272d33689493b45468c5a114bd5f3ccd3656df302",
-      "bytes": 104963
+      "sha256": "c7cf199b15ae173c77e60f9963b06dce1bfcdfbcde87834214dc6d3e8667e263",
+      "bytes": 105146
     },
     {
       "path": "test_results.txt",
