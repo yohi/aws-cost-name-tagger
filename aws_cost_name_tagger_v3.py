@@ -808,6 +808,19 @@ def safe_csv_row(row):
     return {key: safe_csv(value) for key, value in row.items()}
 
 
+def report_output_paths(output: Path, *, mode: str | None = None) -> list[Path]:
+    """Files that this invocation may create; never overwrite any of them."""
+    out = Path(output)
+    paths = [out, out.with_suffix(".review.csv"), out.with_suffix(".report.csv")]
+    if mode == "dryrun":
+        paths.append(out.with_suffix(".result.csv"))
+    elif mode == "y":
+        paths.extend((out.with_suffix(".selected.csv"),
+                      out.with_suffix(".audit.jsonl"),
+                      out.with_suffix(".audit.csv")))
+    return paths
+
+
 def preflight_outputs(paths):
     existing = [str(path) for path in paths if os.path.lexists(path)]
     if existing:
@@ -1008,8 +1021,11 @@ def run_interactive(args):
     """Human-controlled single entry point. Dryrun never invokes an AWS write API."""
     if not re.fullmatch(r"\d{12}", args.account):
         raise SystemExit("--account must be 12 digits")
-    # Validate output filesystem/permissions before any credential or AWS call.
-    preflight_report_destination(Path(args.output))
+    # Check the private directory AND pre-existing output collisions before
+    # login or STS. For a preselected mode, also check mode-specific files.
+    out = Path(args.output)
+    preflight_report_destination(out)
+    preflight_outputs(report_output_paths(out, mode=getattr(args, "mode", None)))
     # Validate local paths before offering credentials or any network access.
     for filename in args.cur:
         if not Path(filename).is_file():
@@ -1023,11 +1039,9 @@ def run_interactive(args):
         print("N: 中止しました。AWSタグ・ローカル計画は未変更です。")
         return
     print(f"選択されたモード: {selected}")
-    out = Path(args.output)
-    if selected == "y":
-        preflight_outputs([out.with_suffix(".selected.csv"),
-                           out.with_suffix(".audit.jsonl"),
-                           out.with_suffix(".audit.csv")])
+    # For interactive selections not known before login, check additional
+    # outputs immediately after mode selection and before plan generation.
+    preflight_outputs(report_output_paths(out, mode=selected))
     doc = plan(args, session=session, extra_mode="dryrun" if selected == "dryrun" else None)
     if selected == "dryrun":
         print(f"DRYRUN_REPORT={out.with_suffix('.result.csv')} | writes=0 | AWS変更なし")
@@ -1211,7 +1225,7 @@ def plan(args, session=None, *, extra_mode=None):
     review=out.with_suffix(".review.csv")
     report=out.with_suffix(".report.csv")
     result=out.with_suffix(".result.csv")
-    destinations=[out, review, report] + ([result] if extra_mode == "dryrun" else [])
+    destinations=report_output_paths(out, mode=extra_mode)
     # Validate the output trust contract before CUR parsing and AWS session use.
     preflight_report_destination(out)
     preflight_outputs(destinations)
