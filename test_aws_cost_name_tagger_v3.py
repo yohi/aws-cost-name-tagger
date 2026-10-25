@@ -1643,8 +1643,8 @@ class StrictMalformedTagsPRBTests(unittest.TestCase):
             {'Name': 'already-named', 'Product': []},
             {'Name': '', '': 'empty-key'},
             {None: 'bad'},
-            [{'Key': 'Product'}],
-            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other'}],
+            [{'Key': 'Name'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other', 'Value': 22}],
             [{'Key': 'Name', 'Value': ''}, {'Key': 'Other', 'Value': None}],
             [{'Key': 'Product', 'Value': 5}],
             [{'Key': '', 'Value': 'bad'}],
@@ -1662,10 +1662,10 @@ class StrictMalformedTagsPRBTests(unittest.TestCase):
 
     def test_prb_t04_ebs_invalid_other_tags_fail_closed_without_writes(self):
         variants = [
-            [{'Key': 'Product'}],
+            [{'Key': 'Name'}],
             [{'Key': 'Product', 'Value': 'a'},
              {'Key': 'Product', 'Value': 'b'}],
-            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'Other', 'Value': 99}],
             {'Name': '', 1: 'bad'},
             {'Name': '', 'Product': None},
             {'Name': 'already-named', 'Product': 7},
@@ -1698,7 +1698,7 @@ class StrictMalformedTagsPRBTests(unittest.TestCase):
             def list_tags_for_resource(self, ResourceName):
                 result = super().list_tags_for_resource(ResourceName)
                 if ResourceName == self.instance_arn:
-                    result['TagList'] = [{'Key': 'Product'}]
+                    result['TagList'] = [{'Key': 'Product', 'Value': None}]
                 return result
 
         rds = CorruptedRDS()
@@ -1727,7 +1727,7 @@ class StrictMalformedTagsPRBTests(unittest.TestCase):
             def describe_instances(self, InstanceIds):
                 result = super().describe_instances(InstanceIds)
                 result['Reservations'][0]['Instances'][0]['Tags'].append(
-                    {'Key': 'Product'}
+                    {'Key': 'Product', 'Value': None}
                 )
                 return result
 
@@ -1787,6 +1787,136 @@ class StrictMalformedTagsPRBTests(unittest.TestCase):
         ).resolve(row_for('rds_instance', alias.instance_id))
         self.assertEqual(result['status'], 'proposed')
         self.assertEqual(result['name_state'], 'ABSENT')
+
+
+
+
+class AWSServiceTagSchemaPRBR2Tests(unittest.TestCase):
+    """Model-aware list/map validation; optional non-Name values stay benign."""
+
+    def test_prb_r2_wrong_outer_shapes_never_propose(self):
+        class WrongEC2(FakeEC2):
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                result['Volumes'][0]['Tags'] = {'Product': 'app'}
+                return result
+
+        class WrongRDS(FakeRDS):
+            def list_tags_for_resource(self, ResourceName):
+                result = super().list_tags_for_resource(ResourceName)
+                if ResourceName == self.instance_arn:
+                    result['TagList'] = {'Product': 'app'}
+                return result
+
+        ec2 = WrongEC2()
+        rds = WrongRDS()
+        cf = FakeCloudFront()
+        cf.tags['Items'] = {'Product': 'app'}
+
+        class WrongAPI:
+            def get_rest_api(self, restApiId):
+                return {'name': 'scs2-prd-web-api'}
+            def get_tags(self, resourceArn):
+                return {'tags': [{'Key': 'Product', 'Value': 'app'}]}
+
+        arn = f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
+        api = 'api1|prod|arn:aws:apigateway:ap-northeast-1::/restapis/api1/stages/prod'
+        cases = [
+            (FakeSession({'ec2': ec2}), row_for('volume', VOLUME)),
+            (FakeSession({'rds': rds}), row_for('rds_instance', rds.instance_id)),
+            (FakeSession({'cloudfront': cf}), row_for('cloudfront', arn, 'us-east-1')),
+            (FakeSession({'apigateway': WrongAPI()}), row_for('apigw_stage', api)),
+        ]
+        for session, row in cases:
+            with self.subTest(kind=row['kind']):
+                result = t.Investigator(session, ACCOUNT).resolve(row)
+                self.assertEqual(result['status'], 'manual_review')
+                self.assertEqual(result['name_state'], 'UNKNOWN')
+                self.assertEqual(result['proposed_name'], '')
+        self.assertEqual(ec2.writes, [])
+
+    def test_prb_r2_optional_non_name_value_for_ec2_rds_cloudfront_elbv2(self):
+        class EC2Optional(FakeEC2):
+            def describe_volumes(self, VolumeIds):
+                result = super().describe_volumes(VolumeIds)
+                result['Volumes'][0]['Tags'] = [{'Key': 'Product'}]
+                return result
+
+        class RDSOptional(FakeRDS):
+            def list_tags_for_resource(self, ResourceName):
+                result = super().list_tags_for_resource(ResourceName)
+                if ResourceName == self.instance_arn:
+                    result['TagList'] = [{'Key': 'Product'}]
+                return result
+
+        class ELBOptional:
+            def describe_load_balancers(self, LoadBalancerArns):
+                return {'LoadBalancers': [{'LoadBalancerName': 'scs2-prd-web-alb',
+                                           'Type': 'application'}]}
+            def describe_tags(self, ResourceArns):
+                return {'TagDescriptions': [{'Tags': [{'Key': 'Product'}]}]}
+
+        ec2 = EC2Optional()
+        rds = RDSOptional()
+        cf = FakeCloudFront()
+        cf.tags['Items'] = [{'Key': 'Product'}]
+        arn = f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
+        elb_arn = (f'arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:'
+                   'loadbalancer/app/scs2-prd-web-alb/abc012')
+        cases = [
+            (FakeSession({'ec2': ec2}), row_for('volume', VOLUME)),
+            (FakeSession({'rds': rds}), row_for('rds_instance', rds.instance_id)),
+            (FakeSession({'cloudfront': cf}), row_for('cloudfront', arn, 'us-east-1')),
+            (FakeSession({'elbv2': ELBOptional()}), row_for('elbv2', elb_arn)),
+        ]
+        for session, row in cases:
+            with self.subTest(kind=row['kind']):
+                result = t.Investigator(session, ACCOUNT).resolve(row)
+                self.assertEqual(result['name_state'], 'ABSENT')
+                self.assertEqual(result['status'], 'proposed')
+                self.assertTrue(result['proposed_name'])
+        self.assertEqual(ec2.writes, [])
+
+    def test_prb_r2_optional_value_never_normalizes_missing_name(self):
+        for raw in (
+            [{'Key': 'Name'}],
+            [{'Key': 'Name', 'Value': ''}, {'Key': 'name'}],
+            [{'Key': 'Product'}, {'Key': 'Name'}],
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    t.tagmap(raw, expected_shape='list',
+                             allow_missing_non_name_value=True)
+        normalized = t.tagmap([{'Key': 'Product'}, {'Key': 'Environment', 'Value': 'prod'}],
+                              expected_shape='list', allow_missing_non_name_value=True)
+        self.assertEqual(normalized, {'Product': '', 'Environment': 'prod'})
+        self.assertEqual(t.name_state(normalized), 'ABSENT')
+        for service in ('opensearch', 'wafv2', 's3'):
+            with self.subTest(service=service):
+                with self.assertRaisesRegex(ValueError, 'Value is missing'):
+                    t.tagmap([{'Key': 'Product'}], expected_shape='list')
+
+    def test_prb_r2_parent_optional_vs_invalid_lineage(self):
+        class ParentOptional(FakeEC2):
+            def describe_instances(self, InstanceIds):
+                result = super().describe_instances(InstanceIds)
+                result['Reservations'][0]['Instances'][0]['Tags'].append({'Key': 'Product'})
+                return result
+
+        class ParentInvalid(FakeEC2):
+            def describe_instances(self, InstanceIds):
+                result = super().describe_instances(InstanceIds)
+                result['Reservations'][0]['Instances'][0]['Tags'] = {'Name': 'scs2-prd-web-ec2'}
+                return result
+
+        for fake, expected in [(ParentOptional(), 'proposed'),
+                               (ParentInvalid(), 'manual_review')]:
+            result = t.Investigator(FakeSession({'ec2': fake}), ACCOUNT).resolve(
+                row_for('volume', VOLUME))
+            self.assertEqual(result['status'], expected)
+            self.assertEqual(result['name_state'], 'ABSENT')
+            self.assertEqual(bool(result['proposed_name']), expected == 'proposed')
+            self.assertEqual(fake.writes, [])
 
 
 if __name__ == '__main__':
