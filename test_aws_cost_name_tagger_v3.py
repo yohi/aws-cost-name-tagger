@@ -664,18 +664,19 @@ class SafetyV32Tests(unittest.TestCase):
             t.create_audit_journal(p)
             t.journal_event(p,{'event':'write_blocked','proposal_id':'one'})
             t.journal_event(p,{'event':'write_blocked','proposal_id':'two'})
-            events=[json.loads(x) for x in p.read_text().splitlines()]
-            self.assertEqual([x['proposal_id'] for x in events],['one','two'])
-            with patch.object(t.os,'fsync',side_effect=OSError('disk failure')):
-                with self.assertRaises(OSError):
-                    t.journal_event(p,{'event':'write_blocked','proposal_id':'three'})
-            self.assertEqual(events[0]['proposal_id'],'one')
-            # Reload the actual file after the injected failure. An fsync error
-            # does not prove that the third event was rolled back or persisted.
-            observed_lines = p.read_bytes().splitlines()
-            self.assertGreaterEqual(len(observed_lines), 2)
+            original_bytes = p.read_bytes()
+            events = [json.loads(x) for x in original_bytes.splitlines()]
+            self.assertEqual([x['proposal_id'] for x in events], ['one', 'two'])
+            with patch.object(t.os, 'fsync', side_effect=OSError('disk failure')):
+                with self.assertRaisesRegex(OSError, 'disk failure'):
+                    t.journal_event(p, {'event': 'write_blocked', 'proposal_id': 'three'})
+            # The failure must not corrupt previously acknowledged bytes.
+            # Do not infer persistence (or rollback) of the third append.
+            observed_bytes = p.read_bytes()
+            self.assertTrue(observed_bytes.startswith(original_bytes))
             self.assertEqual(
-                [json.loads(line)['proposal_id'] for line in observed_lines[:2]],
+                [json.loads(line)['proposal_id'] for line in
+                 observed_bytes[:len(original_bytes)].splitlines()],
                 ['one', 'two'],
             )
 
@@ -1138,6 +1139,7 @@ class OfflineSafetyBoundariesR1Tests(unittest.TestCase):
     def test_t11_two_publishers_cannot_both_claim_same_destination(self):
         import os
         import threading
+        import time
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1166,17 +1168,33 @@ class OfflineSafetyBoundariesR1Tests(unittest.TestCase):
                 with lock:
                     results.append(result)
 
+            threads = [
+                # Daemon threads cannot keep the test process alive if an
+                # unexpected blocking syscall outlives the bounded joins.
+                threading.Thread(target=publisher, args=(source_a,), daemon=True),
+                threading.Thread(target=publisher, args=(source_b,), daemon=True),
+            ]
+            started = []
             with patch.object(t.os, 'link', side_effect=synchronized_link):
-                threads = [
-                    threading.Thread(target=publisher, args=(source_a,)),
-                    threading.Thread(target=publisher, args=(source_b,)),
-                ]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(timeout=15)
+                try:
+                    deadline = time.monotonic() + 12
+                    for thread in threads:
+                        thread.start()
+                        started.append(thread)
+                    for thread in started:
+                        thread.join(timeout=max(0, deadline - time.monotonic()))
+                finally:
+                    # Release waiters on abnormal start/timeout; even if a
+                    # worker blocks elsewhere, process shutdown stays bounded.
+                    barrier.abort()
+                    for thread in started:
+                        thread.join(timeout=0.5)
 
-            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertFalse(
+                any(thread.is_alive() for thread in started),
+                'publisher worker failed to stop within the bounded join',
+            )
+            self.assertEqual(len(started), 2)
             self.assertCountEqual(results, ['published', 'collision'])
             self.assertIn(
                 destination.read_bytes(),
@@ -1186,16 +1204,58 @@ class OfflineSafetyBoundariesR1Tests(unittest.TestCase):
             self.assertTrue(source_b.exists())
 
     def test_t13_destination_directory_fsync_failure_rolls_back_links(self):
+        import os
+        import stat
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / 'source.json'
             destination = root / 'published.json'
             t.write_json(source, {'status': 'staged'})
-            with patch.object(t.os, 'fsync', side_effect=OSError('forced directory fsync failure')):
+            expected_source_bytes = source.read_bytes()
+            directory_stat = root.stat()
+            original_link = os.link
+            original_fsync = os.fsync
+            original_unlink = os.unlink
+            linked = []
+            injected = []
+            cleaned = []
+
+            def tracked_link(src, dst, **kwargs):
+                result = original_link(src, dst, **kwargs)
+                linked.append(Path(dst).name)
+                return result
+
+            def fail_target_directory_fsync(fd):
+                fd_stat = os.fstat(fd)
+                is_destination_dir = (
+                    stat.S_ISDIR(fd_stat.st_mode)
+                    and (fd_stat.st_dev, fd_stat.st_ino)
+                    == (directory_stat.st_dev, directory_stat.st_ino)
+                )
+                if is_destination_dir:
+                    # A pre-link fsync must not satisfy this fault injection.
+                    self.assertEqual(linked, [destination.name])
+                    self.assertTrue(destination.is_file())
+                    injected.append(fd_stat.st_ino)
+                    raise OSError('forced directory fsync failure')
+                return original_fsync(fd)
+
+            def tracked_unlink(path, **kwargs):
+                result = original_unlink(path, **kwargs)
+                cleaned.append(Path(path).name)
+                return result
+
+            with patch.object(t.os, 'link', side_effect=tracked_link), \
+                 patch.object(t.os, 'fsync', side_effect=fail_target_directory_fsync), \
+                 patch.object(t.os, 'unlink', side_effect=tracked_unlink):
                 with self.assertRaisesRegex(OSError, 'forced directory fsync failure'):
                     t.publish_staged_reports([(source, destination)])
+            self.assertEqual(linked, [destination.name])
+            self.assertEqual(len(injected), 1)
+            self.assertEqual(cleaned, [destination.name])
             self.assertFalse(destination.exists())
-            self.assertTrue(source.exists())
+            self.assertEqual(source.read_bytes(), expected_source_bytes)
 
 
 if __name__ == '__main__':
