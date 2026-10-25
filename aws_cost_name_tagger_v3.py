@@ -27,6 +27,10 @@ from pathlib import Path
 
 DEFAULT_THRESHOLD = 10.0
 DEFAULT_REPORT_OUTPUT = ".aws-cost-name-tagger/name_tag_plan.json"
+# Capture the actual OS implementation functions at import time: offline fault
+# injection tests intentionally mock os.link/unlink/mkdir/stat later.
+_REQUIRED_REPORT_DIR_FD_APIS = (os.open, os.mkdir, os.stat, os.link, os.unlink)
+_REQUIRED_REPORT_NOFOLLOW_APIS = (os.stat, os.link)
 SCOPE_PATTERN = re.compile(r"^([a-z0-9][a-z0-9-]*?)-(prd|prod|stg|stage|dev|test|qa)(?=-|$)")
 OPAQUE = re.compile(r"^(?:i|vol|snap|eni|eipalloc|nat|vpce)-[0-9a-f]{8,}$")
 ID_PART = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
@@ -715,10 +719,9 @@ def _require_report_filesystem_support():
 
     if not all(hasattr(os, flag) for flag in ("O_DIRECTORY", "O_NOFOLLOW")):
         raise RuntimeError("Secure report publishing requires O_DIRECTORY and O_NOFOLLOW")
-    required_dir_fd = (os.open, os.mkdir, os.stat, os.link, os.unlink)
-    if any(fn not in os.supports_dir_fd for fn in required_dir_fd):
+    if any(fn not in os.supports_dir_fd for fn in _REQUIRED_REPORT_DIR_FD_APIS):
         raise RuntimeError("Secure report publishing requires dir_fd support for open/mkdir/stat/link/unlink")
-    if any(fn not in os.supports_follow_symlinks for fn in (os.stat, os.link)):
+    if any(fn not in os.supports_follow_symlinks for fn in _REQUIRED_REPORT_NOFOLLOW_APIS):
         raise RuntimeError("Secure report publishing requires nofollow stat/link support")
 
 
