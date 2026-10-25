@@ -35,6 +35,8 @@ MAX_CUR_FILES = 64
 MAX_CUR_ROWS = 2_000_000
 MAX_CUR_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_CUR_LINE_BYTES = 1024 * 1024
+MAX_CUR_LOGICAL_RECORD_BYTES = 1024 * 1024
+MAX_CUR_FIELDS = 512
 MAX_CUR_DISTINCT_RESOURCES = 250_000
 # Capture the actual OS implementation functions at import time: offline fault
 # injection tests intentionally mock os.link/unlink/mkdir/stat later.
@@ -266,9 +268,39 @@ def _scan_cur_file(path: Path, budget: dict, accept_row) -> tuple:
             raise ValueError("CUR input changed before opening")
         with gzip.GzipFile(fileobj=raw, mode="rb") as compressed:
             decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
+            # A CSV logical record can span thousands of short physical lines.
+            # Enforce both bounds BEFORE handing each line to csv.DictReader,
+            # rather than only checking the completed parsed row.
+            record_bytes = 0
+            delimiter_count = 0
+            in_quotes = False
+            at_field_start = True
+
+            def scan_delimiters(text):
+                nonlocal delimiter_count, in_quotes, at_field_start
+                pos = 0
+                while pos < len(text):
+                    char = text[pos]
+                    if in_quotes:
+                        if char == '"':
+                            if pos + 1 < len(text) and text[pos + 1] == '"':
+                                pos += 2
+                                continue
+                            in_quotes = False
+                    elif char == ',':
+                        delimiter_count += 1
+                        if delimiter_count >= MAX_CUR_FIELDS:
+                            raise ValueError("CUR logical record field limit exceeded")
+                        at_field_start = True
+                    elif char == '"' and at_field_start:
+                        in_quotes = True
+                        at_field_start = False
+                    elif char not in ('\r', '\n'):
+                        at_field_start = False
+                    pos += 1
 
             def bounded_lines():
-                nonlocal expanded
+                nonlocal expanded, record_bytes
                 while True:
                     chunk = compressed.readline(MAX_CUR_LINE_BYTES + 1)
                     if not chunk:
@@ -280,16 +312,35 @@ def _scan_cur_file(path: Path, budget: dict, accept_row) -> tuple:
                         raise ValueError("CUR physical line size limit exceeded")
                     expanded += len(chunk)
                     budget["bytes"] += len(chunk)
+                    record_bytes += len(chunk)
                     if budget["bytes"] > MAX_CUR_UNCOMPRESSED_BYTES:
                         raise ValueError("CUR decompressed byte budget exceeded")
+                    if record_bytes > MAX_CUR_LOGICAL_RECORD_BYTES:
+                        raise ValueError("CUR logical record byte limit exceeded")
                     checksum.update(chunk)
-                    yield decoder.decode(chunk, final=False)
+                    decoded = decoder.decode(chunk, final=False)
+                    scan_delimiters(decoded)
+                    yield decoded
 
             reader = csv.DictReader(bounded_lines())
             header = reader.fieldnames
-            if header is not None and (len(header) != len(set(header))
-                                        or any(not h for h in header)):
+            if header is None:
+                raise ValueError("CUR CSV header is missing")
+            if len(header) != len(set(header)) or any(not h for h in header):
                 raise ValueError("CUR header has duplicate or empty column names")
+            required = {
+                "bill_billing_period_start_date", "line_item_usage_account_id",
+                "line_item_line_item_type", "line_item_resource_id",
+                "line_item_unblended_cost", "product_region_code",
+                "line_item_product_code", "line_item_currency_code",
+            }
+            if not required.issubset(header):
+                raise ValueError("CUR header missing required columns: " +
+                                 ", ".join(sorted(required - set(header))))
+            record_bytes = 0
+            delimiter_count = 0
+            in_quotes = False
+            at_field_start = True
             for row in reader:
                 count += 1
                 budget["rows"] += 1
@@ -298,6 +349,10 @@ def _scan_cur_file(path: Path, budget: dict, accept_row) -> tuple:
                 if None in row or any(value is None for value in row.values()):
                     raise ValueError("CUR record has extra or missing fields")
                 accept_row(row)
+                record_bytes = 0
+                delimiter_count = 0
+                in_quotes = False
+                at_field_start = True
     after = path.stat()
     if (_cur_file_identity(before) != _cur_file_identity(after)
             or _cur_file_identity(opened) != _cur_file_identity(after)):
@@ -1168,6 +1223,39 @@ def choose_mode(args) -> str:
     return selected
 
 
+def _cur_kind_filter(args):
+    kinds = getattr(args, "kinds", None)
+    if kinds is None:
+        return None
+    result = {kind.strip() for kind in kinds.split(",") if kind.strip()}
+    if not result:
+        raise ValueError("--kinds must include at least one supported kind")
+    unknown = result - SUPPORTED_KINDS
+    if unknown:
+        raise ValueError(f"Unsupported --kinds value(s): {', '.join(sorted(unknown))}")
+    return result
+
+
+def _run_cur_snapshot(args):
+    """Produce an immutable candidate batch before credentials or AWS calls."""
+    paths = [Path(path) for path in args.cur]
+    initial = tuple(_cur_file_identity(path.stat()) for path in paths)
+    month, candidates = cur_candidates(
+        args.cur, args.month, args.min_cost, args.max_resources, args.account,
+        kind_filter=_cur_kind_filter(args))
+    final = tuple(_cur_file_identity(path.stat()) for path in paths)
+    if initial != final:
+        raise ValueError("CUR input changed during pre-login validation")
+    return (month, candidates, final)
+
+
+def _require_run_cur_unchanged(args, snapshot):
+    paths = [Path(path) for path in args.cur]
+    current = tuple(_cur_file_identity(path.stat()) for path in paths)
+    if current != snapshot[2]:
+        raise ValueError("CUR input changed since pre-login validation")
+
+
 def run_interactive(args):
     """Human-controlled single entry point. Dryrun never invokes an AWS write API."""
     if not re.fullmatch(r"\d{12}", args.account):
@@ -1181,6 +1269,9 @@ def run_interactive(args):
     for filename in args.cur:
         if not Path(filename).is_file():
             raise SystemExit(f"CUR missing: {filename}")
+    # Validate the *entire* CUR before login/STS/IAM and retain the frozen
+    # candidate result. Never silently rebuild it after AWS access.
+    prepared_cur = _run_cur_snapshot(args)
     if not offer_remote_login(args):
         return
     session = build_session(args.profile)
@@ -1193,7 +1284,9 @@ def run_interactive(args):
     # For interactive selections not known before login, check additional
     # outputs immediately after mode selection and before plan generation.
     preflight_outputs(report_output_paths(out, mode=selected))
-    doc = plan(args, session=session, extra_mode="dryrun" if selected == "dryrun" else None)
+    _require_run_cur_unchanged(args, prepared_cur)
+    doc = plan(args, session=session, extra_mode="dryrun" if selected == "dryrun" else None,
+               prepared_cur=prepared_cur)
     if selected == "dryrun":
         print(f"DRYRUN_REPORT={out.with_suffix('.result.csv')} | writes=0 | AWS変更なし")
         return
@@ -1369,7 +1462,7 @@ def write_review_csv(path: Path, records: list[dict]):
         os.fsync(fh.fileno())
 
 
-def plan(args, session=None, *, extra_mode=None):
+def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
     if not re.fullmatch(r"\d{12}",args.account):raise SystemExit("--account must be 12 digits")
     if not args.cur:raise SystemExit("Provide at least one --cur .csv.gz file")
     out=Path(args.output)
@@ -1380,15 +1473,12 @@ def plan(args, session=None, *, extra_mode=None):
     # Validate the output trust contract before CUR parsing and AWS session use.
     preflight_report_destination(out)
     preflight_outputs(destinations)
-    kind_filter = None
-    if args.kinds is not None:
-        kind_filter = {kind.strip() for kind in args.kinds.split(",") if kind.strip()}
-        if not kind_filter:
-            raise ValueError("--kinds must include at least one supported kind")
-        unknown = kind_filter - SUPPORTED_KINDS
-        if unknown:
-            raise ValueError(f"Unsupported --kinds value(s): {', '.join(sorted(unknown))}")
-    month,candidates=cur_candidates(args.cur,args.month,args.min_cost,args.max_resources,args.account,kind_filter=kind_filter)
+    kind_filter = _cur_kind_filter(args)
+    if prepared_cur is None:
+        month,candidates=cur_candidates(args.cur,args.month,args.min_cost,args.max_resources,args.account,kind_filter=kind_filter)
+    else:
+        _require_run_cur_unchanged(args, prepared_cur)
+        month,candidates=prepared_cur[:2]
     session = session or build_session(args.profile)
     assert_account(session,args.account)
     investigator=Investigator(session,args.account, retries=3)
@@ -1414,6 +1504,8 @@ def plan(args, session=None, *, extra_mode=None):
     doc={"schema_version":2,"generated_at_utc":datetime.now(timezone.utc).isoformat(),"account":args.account,"period":month,
          "metric":"Usage/DiscountedUsage(RI effective)/SavingsPlanCoveredUsage(SP effective); excludes one-time fees, unallocated and no-resource charges",
          "min_cost_usd":args.min_cost,"count":len(records),"records":records}
+    if prepared_cur is not None:
+        _require_run_cur_unchanged(args, prepared_cur)
     ensure_private_output_dir(out.parent)
     # NEW-003 mitigation: create the complete file set in a mode-0700 staging
     # directory; publish only after every file has been flushed and fsync'd.
