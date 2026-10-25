@@ -2401,5 +2401,81 @@ class CURR1LimitedCorrectionsTests(unittest.TestCase):
                         t.cur_candidates([str(path)],None,0,3,ACCOUNT)
 
 
+
+
+class CURStrictCSVPR13R3Tests(unittest.TestCase):
+    """FND-13-R2-001: malformed EOF quoting must fail before any AWS access."""
+
+    COLUMNS = (
+        'bill_billing_period_start_date', 'line_item_usage_account_id',
+        'line_item_line_item_type', 'line_item_resource_id',
+        'line_item_unblended_cost', 'product_region_code',
+        'line_item_currency_code', 'line_item_product_code',
+    )
+
+    def write_unclosed(self, path, trailer):
+        # Keep gzip, mandatory header, cost and eight CSV columns valid; the
+        # ONLY defect is that the final quoted product field is unterminated.
+        with gzip.open(path, 'wt', encoding='utf-8', newline='') as fh:
+            csv.writer(fh).writerow(self.COLUMNS)
+            fh.write(f'2026-10-01,{ACCOUNT},Usage,{VOLUME},12.5,{REGION},USD,"')
+            fh.write(trailer)
+        return path
+
+    def test_r3_unclosed_quote_and_escaped_quote_at_eof_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for trailer in ('AmazonEC2', 'AmazonEC2""', 'multi\nline'):
+                with self.subTest(trailer=trailer):
+                    cur = self.write_unclosed(root/'unterminated.csv.gz', trailer)
+                    with self.assertRaises(csv.Error):
+                        t.cur_candidates([str(cur)], '2026-10', 0, 10, ACCOUNT)
+
+    def test_r3_corrupt_cur_plan_and_run_refuse_aws_and_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cur = self.write_unclosed(root/'unclosed.csv.gz', 'AmazonEC2')
+            for command, mode in (('plan', None), ('run', 'dryrun'), ('run', 'y')):
+                with self.subTest(command=command, mode=mode):
+                    output = root/f'{command}-{mode or "none"}'/ 'plan.json'
+                    argv = [command, '--cur', str(cur), '--account', ACCOUNT,
+                            '--month', '2026-10', '--output', str(output)]
+                    if command == 'run':
+                        argv += ['--login', 'skip', '--mode', mode]
+                    args = t.parse_cli(argv)
+                    with patch.object(t, 'offer_remote_login') as login, \
+                         patch.object(t, 'build_session') as session, \
+                         patch.object(t, 'show_aws_identity') as identity, \
+                         patch.object(t, 'assert_account') as guard, \
+                         patch.object(t, 'Investigator') as investigator, \
+                         patch.object(t, 'publish_staged_reports') as publish:
+                        with self.assertRaises(csv.Error):
+                            (t.run_interactive(args) if command == 'run'
+                             else t.plan(args))
+                        for mock in (login, session, identity, guard,
+                                     investigator, publish):
+                            mock.assert_not_called()
+                    self.assertFalse(output.exists())
+                    self.assertEqual(list(output.parent.iterdir()), [])
+
+    def test_r3_valid_multiline_csv_and_doubled_quotes_are_preserved(self):
+        # csv.writer produces doubled quotes and a quoted multi-line field,
+        # which strict=True must still accept without changing its contents.
+        value = 'Amazon "EC2", reserved\nnext "line", billed'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'valid.csv.gz'
+            with gzip.open(path, 'wt', encoding='utf-8', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(self.COLUMNS)
+                writer.writerow(['2026-10-01', ACCOUNT, 'Usage', VOLUME,
+                                 '12.5', REGION, 'USD', value])
+            period, candidates = t.cur_candidates(
+                [str(path)], '2026-10', 0, 10, ACCOUNT)
+            self.assertEqual(period, '2026-10')
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]['source_services'], [value])
+            self.assertEqual(candidates[0]['effective_usage_cost_usd'], 12.5)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
