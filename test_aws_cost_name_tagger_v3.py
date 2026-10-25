@@ -1258,5 +1258,377 @@ class OfflineSafetyBoundariesR1Tests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), expected_source_bytes)
 
 
+
+
+class ReportPublishSafetyPRCTests(unittest.TestCase):
+    """Offline PR-C contracts: source type, private directories and cleanup."""
+
+    def test_t09_symlink_fifo_and_directory_sources_are_not_published(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.json'
+            t.write_json(source, {'report': 'source'})
+            symlink = root / 'alias.json'
+            symlink.symlink_to(source)
+            directory = root / 'directory-source'
+            directory.mkdir()
+            candidates = [('symlink', symlink), ('directory', directory)]
+            if hasattr(os, 'mkfifo'):
+                fifo = root / 'fifo-source'
+                os.mkfifo(fifo)
+                candidates.append(('fifo', fifo))
+            for label, invalid_source in candidates:
+                with self.subTest(source_type=label):
+                    destination = root / f'dest-{label}.json'
+                    with self.assertRaisesRegex(ValueError, 'non-regular staged report'):
+                        t.publish_staged_reports([(invalid_source, destination)])
+                    self.assertFalse(destination.exists())
+            self.assertTrue(symlink.is_symlink())
+            self.assertEqual(source.read_bytes(), b'{\n  "report": "source"\n}\n')
+
+    def test_t15_untrusted_output_or_staging_directory_refused(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.json'
+            t.write_json(source, {'report': 'source'})
+            output_dir = root / 'untrusted-output'
+            output_dir.mkdir()
+            output_dir.chmod(0o777)
+            try:
+                with self.assertRaisesRegex(PermissionError, 'destination'):
+                    t.publish_staged_reports([(source, output_dir / 'report.json')])
+                self.assertFalse((output_dir / 'report.json').exists())
+            finally:
+                output_dir.chmod(0o700)
+
+            staging_dir = root / 'untrusted-stage'
+            staging_dir.mkdir()
+            staged_source = staging_dir / 'source.json'
+            t.write_json(staged_source, {'report': 'source'})
+            staging_dir.chmod(0o777)
+            try:
+                with self.assertRaisesRegex(PermissionError, 'staging'):
+                    t.publish_staged_reports([(staged_source, root / 'report.json')])
+                self.assertFalse((root / 'report.json').exists())
+            finally:
+                staging_dir.chmod(0o700)
+            self.assertEqual(source.read_bytes(), staged_source.read_bytes())
+
+    def test_t14_cleanup_failure_preserves_original_and_continues(self):
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = [root / f'source-{i}.json' for i in range(3)]
+            outputs = [root / f'destination-{i}.json' for i in range(3)]
+            for index, source in enumerate(sources):
+                t.write_json(source, {'index': index})
+            original_fsync = os.fsync
+            original_unlink = os.unlink
+            root_meta = root.stat()
+            attempted = []
+
+            def fail_destination_directory_fsync(fd):
+                info = os.fstat(fd)
+                if (stat.S_ISDIR(info.st_mode)
+                        and (info.st_dev, info.st_ino) ==
+                        (root_meta.st_dev, root_meta.st_ino)):
+                    raise OSError('primary directory fsync failure')
+                return original_fsync(fd)
+
+            def fail_one_unlink(name, **kwargs):
+                attempted.append(Path(name).name)
+                if Path(name).name == outputs[1].name:
+                    raise OSError('secondary cleanup failure')
+                return original_unlink(name, **kwargs)
+
+            with patch.object(t.os, 'fsync', side_effect=fail_destination_directory_fsync), \
+                 patch.object(t.os, 'unlink', side_effect=fail_one_unlink):
+                with self.assertRaises(t.ReportPublishCleanupError) as cm:
+                    t.publish_staged_reports(list(zip(sources, outputs)))
+            error = cm.exception
+            self.assertIsInstance(error.primary_error, OSError)
+            self.assertIn('primary directory fsync failure', str(error.primary_error))
+            self.assertEqual(len(error.cleanup_errors), 1)
+            self.assertEqual(error.cleanup_errors[0][0], outputs[1].name)
+            self.assertIn('secondary cleanup failure', str(error.cleanup_errors[0][1]))
+            self.assertEqual(error.possibly_remaining, (str(outputs[1]),))
+            self.assertEqual(attempted, [p.name for p in reversed(outputs)])
+            self.assertFalse(outputs[0].exists())
+            self.assertTrue(outputs[1].exists())
+            self.assertFalse(outputs[2].exists())
+            self.assertEqual(len([p for p in sources if p.exists()]), 3)
+
+
+
+class ReportPublishCompatibilityR1Tests(unittest.TestCase):
+    """Approved Ubuntu/private-output contract and pre-AWS fail-closed checks."""
+
+    def test_t15_a_public_output_rejected_before_cur_or_aws_for_plan_and_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            public = root / 'public'
+            public.mkdir(mode=0o755)
+            public.chmod(0o755)
+            output = public / 'name_tag_plan.json'
+            args = t.parse_cli([
+                'plan', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--output', str(output),
+            ])
+            with patch.object(t, 'cur_candidates') as cur, \
+                 patch.object(t, 'build_session') as session:
+                with self.assertRaisesRegex(PermissionError, 'destination'):
+                    t.plan(args)
+                cur.assert_not_called()
+                session.assert_not_called()
+
+            run_args = t.parse_cli([
+                'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--login', 'skip', '--mode', 'dryrun', '--output', str(output),
+            ])
+            with patch.object(t, 'offer_remote_login') as login, \
+                 patch.object(t, 'build_session') as session:
+                with self.assertRaisesRegex(PermissionError, 'destination'):
+                    t.run_interactive(run_args)
+                login.assert_not_called()
+                session.assert_not_called()
+            self.assertEqual(list(public.iterdir()), [])
+
+    def test_t15_b_default_private_output_and_explicit_0700_are_usable(self):
+        import os
+        import stat
+
+        for command in ('plan', 'run'):
+            args = t.parse_cli([command, '--cur', 'unused.csv.gz', '--account', ACCOUNT])
+            self.assertEqual(args.output, '.aws-cost-name-tagger/name_tag_plan.json')
+        with tempfile.TemporaryDirectory() as tmp:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                args = t.parse_cli([
+                    'plan', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                ])
+                with patch.object(t, 'cur_candidates', return_value=('2026-10', [])), \
+                     patch.object(t, 'assert_account'):
+                    t.plan(args, session=FakeSession({}))
+                out = Path(args.output)
+                self.assertTrue(out.is_file())
+                self.assertEqual(stat.S_IMODE(out.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+                self.assertTrue(out.with_suffix('.review.csv').is_file())
+                self.assertTrue(out.with_suffix('.report.csv').is_file())
+            finally:
+                os.chdir(original_cwd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination_dir = root / 'existing-private'
+            destination_dir.mkdir(mode=0o700)
+            destination_dir.chmod(0o700)
+            source = root / 'source.json'
+            t.write_json(source, {'ok': True})
+            destination = destination_dir / 'published.json'
+            t.publish_staged_reports([(source, destination)])
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+
+    def test_t15_c_owner_mismatch_denied_before_publication(self):
+        import os
+        import stat
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'not-owned.json'
+            original_fstat = os.fstat
+
+            def foreign_directory(fd):
+                record = original_fstat(fd)
+                if stat.S_ISDIR(record.st_mode):
+                    return SimpleNamespace(st_uid=os.geteuid() + 1,
+                                           st_mode=record.st_mode)
+                return record
+
+            with patch.object(t.os, 'fstat', side_effect=foreign_directory):
+                with self.assertRaisesRegex(PermissionError, 'owned by'):
+                    t.preflight_report_destination(out)
+            self.assertFalse(out.exists())
+
+    def test_t15_d_unsupported_macos_refused_before_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = t.parse_cli([
+                'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--login', 'skip', '--mode', 'dryrun',
+                '--output', str(Path(tmp) / 'result.json'),
+            ])
+            with patch.object(t.sys, 'platform', 'darwin'), \
+                 patch.object(t, 'offer_remote_login') as login, \
+                 patch.object(t, 'build_session') as session:
+                with self.assertRaisesRegex(RuntimeError, 'only on Ubuntu Linux'):
+                    t.run_interactive(args)
+                login.assert_not_called()
+                session.assert_not_called()
+            self.assertFalse((Path(tmp) / 'result.json').exists())
+
+    def test_t09_b_missing_posix_capabilities_fail_before_aws_or_local_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'future' / 'result.json'
+            args = t.parse_cli([
+                'plan', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--output', str(out),
+            ])
+            for capability, function in (
+                ('supports_dir_fd', t.os.stat),
+                ('supports_follow_symlinks', t.os.link),
+            ):
+                with self.subTest(capability=capability, function=function.__name__):
+                    saved = set(getattr(t.os, capability))
+                    saved.discard(function)
+                    with patch.object(t.os, capability, saved), \
+                         patch.object(t, 'cur_candidates') as cur, \
+                         patch.object(t, 'build_session') as session:
+                        with self.assertRaisesRegex(RuntimeError, 'requires'):
+                            t.plan(args)
+                        cur.assert_not_called()
+                        session.assert_not_called()
+                    self.assertFalse(out.parent.exists())
+
+    def test_t14_b_multiple_cleanup_errors_preserve_primary_and_all_attempts(self):
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = [root / f'source-{i}.json' for i in range(4)]
+            outputs = [root / f'destination-{i}.json' for i in range(4)]
+            for index, source in enumerate(sources):
+                t.write_json(source, {'index': index})
+            original_fsync, original_unlink = os.fsync, os.unlink
+            root_meta = root.stat()
+            attempted = []
+            failed = {outputs[0].name, outputs[2].name}
+
+            def fail_destination_fsync(fd):
+                info = os.fstat(fd)
+                if (stat.S_ISDIR(info.st_mode)
+                        and (info.st_dev, info.st_ino) ==
+                        (root_meta.st_dev, root_meta.st_ino)):
+                    raise OSError('primary fsync failure')
+                return original_fsync(fd)
+
+            def fail_two_unlinks(name, **kwargs):
+                attempted.append(Path(name).name)
+                if Path(name).name in failed:
+                    raise OSError(f"cleanup failure: {Path(name).name}")
+                return original_unlink(name, **kwargs)
+
+            with patch.object(t.os, 'fsync', side_effect=fail_destination_fsync), \
+                 patch.object(t.os, 'unlink', side_effect=fail_two_unlinks):
+                with self.assertRaises(t.ReportPublishCleanupError) as captured:
+                    t.publish_staged_reports(list(zip(sources, outputs)))
+
+            error = captured.exception
+            self.assertIn('primary fsync failure', str(error.primary_error))
+            self.assertIs(error.__cause__, error.primary_error)
+            self.assertEqual(len(error.cleanup_errors), 2)
+            self.assertEqual({name for name, _ in error.cleanup_errors}, failed)
+            self.assertEqual({str(p) for p in outputs if p.exists()},
+                             set(error.possibly_remaining))
+            self.assertEqual(attempted, [p.name for p in reversed(outputs)])
+            self.assertTrue(all(p.exists() for p in sources))
+
+
+
+
+class PreLoginCollisionPRCR2Tests(unittest.TestCase):
+    """FND-11-R2-001: reject local collisions before run login or STS."""
+
+    def test_run_existing_common_outputs_refused_before_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / 'plan.json'
+            for existing in (out, out.with_suffix('.review.csv'),
+                             out.with_suffix('.report.csv')):
+                with self.subTest(existing=existing.name):
+                    existing.write_bytes(b'previous report - must remain unchanged')
+                    args = t.parse_cli([
+                        'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                        '--login', 'skip', '--mode', 'dryrun', '--output', str(out),
+                    ])
+                    with patch.object(t, 'offer_remote_login') as login, \
+                         patch.object(t, 'build_session') as session, \
+                         patch.object(t, 'show_aws_identity') as identity, \
+                         patch.object(t, 'plan') as plan:
+                        with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                            t.run_interactive(args)
+                        login.assert_not_called()
+                        session.assert_not_called()
+                        identity.assert_not_called()
+                        plan.assert_not_called()
+                    self.assertEqual(existing.read_bytes(),
+                                     b'previous report - must remain unchanged')
+                    existing.unlink()
+
+    def test_run_preselected_mode_outputs_refused_before_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / 'plan.json'
+            mode_cases = (
+                ('dryrun', out.with_suffix('.result.csv')),
+                ('y', out.with_suffix('.selected.csv')),
+                ('y', out.with_suffix('.audit.jsonl')),
+                ('y', out.with_suffix('.audit.csv')),
+            )
+            for mode, existing in mode_cases:
+                with self.subTest(mode=mode, existing=existing.name):
+                    # A dangling symlink is a collision too: lexists, not exists.
+                    outside = root / 'missing-external'
+                    existing.symlink_to(outside)
+                    args = t.parse_cli([
+                        'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                        '--login', 'skip', '--mode', mode, '--output', str(out),
+                    ])
+                    with patch.object(t, 'offer_remote_login') as login, \
+                         patch.object(t, 'build_session') as session, \
+                         patch.object(t, 'show_aws_identity') as identity, \
+                         patch.object(t, 'plan') as plan:
+                        with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                            t.run_interactive(args)
+                        login.assert_not_called()
+                        session.assert_not_called()
+                        identity.assert_not_called()
+                        plan.assert_not_called()
+                    self.assertTrue(existing.is_symlink())
+                    self.assertFalse(outside.exists())
+                    existing.unlink()
+
+    def test_interactive_choice_checks_new_mode_outputs_before_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / 'plan.json'
+            collision = out.with_suffix('.result.csv')
+            collision.write_bytes(b'keep existing')
+            args = t.parse_cli([
+                'run', '--cur', 'unused.csv.gz', '--account', ACCOUNT,
+                '--login', 'skip', '--output', str(out),
+            ])
+            # The mode is unknown until after login; the common outputs are
+            # still checked pre-login, and mode-specific outputs pre-plan.
+            args.cur = [str(root / 'input.csv.gz')]
+            (root / 'input.csv.gz').write_bytes(b'placeholder')
+            with patch.object(t, 'offer_remote_login', return_value=True), \
+                 patch.object(t, 'build_session', return_value=object()), \
+                 patch.object(t, 'show_aws_identity', return_value={}), \
+                 patch.object(t, 'choose_mode', return_value='dryrun'), \
+                 patch.object(t, 'plan') as plan:
+                with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                    t.run_interactive(args)
+                plan.assert_not_called()
+            self.assertEqual(collision.read_bytes(), b'keep existing')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

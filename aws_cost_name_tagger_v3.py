@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_THRESHOLD = 10.0
+DEFAULT_REPORT_OUTPUT = ".aws-cost-name-tagger/name_tag_plan.json"
+# Capture the actual OS implementation functions at import time: offline fault
+# injection tests intentionally mock os.link/unlink/mkdir/stat later.
+_REQUIRED_REPORT_DIR_FD_APIS = (os.open, os.mkdir, os.stat, os.link, os.unlink)
+_REQUIRED_REPORT_NOFOLLOW_APIS = (os.stat, os.link)
 SCOPE_PATTERN = re.compile(r"^([a-z0-9][a-z0-9-]*?)-(prd|prod|stg|stage|dev|test|qa)(?=-|$)")
 OPAQUE = re.compile(r"^(?:i|vol|snap|eni|eipalloc|nat|vpce)-[0-9a-f]{8,}$")
 ID_PART = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
@@ -693,6 +699,32 @@ def assert_account(session, expected: str):
         raise SystemExit(f"ABORT: AWS STS account {actual} != expected {expected}")
 
 
+def _require_report_filesystem_support():
+    """Fail closed before AWS access on unverified OS/API combinations.
+
+    Current supported runtime is Ubuntu Linux. macOS/APFS (ACL and ownership
+    behavior), other Linux distributions and other POSIX systems are not
+    validated for secure publication in this release.
+    """
+    if sys.platform != "linux":
+        raise RuntimeError("Secure report publishing is supported only on Ubuntu Linux")
+    try:
+        release = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError("Cannot verify Ubuntu Linux for secure reports") from exc
+    distro = next((line.split("=", 1)[1].strip().strip('"').strip("'")
+                   for line in release.splitlines() if line.startswith("ID=")), "")
+    if distro != "ubuntu":
+        raise RuntimeError("Secure report publishing is supported only on Ubuntu Linux")
+
+    if not all(hasattr(os, flag) for flag in ("O_DIRECTORY", "O_NOFOLLOW")):
+        raise RuntimeError("Secure report publishing requires O_DIRECTORY and O_NOFOLLOW")
+    if any(fn not in os.supports_dir_fd for fn in _REQUIRED_REPORT_DIR_FD_APIS):
+        raise RuntimeError("Secure report publishing requires dir_fd support for open/mkdir/stat/link/unlink")
+    if any(fn not in os.supports_follow_symlinks for fn in _REQUIRED_REPORT_NOFOLLOW_APIS):
+        raise RuntimeError("Secure report publishing requires nofollow stat/link support")
+
+
 @contextmanager
 def _private_directory_fd(path: Path, *, create: bool = True):
     """Open every ancestor with O_NOFOLLOW, rooted at / (POSIX).
@@ -705,9 +737,7 @@ def _private_directory_fd(path: Path, *, create: bool = True):
     path = Path(path)
     if ".." in path.parts:
         raise ValueError(f"Output path must not contain '..': {path}")
-    for feature in ("O_DIRECTORY", "O_NOFOLLOW"):
-        if not hasattr(os, feature) or os.name != "posix":
-            raise RuntimeError("Secure report output requires POSIX O_DIRECTORY and O_NOFOLLOW")
+    _require_report_filesystem_support()
     absolute = path.absolute()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     dfd = os.open("/", flags)
@@ -776,6 +806,19 @@ def safe_csv(value):
 
 def safe_csv_row(row):
     return {key: safe_csv(value) for key, value in row.items()}
+
+
+def report_output_paths(output: Path, *, mode: str | None = None) -> list[Path]:
+    """Files that this invocation may create; never overwrite any of them."""
+    out = Path(output)
+    paths = [out, out.with_suffix(".review.csv"), out.with_suffix(".report.csv")]
+    if mode == "dryrun":
+        paths.append(out.with_suffix(".result.csv"))
+    elif mode == "y":
+        paths.extend((out.with_suffix(".selected.csv"),
+                      out.with_suffix(".audit.jsonl"),
+                      out.with_suffix(".audit.csv")))
+    return paths
 
 
 def preflight_outputs(paths):
@@ -978,6 +1021,11 @@ def run_interactive(args):
     """Human-controlled single entry point. Dryrun never invokes an AWS write API."""
     if not re.fullmatch(r"\d{12}", args.account):
         raise SystemExit("--account must be 12 digits")
+    # Check the private directory AND pre-existing output collisions before
+    # login or STS. For a preselected mode, also check mode-specific files.
+    out = Path(args.output)
+    preflight_report_destination(out)
+    preflight_outputs(report_output_paths(out, mode=getattr(args, "mode", None)))
     # Validate local paths before offering credentials or any network access.
     for filename in args.cur:
         if not Path(filename).is_file():
@@ -991,11 +1039,9 @@ def run_interactive(args):
         print("N: 中止しました。AWSタグ・ローカル計画は未変更です。")
         return
     print(f"選択されたモード: {selected}")
-    out = Path(args.output)
-    if selected == "y":
-        preflight_outputs([out.with_suffix(".selected.csv"),
-                           out.with_suffix(".audit.jsonl"),
-                           out.with_suffix(".audit.csv")])
+    # For interactive selections not known before login, check additional
+    # outputs immediately after mode selection and before plan generation.
+    preflight_outputs(report_output_paths(out, mode=selected))
     doc = plan(args, session=session, extra_mode="dryrun" if selected == "dryrun" else None)
     if selected == "dryrun":
         print(f"DRYRUN_REPORT={out.with_suffix('.result.csv')} | writes=0 | AWS変更なし")
@@ -1060,14 +1106,62 @@ def run_interactive(args):
     print(f"REVIEW_AUDIT={journal}; REVIEW_REPORT={report}; writes=0; AWS変更なし")
 
 
-def publish_staged_reports(pairs: list[tuple[Path, Path]]):
-    """Best-effort grouped publication using dirfd-anchored, nofollow links.
+class ReportPublishCleanupError(RuntimeError):
+    """A publish failure followed by one or more incomplete cleanup attempts."""
 
-    This mitigates symlink substitution but does not make multi-file
-    publication atomic. After SIGKILL or power loss, partial outputs can remain.
+    def __init__(self, primary_error, cleanup_errors, possibly_remaining):
+        self.primary_error = primary_error
+        self.cleanup_errors = tuple(cleanup_errors)
+        self.possibly_remaining = tuple(possibly_remaining)
+        super().__init__(
+            f"Report publish failed: {primary_error!r}; "
+            f"cleanup failed for {len(self.cleanup_errors)} path(s); "
+            f"possibly remaining outputs: {self.possibly_remaining!r}"
+        )
+
+
+def _require_private_publish_directory(fd, purpose):
+    """Trust contract for publication: private, caller-owned directory.
+
+    Other UIDs cannot mutate entries in this directory through normal POSIX
+    permissions. This is NOT isolation from another process with the same UID
+    or a privileged process; parent path and ACL assumptions still apply.
+    """
+    info = os.fstat(fd)
+    if (not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077):
+        raise PermissionError(
+            f"Report {purpose} directory must be owned by the effective UID "
+            "and deny group/other access (private mode, e.g. 0700)"
+        )
+
+
+def preflight_report_destination(output_path: Path):
+    """Validate the output directory before login, CUR or AWS metadata reads.
+
+    New directories are created as 0700. Existing directories are never
+    chmod'd; a non-private or foreign-owned destination fails closed.
+    Collision handling remains in preflight_outputs and private_output.
+    """
+    output_path = Path(output_path)
+    _require_report_filesystem_support()
+    with _private_directory_fd(output_path.parent) as dfd:
+        _require_private_publish_directory(dfd, "destination")
+
+
+def publish_staged_reports(pairs: list[tuple[Path, Path]]):
+    """Publish regular staged files to private directories, without overwrites.
+
+    Existing destination directories with group/other access are rejected;
+    callers must choose an owned private output directory. This contract does
+    not defend against hostile same-UID/privileged processes or mutable
+    ancestor paths. A pathname check alone cannot close those races.
+    Multi-file crash/power-loss atomicity is NOT guaranteed.
     """
     if not pairs:
         return
+    _require_report_filesystem_support()
     preflight_outputs([dst for _, dst in pairs])
     sources = {Path(src).parent for src, _ in pairs}
     destinations = {Path(dst).parent for _, dst in pairs}
@@ -1078,15 +1172,36 @@ def publish_staged_reports(pairs: list[tuple[Path, Path]]):
     published = []
     with _private_directory_fd(source_dir, create=False) as src_fd:
         with _private_directory_fd(dest_dir, create=False) as dst_fd:
+            _require_private_publish_directory(src_fd, "staging")
+            _require_private_publish_directory(dst_fd, "destination")
+            # Pre-validate all sources while the private source directory is
+            # anchored. os.link(follow_symlinks=False) alone accepts symlinks.
+            for src, _ in pairs:
+                source_meta = os.stat(
+                    Path(src).name, dir_fd=src_fd, follow_symlinks=False
+                )
+                if not stat.S_ISREG(source_meta.st_mode):
+                    raise ValueError(f"Refusing non-regular staged report: {Path(src).name}")
             try:
                 for src, dst in pairs:
                     os.link(Path(src).name, Path(dst).name,
                             src_dir_fd=src_fd, dst_dir_fd=dst_fd, follow_symlinks=False)
                     published.append(Path(dst).name)
                 os.fsync(dst_fd)
-            except BaseException:
+            except BaseException as primary:
+                cleanup_errors = []
+                possibly_remaining = []
+                # Continue independent cleanup attempts even if one fails.
                 for name in reversed(published):
-                    os.unlink(name, dir_fd=dst_fd)
+                    try:
+                        os.unlink(name, dir_fd=dst_fd)
+                    except OSError as cleanup_error:
+                        cleanup_errors.append((name, cleanup_error))
+                        possibly_remaining.append(str(dest_dir / name))
+                if cleanup_errors:
+                    raise ReportPublishCleanupError(
+                        primary, cleanup_errors, possibly_remaining
+                    ) from primary
                 raise
 
 
@@ -1110,7 +1225,9 @@ def plan(args, session=None, *, extra_mode=None):
     review=out.with_suffix(".review.csv")
     report=out.with_suffix(".report.csv")
     result=out.with_suffix(".result.csv")
-    destinations=[out, review, report] + ([result] if extra_mode == "dryrun" else [])
+    destinations=report_output_paths(out, mode=extra_mode)
+    # Validate the output trust contract before CUR parsing and AWS session use.
+    preflight_report_destination(out)
     preflight_outputs(destinations)
     kind_filter = None
     if args.kinds is not None:
@@ -1180,7 +1297,7 @@ def parse_cli(argv=None):
     p.add_argument("--min-cost",type=float,default=DEFAULT_THRESHOLD,help="Effective monthly-to-date cost minimum, USD")
     p.add_argument("--max-resources",type=int,default=100,help="Limit number of AWS metadata lookups")
     p.add_argument("--kinds", help="Comma-separated types, e.g. volume,snapshot,instance,eni; optional")
-    p.add_argument("--output",default="name_tag_plan.json")
+    p.add_argument("--output",default=DEFAULT_REPORT_OUTPUT)
     p.set_defaults(func=plan)
     r=sub.add_parser("run",help="Interactive: remote login prompt -> role info -> Y/N/dryrun -> reports")
     r.add_argument("--cur",action="append",required=True,help="Gzipped CUR v2 CSV")
@@ -1192,7 +1309,7 @@ def parse_cli(argv=None):
     r.add_argument("--min-cost",type=float,default=DEFAULT_THRESHOLD)
     r.add_argument("--max-resources",type=int,default=100)
     r.add_argument("--kinds")
-    r.add_argument("--output",default="name_tag_plan.json")
+    r.add_argument("--output",default=DEFAULT_REPORT_OUTPUT)
     r.add_argument("--max-writes",type=int,default=20)
     r.add_argument("--allow-medium",action="store_true",help="Also present medium-confidence proposals for per-row approval")
     r.set_defaults(func=run_interactive)
