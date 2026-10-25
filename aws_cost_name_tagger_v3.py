@@ -650,7 +650,11 @@ class Investigator:
                 # WAFv2 NextMarker is at the top level, not inside
                 # TagInfoForResource. A partial page must never authorize a
                 # Name candidate, even if its TagList has no Name key.
-                if tag_page.get("NextMarker") is not None:
+                # AWS CLI examples use an empty string for the terminal marker,
+                # despite the API model's nonempty marker constraint. Only an
+                # actual nonempty (or malformed non-string) marker fails closed.
+                marker=tag_page.get("NextMarker")
+                if marker is not None and marker != "":
                     raise ValueError("WAFv2 tag response is paginated; Name state UNKNOWN until all tags are read")
                 tags=tagmap(tag_page.get("TagInfoForResource",{}).get("TagList",[]), expected_shape="list")
                 acl_name,idpart=loc.split("/webacl/",1)[-1].split("/",1)
