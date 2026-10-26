@@ -2906,5 +2906,91 @@ class OfflineJournalBoundaryPR15Tests(unittest.TestCase):
             self.assertTrue(path.read_bytes().startswith(before))
 
 
+
+
+class JournalEdgeCasesR1002Tests(unittest.TestCase):
+    """FND-15-R1-002: fail-closed append loop and descriptor finalization."""
+
+    def test_r1002_zero_byte_write_refused_preserving_prior_log(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(path)
+            t.journal_event(path, {'event': 'previous'})
+            before = path.read_bytes()
+            with patch.object(t.os, 'write', return_value=0) as write, \
+                 patch.object(t.os, 'fsync') as fsync:
+                with self.assertRaisesRegex(OSError, 'Audit journal short write'):
+                    t.journal_event(path, {'event': 'uncommitted'})
+                write.assert_called_once()
+                fsync.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_r1002_short_positive_write_retries_only_remaining_bytes(self):
+        import os
+        real_write = os.write
+        sizes = []
+        def write_part(fd, payload):
+            sizes.append(len(payload))
+            return real_write(fd, payload[:3])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(path)
+            with patch.object(t.os, 'write', side_effect=write_part):
+                t.journal_event(path, {'event': 'partially_written', 'id': 'test'})
+            self.assertGreater(len(sizes), 1)
+            self.assertTrue(all(a > b > 0 for a, b in zip(sizes, sizes[1:])))
+            self.assertEqual(
+                [row['event'] for row in
+                 (json.loads(line) for line in path.read_bytes().splitlines())],
+                ['partially_written'],
+            )
+            self.assertEqual(path.read_bytes().count(b'\n'), 1)
+
+    def _assert_fstat_rejection_closes_fd(self, fstat_injection, error_type, message):
+        """Exercise the real open/close path while mocking only the type probe."""
+        import errno
+        import os
+        real_open, real_fstat = os.open, os.fstat
+        opened_fds = []
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(journal)
+
+            def capture_open(name, flags, *args, **kwargs):
+                fd = real_open(name, flags, *args, **kwargs)
+                if name == journal.name:
+                    opened_fds.append(fd)
+                return fd
+
+            with patch.object(t.os, 'open', side_effect=capture_open), \
+                 patch.object(t.os, 'fstat', **fstat_injection), \
+                 patch.object(t.os, 'write') as write, \
+                 patch.object(t.os, 'fsync') as fsync:
+                with self.assertRaises(error_type) as raised:
+                    t.journal_event(journal, {'event': 'never_written'})
+                self.assertIn(message, str(raised.exception))
+                write.assert_not_called()
+                fsync.assert_not_called()
+            self.assertEqual(len(opened_fds), 1)
+            with self.assertRaises(OSError) as closed:
+                real_fstat(opened_fds[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertEqual(journal.read_bytes(), b'')
+
+    def test_r1002_fstat_failure_closes_opened_journal_descriptor(self):
+        import errno
+        self._assert_fstat_rejection_closes_fd(
+            {'side_effect': OSError(errno.EIO, 'injected fstat failure')},
+            OSError, 'injected fstat failure')
+
+    def test_r1002_nonregular_fstat_closes_fd_before_any_mutation(self):
+        import stat
+        from types import SimpleNamespace
+        self._assert_fstat_rejection_closes_fd(
+            {'return_value': SimpleNamespace(st_mode=stat.S_IFIFO | 0o600)},
+            ValueError, 'regular file')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
