@@ -32,10 +32,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+      - name: Set up uv (fixed tool version)
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
+          version: "0.13.5"
+
+      - name: Verify fixed uv tool version
+        run: |
+          uv --version
+          test "$(uv --version | awk '{print $2}')" = "0.13.5"
 
       - name: Install pinned dependencies
         run: uv sync --locked --python "${{ matrix.python-version }}"
@@ -86,13 +92,80 @@ jobs:
             --module unittest -q test_aws_cost_name_tagger_v3 \
             2>&1 | tee trace-summary.txt
 
+      - name: Record offline coverage provenance
+        if: matrix.python-version == '3.12'
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          coverage = sorted(Path("offline-line-coverage").rglob("*.cover"))
+          assert coverage, "Expected annotated source coverage files"
+          paths = [Path("trace-summary.txt"), *coverage]
+          assert all(path.is_file() for path in paths)
+          entries = [
+              {
+                  "path": path.as_posix(),
+                  "bytes": path.stat().st_size,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+              for path in paths
+          ]
+          def git(*args):
+              return subprocess.check_output(
+                  ["git", *args], text=True
+              ).strip()
+
+          provenance = {
+              "schema_version": 1,
+              "purpose": "Offline Python executed-line coverage (not branch coverage)",
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "github_sha": os.environ.get("GITHUB_SHA", ""),
+              "github_ref": os.environ.get("GITHUB_REF", ""),
+              "git_checkout_head": git("rev-parse", "HEAD"),
+              "git_checkout_tree": git("rev-parse", "HEAD^{tree}"),
+              "python_version": platform.python_version(),
+              "uv_version": subprocess.check_output(
+                  ["uv", "--version"], text=True
+              ).strip(),
+              "files": entries,
+          }
+          assert provenance["uv_version"].split()[1] == "0.13.5"
+          output = Path("coverage-evidence.json")
+          output.write_text(json.dumps(
+              provenance, sort_keys=True, indent=2
+          ) + "\n", encoding="utf-8")
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          print(f"COVERAGE_EVIDENCE_SHA256={digest}")
+          print(f"COVERAGE_EVIDENCE_TREE={provenance['git_checkout_tree']}")
+          print(f"COVERAGE_EVIDENCE_FILES={len(entries)}")
+          PY
+
       - name: Upload offline line-coverage evidence
         if: matrix.python-version == '3.12'
+        id: coverage-upload
         uses: actions/upload-artifact@v4
         with:
           name: offline-line-coverage-python-3-12
           path: |
             offline-line-coverage/
             trace-summary.txt
+            coverage-evidence.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
+
+      - name: Record coverage artifact receipt
+        if: matrix.python-version == '3.12'
+        env:
+          ARTIFACT_ID: ${{ steps.coverage-upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.coverage-upload.outputs.artifact-digest }}
+        run: |
+          test -n "$ARTIFACT_ID"
+          test -n "$ARTIFACT_DIGEST"
+          echo "COVERAGE_ARTIFACT_ID=$ARTIFACT_ID"
+          echo "COVERAGE_ARTIFACT_DIGEST=$ARTIFACT_DIGEST"
