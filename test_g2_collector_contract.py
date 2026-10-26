@@ -287,8 +287,9 @@ class I1MockOnlyTests(unittest.TestCase):
     def test_port_subclass_is_not_accepted(self):
         class Custom(c.FixturePort):
             pass
+        custom_port = Custom(fixtures())
         with self.assertRaises(c.ContractError):
-            c.run_simulation(Custom(fixtures()), ACCOUNT, (REGION,), START, END, AS_OF)
+            c.run_simulation(custom_port, ACCOUNT, (REGION,), START, END, AS_OF)
 
     def test_probes_do_not_expand_to_write_or_high_cost_apis(self):
         probes = c.build_plan(ACCOUNT, (REGION, "us-east-1"), START, END, AS_OF)

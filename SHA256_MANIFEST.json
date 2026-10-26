@@ -40,8 +40,8 @@
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
-      "sha256": "3d09403625c87cc9174b57d51aa4a771e9fdb52418ebf1c321b0ba2dfec2d897",
-      "bytes": 169116
+      "sha256": "823f740859701718405e8bde102a0d16a129afea07e9629018ab44f76de5bc50",
+      "bytes": 169396
     },
     {
       "path": "test_results.txt",
@@ -77,6 +77,11 @@
       "path": "docs/SONAR_COVERAGE_CUTOVER_CONTRACT_R0.md",
       "sha256": "47756da9b99d34491b9fe2683e515f78c567b846cbbd5f250a239c78ab11a9f2",
       "bytes": 28222
+    },
+    {
+      "path": "test_g2_collector_contract.py",
+      "sha256": "6cb5f998c528a3aae92b613960ce7a54826f547539174563a7f3e042042ee46e",
+      "bytes": 15623
     }
   ],
   "repository_note": "GitHub feature branch: includes committed uv.lock and Safety Hold CI; test_results.txt and uv_lock_attempt.txt retain historical ZIP-era results."
