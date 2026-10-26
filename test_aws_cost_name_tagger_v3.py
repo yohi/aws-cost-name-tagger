@@ -500,8 +500,9 @@ class InteractiveV3Tests(unittest.TestCase):
             self.assertIn('IAM Role ARN : arn:aws:iam::',stream.getvalue())
             self.assertIn('NOT VERIFIED',stream.getvalue())
         self.assertEqual(ident['Account'],ACCOUNT)
+        wrong_account_session=FakeSession({'sts':FakeSTS('000000000000'),'iam':FakeIAM()})
         with self.assertRaises(SystemExit):
-            t.show_aws_identity(FakeSession({'sts':FakeSTS('000000000000'),'iam':FakeIAM()}),ACCOUNT)
+            t.show_aws_identity(wrong_account_session,ACCOUNT)
 
     def test_login_remote_launches_only_after_explicit_choice(self):
         from argparse import Namespace
@@ -879,8 +880,9 @@ class SafetyV33Tests(unittest.TestCase):
 
     def test_safety_hold_apply_and_direct_write_remain_disabled(self):
         with self.assertRaises(SystemExit): t.apply(object())
+        investigator=t.Investigator(FakeSession({}),ACCOUNT)
         with self.assertRaises(RuntimeError):
-            t.Investigator(FakeSession({}),ACCOUNT).write_name({'kind':'volume'})
+            investigator.write_name({'kind':'volume'})
 
 
 
@@ -2806,6 +2808,9 @@ class AWSReadBudgetPR14Tests(unittest.TestCase):
             wrapped=t._BudgetedAWSSession(
                 FakeSession({'sts':FakeSTS(),'ec2':FakeEC2()}),
                 t.AWSReadBudget(max_calls=3,max_elapsed=1000))
+            # Client preparation does not count as an API read. Bind before the
+            # budget is exhausted, then test one attempted API call after plan.
+            sts_client=wrapped.client('sts')
             with patch.object(t,'cur_candidates',return_value=('2026-10',[
                     row_for('volume',VOLUME)])):
                 doc=t.plan(args,session=wrapped)
@@ -2814,7 +2819,7 @@ class AWSReadBudgetPR14Tests(unittest.TestCase):
             self.assertEqual(doc['records'][0]['status'],'proposed')
             self.assertTrue(out.is_file())
             with self.assertRaisesRegex(t.AWSReadBudgetExceeded,'API-call'):
-                wrapped.client('sts').get_caller_identity()
+                sts_client.get_caller_identity()
             self.assertTrue(wrapped.read_budget.exhausted)
 
     def test_pr14_expired_deadline_stops_before_first_api(self):
