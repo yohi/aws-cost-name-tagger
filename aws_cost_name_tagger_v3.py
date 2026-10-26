@@ -1589,6 +1589,21 @@ def write_review_csv(path: Path, records: list[dict]):
         os.fsync(fh.fileno())
 
 
+def _demote_colliding_proposals(records):
+    """Demote proposed Names reused by distinct targets; mutate records in place."""
+    # A truncated ID suffix can collide. Never auto-propose the same Name
+    # for two distinct write targets inside the same reviewed batch.
+    byname=defaultdict(set)
+    for rec in records:
+        if rec["status"]=="proposed":
+            byname[rec["proposed_name"]].add((rec["region"],rec["kind"],rec["write_target"]))
+    for rec in records:
+        if rec["status"]=="proposed" and len(byname[rec["proposed_name"]])>1:
+            rec.update(status="manual_review",confidence="none",
+                       evidence=f"Proposed Name collision in batch: {rec['proposed_name']}",proposed_name="")
+            rec["proposal_id"]=proposal_key(rec)
+
+
 def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
     if not re.fullmatch(r"\d{12}",args.account):raise SystemExit("--account must be 12 digits")
     if not args.cur:raise SystemExit("Provide at least one --cur .csv.gz file")
@@ -1619,17 +1634,7 @@ def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
         # Candidate names are not emitted before full validation succeeds.
         # A later budget failure must leave neither a report nor leaked stderr
         # records of a plan that never completed.
-    # A truncated ID suffix can collide. Never auto-propose the same Name
-    # for two distinct write targets inside the same reviewed batch.
-    byname=defaultdict(set)
-    for rec in records:
-        if rec["status"]=="proposed":
-            byname[rec["proposed_name"]].add((rec["region"],rec["kind"],rec["write_target"]))
-    for rec in records:
-        if rec["status"]=="proposed" and len(byname[rec["proposed_name"]])>1:
-            rec.update(status="manual_review",confidence="none",
-                       evidence=f"Proposed Name collision in batch: {rec['proposed_name']}",proposed_name="")
-            rec["proposal_id"]=proposal_key(rec)
+    _demote_colliding_proposals(records)
     if session.read_budget.exhausted:
         raise AWSReadBudgetExceeded("AWS read budget exhausted: no partial candidate report")
     doc={"schema_version":2,"generated_at_utc":datetime.now(timezone.utc).isoformat(),"account":args.account,"period":month,
