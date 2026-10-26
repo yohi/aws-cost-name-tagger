@@ -2262,6 +2262,121 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
             self.assertEqual(list(output.parent.iterdir()), [])
 
 
+    def test_issue18_r3_multifile_stable_ties_ri_sp_and_exclusions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self.write_cur(root/'first.csv.gz', [
+                self.row(line_item_resource_id=INSTANCE,
+                         line_item_unblended_cost='5'),
+                self.row(line_item_resource_id=INSTANCE,
+                         line_item_line_item_type='DiscountedUsage',
+                         reservation_effective_cost='2'),
+                self.row(line_item_resource_id=INSTANCE,
+                         line_item_line_item_type='SavingsPlanCoveredUsage',
+                         savings_plan_savings_plan_effective_cost='3'),
+                self.row(line_item_line_item_type='Fee',
+                         line_item_currency_code='EUR',
+                         line_item_resource_id=VOLUME, line_item_unblended_cost='999'),
+                self.row(bill_billing_period_start_date='2026-09-01',
+                         line_item_currency_code='EUR',
+                         line_item_resource_id=VOLUME, line_item_unblended_cost='888'),
+            ])
+            second = self.write_cur(root/'second.csv.gz', [
+                self.row(line_item_resource_id=VOLUME, line_item_unblended_cost='10'),
+                self.row(line_item_resource_id=SNAPSHOT, line_item_unblended_cost='10'),
+                self.row(line_item_usage_account_id='111111111111',
+                         line_item_currency_code='EUR',
+                         line_item_resource_id=SNAPSHOT, line_item_unblended_cost='900'),
+            ])
+            with patch.object(t, '_scan_cur_file', wraps=t._scan_cur_file) as scan:
+                period, rows = self.call_cur([first, second])
+            self.assertEqual(scan.call_count, 4)  # two full bounded passes
+            self.assertEqual(period, '2026-10')
+            self.assertEqual([r['locator'] for r in rows],
+                             [INSTANCE, VOLUME, SNAPSHOT])
+            self.assertEqual([r['effective_usage_cost_usd'] for r in rows],
+                             [10, 10, 10])
+            self.assertEqual([r['billing_rows'] for r in rows], [3, 1, 1])
+            self.assertEqual([r['currency'] for r in rows],
+                             [['USD'], ['USD'], ['USD']])
+            self.assertEqual([r['source_services'] for r in rows],
+                             [['AmazonEC2']] * 3)
+            _, filtered = t.cur_candidates(
+                [str(first), str(second)], None, 10, 2, ACCOUNT,
+                kind_filter={'instance', 'volume'})
+            self.assertEqual([r['locator'] for r in filtered],
+                             [INSTANCE, VOLUME])
+
+    def test_issue18_r3_currency_checks_stay_after_early_exclusions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'currency.csv.gz'
+            excluded = [
+                self.row(line_item_currency_code='EUR',
+                         bill_billing_period_start_date='2026-09-01'),
+                self.row(line_item_currency_code='EUR',
+                         line_item_usage_account_id='111111111111'),
+                self.row(line_item_currency_code='EUR',
+                         line_item_line_item_type='Fee'),
+            ]
+            self.write_cur(path, excluded + [self.row()])
+            self.assertEqual(self.call_cur([path])[1][0]
+                             ['effective_usage_cost_usd'], 7)
+            self.write_cur(path, excluded + [
+                self.row(line_item_currency_code='EUR',
+                         line_item_resource_id=INSTANCE)])
+            with self.assertRaisesRegex(ValueError, 'Non-USD CUR'):
+                self.call_cur([path])
+            # The kind filter runs after currency validation, not before.
+            with self.assertRaisesRegex(ValueError, 'Non-USD CUR'):
+                t.cur_candidates([str(path)], None, 0, 2, ACCOUNT,
+                                 kind_filter={'volume'})
+
+    def test_issue18_r3_foreign_arn_and_global_bucket_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'resources.csv.gz'
+            foreign = f'arn:aws:ec2:{REGION}:111111111111:volume/{VOLUME}'
+            self.write_cur(path, [
+                self.row(line_item_resource_id=foreign,
+                         line_item_unblended_cost='100'),
+                self.row(line_item_resource_id='scs2-prd-assets',
+                         product_region_code='', line_item_unblended_cost='4'),
+                self.row(line_item_resource_id=INSTANCE,
+                         product_region_code='', line_item_unblended_cost='50'),
+            ])
+            period, rows = self.call_cur([path])
+            self.assertEqual(period, '2026-10')
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]['kind'], rows[0]['locator'],
+                              rows[0]['region'], rows[0]['effective_usage_cost_usd']),
+                             ('s3_bucket', 'scs2-prd-assets', 'global', 4))
+            self.assertEqual(t.cur_candidates(
+                [str(path)], None, 0, 2, ACCOUNT,
+                kind_filter={'volume'})[1], [])
+
+    def test_issue18_r3_invalid_period_and_record_still_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root/'invalid.csv.gz'
+            for bad in (
+                self.row(bill_billing_period_start_date='2026-13-01'),
+                self.row(line_item_unblended_cost='NaN'),
+            ):
+                with self.subTest(bad=bad):
+                    self.write_cur(path, [bad])
+                    args = t.parse_cli(['plan', '--cur', str(path),
+                                        '--account', ACCOUNT,
+                                        '--output', str(root/'plan.json')])
+                    with patch.object(t, 'build_session') as session, \
+                         patch.object(t, 'publish_staged_reports') as publish:
+                        with self.assertRaises(ValueError):
+                            t.plan(args)
+                        session.assert_not_called()
+                        publish.assert_not_called()
+                    self.assertFalse(Path(args.output).exists())
+
+
+
+
 
 
 class CURR1LimitedCorrectionsTests(unittest.TestCase):
