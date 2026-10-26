@@ -81,7 +81,7 @@ jobs:
           STDLIB="$(uv run --locked python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')"
           SITE="$(uv run --locked python -c 'import site; print(site.getsitepackages()[0])')"
           uv run --locked python -m trace --count --missing --summary \
-            --coverdir .trace-coverage \
+            --coverdir offline-line-coverage \
             --ignore-dir "$STDLIB" --ignore-dir "$SITE" \
             --module unittest -q test_aws_cost_name_tagger_v3 \
             2>&1 | tee trace-summary.txt
@@ -92,7 +92,7 @@ jobs:
         with:
           name: offline-line-coverage-python-3-12
           path: |
-            .trace-coverage/
+            offline-line-coverage/
             trace-summary.txt
           if-no-files-found: error
           retention-days: 30
