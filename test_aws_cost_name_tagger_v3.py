@@ -2947,64 +2947,49 @@ class JournalEdgeCasesR1002Tests(unittest.TestCase):
             )
             self.assertEqual(path.read_bytes().count(b'\n'), 1)
 
+    def _assert_fstat_rejection_closes_fd(self, fstat_injection, error_type, message):
+        """Exercise the real open/close path while mocking only the type probe."""
+        import errno
+        import os
+        real_open, real_fstat = os.open, os.fstat
+        opened_fds = []
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(journal)
+
+            def capture_open(name, flags, *args, **kwargs):
+                fd = real_open(name, flags, *args, **kwargs)
+                if name == journal.name:
+                    opened_fds.append(fd)
+                return fd
+
+            with patch.object(t.os, 'open', side_effect=capture_open), \
+                 patch.object(t.os, 'fstat', **fstat_injection), \
+                 patch.object(t.os, 'write') as write, \
+                 patch.object(t.os, 'fsync') as fsync:
+                with self.assertRaises(error_type) as raised:
+                    t.journal_event(journal, {'event': 'never_written'})
+                self.assertIn(message, str(raised.exception))
+                write.assert_not_called()
+                fsync.assert_not_called()
+            self.assertEqual(len(opened_fds), 1)
+            with self.assertRaises(OSError) as closed:
+                real_fstat(opened_fds[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertEqual(journal.read_bytes(), b'')
+
     def test_r1002_fstat_failure_closes_opened_journal_descriptor(self):
         import errno
-        import os
-        real_open, real_fstat = os.open, os.fstat
-        journal_fds = []
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'audit.jsonl'
-            t.create_audit_journal(path)
-            def track_open(name, flags, *args, **kwargs):
-                fd = real_open(name, flags, *args, **kwargs)
-                if name == path.name:
-                    journal_fds.append(fd)
-                return fd
-            with patch.object(t.os, 'open', side_effect=track_open), \
-                 patch.object(t.os, 'fstat',
-                              side_effect=OSError(errno.EIO, 'injected fstat failure')), \
-                 patch.object(t.os, 'write') as write, \
-                 patch.object(t.os, 'fsync') as fsync:
-                with self.assertRaises(OSError) as caught:
-                    t.journal_event(path, {'event': 'never_written'})
-                self.assertEqual(caught.exception.errno, errno.EIO)
-                write.assert_not_called()
-                fsync.assert_not_called()
-            self.assertEqual(len(journal_fds), 1)
-            with self.assertRaises(OSError) as closed:
-                real_fstat(journal_fds[0])
-            self.assertEqual(closed.exception.errno, errno.EBADF)
-            self.assertEqual(path.read_bytes(), b'')
+        self._assert_fstat_rejection_closes_fd(
+            {'side_effect': OSError(errno.EIO, 'injected fstat failure')},
+            OSError, 'injected fstat failure')
 
     def test_r1002_nonregular_fstat_closes_fd_before_any_mutation(self):
-        import errno
-        import os
         import stat
         from types import SimpleNamespace
-        real_open, real_fstat = os.open, os.fstat
-        journal_fds = []
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'audit.jsonl'
-            t.create_audit_journal(path)
-            def track_open(name, flags, *args, **kwargs):
-                fd = real_open(name, flags, *args, **kwargs)
-                if name == path.name:
-                    journal_fds.append(fd)
-                return fd
-            with patch.object(t.os, 'open', side_effect=track_open), \
-                 patch.object(t.os, 'fstat',
-                              return_value=SimpleNamespace(st_mode=stat.S_IFIFO | 0o600)), \
-                 patch.object(t.os, 'write') as write, \
-                 patch.object(t.os, 'fsync') as fsync:
-                with self.assertRaisesRegex(ValueError, 'regular file'):
-                    t.journal_event(path, {'event': 'never_written'})
-                write.assert_not_called()
-                fsync.assert_not_called()
-            self.assertEqual(len(journal_fds), 1)
-            with self.assertRaises(OSError) as closed:
-                real_fstat(journal_fds[0])
-            self.assertEqual(closed.exception.errno, errno.EBADF)
-            self.assertEqual(path.read_bytes(), b'')
+        self._assert_fstat_rejection_closes_fd(
+            {'return_value': SimpleNamespace(st_mode=stat.S_IFIFO | 0o600)},
+            ValueError, 'regular file')
 
 
 if __name__ == '__main__':
