@@ -103,7 +103,6 @@ def main() -> None:
     source_path = root / _MODULE
     folder = root / "offline-line-coverage"
     trace_path = folder / "aws_cost_name_tagger_v3.cover"
-    output_path = folder / "sonar-generic-coverage.xml"
     if source_path.is_symlink() or folder.is_symlink() or trace_path.is_symlink():
         raise ValueError("symlink input refused")
     xml = convert(source_data=source_path.read_bytes(), trace_data=trace_path.read_bytes())

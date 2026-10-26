@@ -60,8 +60,8 @@
     },
     {
       "path": "trace_to_sonar_generic.py",
-      "bytes": 4721,
-      "sha256": "31161c41f2aacc1f01086e1394276fe0201c88692e6f482306aadb61220b4dfd"
+      "bytes": 4665,
+      "sha256": "74c9ef0768cf49749cbe2015c61fd189486c79cdd706cda18cc820cb4f8f8d1a"
     },
     {
       "path": "test_trace_to_sonar_generic.py",
