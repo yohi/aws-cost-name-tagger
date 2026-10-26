@@ -83,7 +83,7 @@
 
 ### FND-15-R1-003 — CI Tool Version / Coverage Provenance
 
-Safety Hold CIは`astral-sh/setup-uv@v6`でインストールするuvを**0.13.5に指定**し、`uv --version`が期待値に一致しない場合は停止します。アクション実装は`@v6`、OSは`ubuntu-latest`、Pythonは各マイナーバージョン指定であるため、**ジョブ環境全体のバイト単位の固定ではありません**。依存パッケージは従来どおり`uv.lock`で固定します。Python 3.10/3.11/3.12のロック済みCIを継続します。
+Safety Hold CIは既知チェックサム情報を備えた`astral-sh/setup-uv v10.3.2`の固定コミット`07a047e608db84b3d8c06cd9a7c7dcc9c355c18e`を使用し、インストールするuvを**0.13.5に指定**します。`uv --version`のプラットフォーム表記に左右されずバージョン番号を比較し、不一致なら停止します。OSは`ubuntu-latest`、Pythonは各マイナーバージョン指定であるため、**ジョブ環境全体のバイト単位の固定ではありません**。依存パッケージは従来どおり`uv.lock`で固定します。Python 3.10/3.11/3.12のロック済みCIを継続します。
 
 Python 3.12の行カバレッジ成果物は、注釈付き`.cover`ファイル・サマリーのほかに`coverage-evidence.json`を同梱します。このJSONは各ファイルのバイト数とSHA-256、実行環境のPython・uvバージョン、GitHub Actionsの`GITHUB_SHA`、checkoutしたGitのHEADとtree SHAを記録します。JSON自体のSHA-256とGitHubが返すアップロード済みArtifactのID・digestはCIログにも出力します。これらは**再現性・同一性照合用の受領情報であり、署名や第三者による真正性証明ではありません**。PR CIはマージテストコミットで実行されるため、`GITHUB_SHA`とPRのレビューHEADが異なり得ます。両者を比較する際はtree SHAを別途照合します。
 
