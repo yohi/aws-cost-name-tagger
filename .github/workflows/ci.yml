@@ -71,6 +71,9 @@ jobs:
           print(f"SHA256 manifest PASS ({len(files)} files)")
           PY
 
+      - name: Validate offline Sonar report converter
+        run: uv run --locked --no-build python -m unittest -q test_trace_to_sonar_generic
+
       - name: Unit tests (module runner)
         run: uv run --locked --no-build python -m unittest -q test_aws_cost_name_tagger_v3
 
@@ -92,6 +95,11 @@ jobs:
             --module unittest -q test_aws_cost_name_tagger_v3 \
             2>&1 | tee trace-summary.txt
 
+      - name: Generate Sonar generic coverage evidence (offline only)
+        if: matrix.python-version == '3.12'
+        run: |
+          uv run --locked --no-build python trace_to_sonar_generic.py
+
       - name: Record offline coverage provenance
         if: matrix.python-version == '3.12'
         run: |
@@ -106,7 +114,7 @@ jobs:
 
           coverage = sorted(Path("offline-line-coverage").rglob("*.cover"))
           assert coverage, "Expected annotated source coverage files"
-          paths = [Path("trace-summary.txt"), *coverage]
+          paths = [Path("trace-summary.txt"), *coverage, Path("offline-line-coverage/sonar-generic-coverage.xml")]
           assert all(path.is_file() for path in paths)
           entries = [
               {
