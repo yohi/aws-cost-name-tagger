@@ -2992,5 +2992,82 @@ class JournalEdgeCasesR1002Tests(unittest.TestCase):
             ValueError, 'regular file')
 
 
+class PlanCollisionExtractionIssue18Tests(unittest.TestCase):
+    """Issue #18: preserve the in-place collision and proposal ID contracts."""
+
+    @staticmethod
+    def record(locator, write_target, status='proposed', region=REGION):
+        rec = {**row_for('volume', locator, region),
+               'status': status, 'write_target': write_target,
+               'proposed_name': 'shared-name', 'confidence': 'high',
+               'evidence': 'offline test',
+               'name_state': 'ABSENT', 'name_key_present': False,
+               'name_raw_value': None}
+        rec['proposal_id'] = t.proposal_key(rec)
+        return rec
+
+    def test_issue18_distinct_write_targets_demoted_and_rekeyed(self):
+        first = self.record('vol-first', 'vol-first')
+        second = self.record('vol-second', 'vol-second')
+        safe = self.record('vol-safe', 'vol-safe')
+        safe['proposed_name'] = 'unique-name'
+        safe['proposal_id'] = t.proposal_key(safe)
+        safe_before = dict(safe)
+        prior_ids = [first['proposal_id'], second['proposal_id']]
+        records = [first, second, safe]
+        self.assertIsNone(t._demote_colliding_proposals(records))
+        for rec, before_id in zip(records[:2], prior_ids):
+            self.assertEqual(rec['status'], 'manual_review')
+            self.assertEqual(rec['confidence'], 'none')
+            self.assertEqual(rec['proposed_name'], '')
+            self.assertIn('Proposed Name collision in batch: shared-name',
+                          rec['evidence'])
+            self.assertNotEqual(rec['proposal_id'], before_id)
+            self.assertEqual(rec['proposal_id'], t.proposal_key(rec))
+            self.assertEqual(rec['name_state'], 'ABSENT')
+        self.assertEqual(safe, safe_before)
+
+    def test_issue18_same_target_and_nonproposed_do_not_collide(self):
+        first = self.record('vol-first', 'same-target')
+        second = self.record('vol-second', 'same-target')
+        ignored = self.record('vol-third', 'other-target', status='already_named')
+        records = [first, second, ignored]
+        original = [dict(rec) for rec in records]
+        t._demote_colliding_proposals(records)
+        self.assertEqual(records, original)
+
+    def test_issue18_plan_applies_demotions_before_publishing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'plan.json'
+            args = t.parse_cli(['plan', '--cur', 'unused.csv.gz', '--account',
+                                ACCOUNT, '--output', str(out)])
+            candidates = [row_for('volume', 'vol-first'),
+                          row_for('volume', 'vol-second')]
+
+            def resolve(item):
+                return {'status': 'proposed', 'confidence': 'high',
+                        'proposed_name': 'shared-name',
+                        'evidence': 'offline test',
+                        'write_target': item['locator'],
+                        'name_state': 'ABSENT',
+                        'name_key_present': False,
+                        'name_raw_value': None}
+
+            with patch.object(t, 'cur_candidates',
+                              return_value=('2026-10', candidates)), \
+                 patch.object(t, 'assert_account'), \
+                 patch.object(t, 'Investigator') as investigator:
+                investigator.return_value.resolve.side_effect = resolve
+                doc = t.plan(args, session=FakeSession({}))
+            self.assertEqual(doc['count'], 2)
+            self.assertEqual([r['status'] for r in doc['records']],
+                             ['manual_review', 'manual_review'])
+            self.assertTrue(all(r['proposed_name'] == '' for r in doc['records']))
+            self.assertEqual(json.loads(out.read_text())['records'],
+                             doc['records'])
+            self.assertTrue(out.with_suffix('.review.csv').is_file())
+            self.assertTrue(out.with_suffix('.report.csv').is_file())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
