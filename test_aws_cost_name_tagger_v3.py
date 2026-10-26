@@ -2307,6 +2307,48 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
             self.assertEqual([r['locator'] for r in filtered],
                              [INSTANCE, VOLUME])
 
+    def test_issue18_r2_s6659_exact_month_slice_equivalence(self):
+        # A startswith-only rewrite would incorrectly accept a short month.
+        # This helper's comparison also accepts an empty period with an
+        # empty month argument, so preserve that historic edge case.
+        valid = self.row()
+        for month, expected in (
+            ('2026-10', True),
+            ('2026-11', False),
+            ('2026', False),
+            ('2026-1', False),
+            ('2026-10-01', False),
+            ('', False),
+        ):
+            with self.subTest(month=month):
+                self.assertIs(t._cur_selected_usage(valid, month, ACCOUNT),
+                              expected)
+
+        empty_period = self.row(bill_billing_period_start_date='')
+        self.assertTrue(t._cur_selected_usage(empty_period, '', ACCOUNT))
+        self.assertFalse(t._cur_selected_usage(empty_period, '2026-10', ACCOUNT))
+
+        # Month exclusion must still happen before the non-USD failure.
+        non_usd = self.row(line_item_currency_code='EUR')
+        self.assertFalse(t._cur_selected_usage(non_usd, '2026', ACCOUNT))
+        with self.assertRaisesRegex(ValueError, 'Non-USD CUR'):
+            t._cur_selected_usage(non_usd, '2026-10', ACCOUNT)
+
+    def test_issue18_r2_s6659_public_cur_explicit_short_month(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cur(Path(tmp) / 'month.csv.gz', [self.row()])
+            for month in ('2026', '2026-10-01', '2026-1'):
+                with self.subTest(month=month):
+                    actual_month, records = t.cur_candidates(
+                        [str(path)], month, 0, 10, ACCOUNT)
+                    self.assertEqual(actual_month, month)
+                    self.assertEqual(records, [])
+            actual_month, records = t.cur_candidates(
+                [str(path)], '2026-10', 0, 10, ACCOUNT)
+            self.assertEqual(actual_month, '2026-10')
+            self.assertEqual(len(records), 1)
+
+
     def test_issue18_r3_currency_checks_stay_after_early_exclusions(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'currency.csv.gz'

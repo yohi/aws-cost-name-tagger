@@ -414,7 +414,7 @@ def _cur_selected_usage(row, active_month: str, account: str) -> bool:
     period = row.get("bill_billing_period_start_date", "")
     if not isinstance(period, str):
         raise ValueError("CUR billing period missing")
-    if period[:7] != active_month:
+    if len(period[:7]) != len(active_month) or not period.startswith(active_month):
         return False
     if row["line_item_usage_account_id"] != account:
         return False
