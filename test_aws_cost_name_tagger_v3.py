@@ -2449,9 +2449,9 @@ class CURStrictCSVPR13R3Tests(unittest.TestCase):
                          patch.object(t, 'assert_account') as guard, \
                          patch.object(t, 'Investigator') as investigator, \
                          patch.object(t, 'publish_staged_reports') as publish:
+                        invoke = t.run_interactive if command == 'run' else t.plan
                         with self.assertRaises(csv.Error):
-                            (t.run_interactive(args) if command == 'run'
-                             else t.plan(args))
+                            invoke(args)
                         for mock in (login, session, identity, guard,
                                      investigator, publish):
                             mock.assert_not_called()
