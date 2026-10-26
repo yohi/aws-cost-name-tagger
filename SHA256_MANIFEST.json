@@ -5,8 +5,8 @@
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "10c4809147fa310461b29e41f266b1b24f470a79127818ac8cadf15dbd136d63",
-      "bytes": 6586
+      "sha256": "4acdbbb1bdc0f396a0cf33bc3bc184f3b8bb07a200634b0bbe01d7ebe8def6fc",
+      "bytes": 7185
     },
     {
       "path": ".gitignore",
@@ -57,6 +57,21 @@
       "path": "uv.lock",
       "sha256": "d965d0dda31681a2a7d523f62e50edd3900ca80a4abd3de96353b89fcca09021",
       "bytes": 15896
+    },
+    {
+      "path": "trace_to_sonar_generic.py",
+      "bytes": 3138,
+      "sha256": "6895a73bbabd5e9e8266f825ae7982ae46b59e3289cd2541c24d712067caefbc"
+    },
+    {
+      "path": "test_trace_to_sonar_generic.py",
+      "bytes": 3766,
+      "sha256": "becbb905c3be78802ccd1f55224dbb88fa9b9d00936d41c53cc260254d16ca44"
+    },
+    {
+      "path": "docs/SONAR_COVERAGE_HANDOFF_R0.md",
+      "bytes": 2490,
+      "sha256": "7784a1162afd494b3727d746a1508e8a72f5929959c0fb20a5af7d680eec9929"
     }
   ],
   "repository_note": "GitHub feature branch: includes committed uv.lock and Safety Hold CI; test_results.txt and uv_lock_attempt.txt retain historical ZIP-era results."
