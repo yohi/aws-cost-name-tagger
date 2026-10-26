@@ -258,118 +258,136 @@ def _cur_file_identity(info) -> tuple:
             info.st_mtime_ns, info.st_ctime_ns)
 
 
+class _CURStreamState:
+    """Only the counters and decoder for one bounded CUR gzip scan.
+
+    Quoting state spans physical lines, then resets only after a fully parsed
+    logical CSV record. Keep this object private to a single scan/pass.
+    """
+
+    def __init__(self, compressed, budget, checksum):
+        self.compressed = compressed
+        self.budget = budget
+        self.checksum = checksum
+        self.decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
+        self.expanded = 0
+        self.reset_record()
+
+    def reset_record(self):
+        self.record_bytes = 0
+        self.delimiter_count = 0
+        self.in_quotes = False
+        self.at_field_start = True
+
+    def _advance_quoted(self, text, pos):
+        if text[pos] == '"':
+            if pos + 1 < len(text) and text[pos + 1] == '"':
+                return pos + 2
+            self.in_quotes = False
+        return pos + 1
+
+    def _count_field(self):
+        self.delimiter_count += 1
+        if self.delimiter_count >= MAX_CUR_FIELDS:
+            raise ValueError("CUR logical record field limit exceeded")
+        self.at_field_start = True
+
+    def scan_delimiters(self, text):
+        pos = 0
+        while pos < len(text):
+            char = text[pos]
+            if self.in_quotes:
+                pos = self._advance_quoted(text, pos)
+                continue
+            if char == ',':
+                self._count_field()
+            elif char == '"' and self.at_field_start:
+                self.in_quotes = True
+                self.at_field_start = False
+            elif char not in ('\r', '\n'):
+                self.at_field_start = False
+            pos += 1
+
+    def bounded_lines(self):
+        while True:
+            chunk = self.compressed.readline(MAX_CUR_LINE_BYTES + 1)
+            if not chunk:
+                tail = self.decoder.decode(b"", final=True)
+                if tail:
+                    yield tail
+                return
+            if len(chunk) > MAX_CUR_LINE_BYTES:
+                raise ValueError("CUR physical line size limit exceeded")
+            self.expanded += len(chunk)
+            self.budget["bytes"] += len(chunk)
+            self.record_bytes += len(chunk)
+            if self.budget["bytes"] > MAX_CUR_UNCOMPRESSED_BYTES:
+                raise ValueError("CUR decompressed byte budget exceeded")
+            if self.record_bytes > MAX_CUR_LOGICAL_RECORD_BYTES:
+                raise ValueError("CUR logical record byte limit exceeded")
+            self.checksum.update(chunk)
+            decoded = self.decoder.decode(chunk, final=False)
+            self.scan_delimiters(decoded)
+            yield decoded
+
+
+def _cur_validate_header(reader):
+    header = reader.fieldnames
+    if header is None:
+        raise ValueError("CUR CSV header is missing")
+    if len(header) != len(set(header)) or any(not h for h in header):
+        raise ValueError("CUR header has duplicate or empty column names")
+    required = {
+        "bill_billing_period_start_date", "line_item_usage_account_id",
+        "line_item_line_item_type", "line_item_resource_id",
+        "line_item_unblended_cost", "product_region_code",
+        "line_item_product_code", "line_item_currency_code",
+    }
+    if not required.issubset(header):
+        raise ValueError("CUR header missing required columns: " +
+                         ", ".join(sorted(required - set(header))))
+
+
+def _cur_consume_rows(reader, budget, accept_row, stream):
+    count = 0
+    for row in reader:
+        count += 1
+        budget["rows"] += 1
+        if budget["rows"] > MAX_CUR_ROWS:
+            raise ValueError("CUR row budget exceeded")
+        if None in row or any(value is None for value in row.values()):
+            raise ValueError("CUR record has extra or missing fields")
+        accept_row(row)
+        stream.reset_record()
+    return count
+
+
 def _scan_cur_file(path: Path, budget: dict, accept_row) -> tuple:
     """Stream a bounded gzip CSV once and return a decoded-content receipt.
 
-    The physical line and total expansion limits prevent a large decompressed
-    line from being materialized before checking its size. The receipt,
-    compressed-file identity and row count are compared across both passes.
+    Preserve record- and physical-line bounds before csv.DictReader(strict=True),
+    as well as the compressed inode/metadata and decoded-content receipts.
     """
     before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("CUR input must be a regular file")
-    count = 0
-    expanded = 0
     checksum = hashlib.sha256()
     with path.open("rb") as raw:
         opened = os.fstat(raw.fileno())
         if _cur_file_identity(opened) != _cur_file_identity(before):
             raise ValueError("CUR input changed before opening")
         with gzip.GzipFile(fileobj=raw, mode="rb") as compressed:
-            decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
-            # A CSV logical record can span thousands of short physical lines.
-            # Enforce both bounds BEFORE handing each line to csv.DictReader,
-            # rather than only checking the completed parsed row.
-            record_bytes = 0
-            delimiter_count = 0
-            in_quotes = False
-            at_field_start = True
-
-            def scan_delimiters(text):
-                nonlocal delimiter_count, in_quotes, at_field_start
-                pos = 0
-                while pos < len(text):
-                    char = text[pos]
-                    if in_quotes:
-                        if char == '"':
-                            if pos + 1 < len(text) and text[pos + 1] == '"':
-                                pos += 2
-                                continue
-                            in_quotes = False
-                    elif char == ',':
-                        delimiter_count += 1
-                        if delimiter_count >= MAX_CUR_FIELDS:
-                            raise ValueError("CUR logical record field limit exceeded")
-                        at_field_start = True
-                    elif char == '"' and at_field_start:
-                        in_quotes = True
-                        at_field_start = False
-                    elif char not in ('\r', '\n'):
-                        at_field_start = False
-                    pos += 1
-
-            def bounded_lines():
-                nonlocal expanded, record_bytes
-                while True:
-                    chunk = compressed.readline(MAX_CUR_LINE_BYTES + 1)
-                    if not chunk:
-                        tail = decoder.decode(b"", final=True)
-                        if tail:
-                            yield tail
-                        return
-                    if len(chunk) > MAX_CUR_LINE_BYTES:
-                        raise ValueError("CUR physical line size limit exceeded")
-                    expanded += len(chunk)
-                    budget["bytes"] += len(chunk)
-                    record_bytes += len(chunk)
-                    if budget["bytes"] > MAX_CUR_UNCOMPRESSED_BYTES:
-                        raise ValueError("CUR decompressed byte budget exceeded")
-                    if record_bytes > MAX_CUR_LOGICAL_RECORD_BYTES:
-                        raise ValueError("CUR logical record byte limit exceeded")
-                    checksum.update(chunk)
-                    decoded = decoder.decode(chunk, final=False)
-                    scan_delimiters(decoded)
-                    yield decoded
-
-            # Reject malformed quoting (notably an unclosed quoted field at
-            # EOF). csv.DictReader's default strict=False can otherwise
-            # silently accept a truncated logical CSV record.
-            reader = csv.DictReader(bounded_lines(), strict=True)
-            header = reader.fieldnames
-            if header is None:
-                raise ValueError("CUR CSV header is missing")
-            if len(header) != len(set(header)) or any(not h for h in header):
-                raise ValueError("CUR header has duplicate or empty column names")
-            required = {
-                "bill_billing_period_start_date", "line_item_usage_account_id",
-                "line_item_line_item_type", "line_item_resource_id",
-                "line_item_unblended_cost", "product_region_code",
-                "line_item_product_code", "line_item_currency_code",
-            }
-            if not required.issubset(header):
-                raise ValueError("CUR header missing required columns: " +
-                                 ", ".join(sorted(required - set(header))))
-            record_bytes = 0
-            delimiter_count = 0
-            in_quotes = False
-            at_field_start = True
-            for row in reader:
-                count += 1
-                budget["rows"] += 1
-                if budget["rows"] > MAX_CUR_ROWS:
-                    raise ValueError("CUR row budget exceeded")
-                if None in row or any(value is None for value in row.values()):
-                    raise ValueError("CUR record has extra or missing fields")
-                accept_row(row)
-                record_bytes = 0
-                delimiter_count = 0
-                in_quotes = False
-                at_field_start = True
+            stream = _CURStreamState(compressed, budget, checksum)
+            # Strict CSV decoding and all budgets still precede row acceptance.
+            reader = csv.DictReader(stream.bounded_lines(), strict=True)
+            _cur_validate_header(reader)
+            stream.reset_record()
+            count = _cur_consume_rows(reader, budget, accept_row, stream)
     after = path.stat()
     if (_cur_file_identity(before) != _cur_file_identity(after)
             or _cur_file_identity(opened) != _cur_file_identity(after)):
         raise ValueError("CUR input changed during scan")
-    return (_cur_file_identity(after), expanded, count, checksum.hexdigest())
+    return (_cur_file_identity(after), stream.expanded, count, checksum.hexdigest())
 
 
 def _cur_input_paths(files: list[str]) -> list[Path]:

@@ -2262,6 +2262,110 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
             self.assertEqual(list(output.parent.iterdir()), [])
 
 
+    def test_issue18_r4_scanner_utf8_bom_crlf_quoted_multiline_receipt(self):
+        import hashlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'bom.csv.gz'
+            value = 'Amazon "EC2", alpha\r\nsecond, "line" と東京'
+            text = io.StringIO(newline='')
+            writer = csv.DictWriter(text, fieldnames=self.COLS)
+            writer.writeheader()
+            writer.writerow(self.row(line_item_product_code=value))
+            decoded = text.getvalue().encode('utf-8-sig')
+            with gzip.open(path, 'wb') as fh:
+                fh.write(decoded)
+            accepted = []
+            budget = {'bytes': 0, 'rows': 0}
+            receipt = t._scan_cur_file(path, budget, accepted.append)
+            self.assertEqual((receipt[1], receipt[2], receipt[3]),
+                             (len(decoded), 1, hashlib.sha256(decoded).hexdigest()))
+            self.assertEqual(budget, {'bytes': len(decoded), 'rows': 1})
+            self.assertEqual(accepted[0]['line_item_product_code'], value)
+            period, records = self.call_cur([path])
+            self.assertEqual(period, '2026-10')
+            self.assertEqual(records[0]['source_services'], [value])
+
+    def test_issue18_r4_scanner_exact_byte_line_record_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cur(Path(tmp) / 'limits.csv.gz', [self.row()])
+            decoded = gzip.decompress(path.read_bytes())
+            lengths = [len(line) for line in decoded.splitlines(keepends=True)]
+            longest = max(lengths)
+            limits = {
+                'MAX_CUR_UNCOMPRESSED_BYTES': len(decoded),
+                'MAX_CUR_LINE_BYTES': longest,
+                'MAX_CUR_LOGICAL_RECORD_BYTES': longest,
+            }
+            with patch.multiple(t, **limits):
+                month, records = self.call_cur([path])
+                self.assertEqual(month, '2026-10')
+                self.assertEqual(len(records), 1)
+            for limit, value, diagnostic in (
+                ('MAX_CUR_UNCOMPRESSED_BYTES', len(decoded) - 1, 'byte budget'),
+                ('MAX_CUR_LINE_BYTES', longest - 1, 'physical line size'),
+                ('MAX_CUR_LOGICAL_RECORD_BYTES', longest - 1, 'logical record byte'),
+            ):
+                with self.subTest(limit=limit):
+                    with patch.object(t, limit, value):
+                        with self.assertRaisesRegex(ValueError, diagnostic):
+                            self.call_cur([path])
+
+    def test_issue18_r4_scanner_field_budget_ignores_quoted_commas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cur(Path(tmp) / 'quoted.csv.gz', [
+                self.row(line_item_product_code='quoted,"one,two",and,three')
+            ])
+            with patch.object(t, 'MAX_CUR_FIELDS', len(self.COLS)):
+                month, records = self.call_cur([path])
+                self.assertEqual(month, '2026-10')
+                self.assertEqual(records[0]['source_services'],
+                                 ['quoted,"one,two",and,three'])
+            with patch.object(t, 'MAX_CUR_FIELDS', len(self.COLS) - 1):
+                with self.assertRaisesRegex(ValueError, 'field limit'):
+                    self.call_cur([path])
+
+    def test_issue18_r4_scanner_logical_counter_resets_for_each_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cur(Path(tmp) / 'two.csv.gz', [
+                self.row(line_item_unblended_cost='2'),
+                self.row(line_item_unblended_cost='3'),
+            ])
+            raw = gzip.decompress(path.read_bytes())
+            physical = raw.splitlines(keepends=True)
+            one_record_bound = max(len(line) for line in physical)
+            self.assertGreater(sum(len(line) for line in physical),
+                               one_record_bound)
+            with patch.object(t, 'MAX_CUR_LOGICAL_RECORD_BYTES',
+                              one_record_bound):
+                month, items = self.call_cur([path])
+            self.assertEqual(month, '2026-10')
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]['effective_usage_cost_usd'], 5)
+            self.assertEqual(items[0]['billing_rows'], 2)
+
+    def test_issue18_r4_scanner_invalid_utf8_stops_before_aws(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self.write_cur(root / 'invalid.csv.gz', [self.row()])
+            decoded = gzip.decompress(path.read_bytes())
+            self.assertIn(b'AmazonEC2', decoded)
+            with gzip.open(path, 'wb') as fh:
+                fh.write(decoded.replace(b'AmazonEC2', b'\xff', 1))
+            output = root / 'private' / 'plan.json'
+            args = t.parse_cli(['plan', '--cur', str(path), '--account',
+                                ACCOUNT, '--output', str(output)])
+            with patch.object(t, 'build_session') as session, \
+                 patch.object(t, 'assert_account') as account, \
+                 patch.object(t, 'publish_staged_reports') as publish:
+                with self.assertRaises(UnicodeDecodeError):
+                    t.plan(args)
+                session.assert_not_called()
+                account.assert_not_called()
+                publish.assert_not_called()
+            self.assertFalse(output.exists())
+
+
     def test_issue18_r3_multifile_stable_ties_ri_sp_and_exclusions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
