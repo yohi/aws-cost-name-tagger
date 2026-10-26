@@ -2906,5 +2906,106 @@ class OfflineJournalBoundaryPR15Tests(unittest.TestCase):
             self.assertTrue(path.read_bytes().startswith(before))
 
 
+
+
+class JournalEdgeCasesR1002Tests(unittest.TestCase):
+    """FND-15-R1-002: fail-closed append loop and descriptor finalization."""
+
+    def test_r1002_zero_byte_write_refused_preserving_prior_log(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(path)
+            t.journal_event(path, {'event': 'previous'})
+            before = path.read_bytes()
+            with patch.object(t.os, 'write', return_value=0) as write, \
+                 patch.object(t.os, 'fsync') as fsync:
+                with self.assertRaisesRegex(OSError, 'Audit journal short write'):
+                    t.journal_event(path, {'event': 'uncommitted'})
+                write.assert_called_once()
+                fsync.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_r1002_short_positive_write_retries_only_remaining_bytes(self):
+        import os
+        real_write = os.write
+        sizes = []
+        def write_part(fd, payload):
+            sizes.append(len(payload))
+            return real_write(fd, payload[:3])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(path)
+            with patch.object(t.os, 'write', side_effect=write_part):
+                t.journal_event(path, {'event': 'partially_written', 'id': 'test'})
+            self.assertGreater(len(sizes), 1)
+            self.assertTrue(all(a > b > 0 for a, b in zip(sizes, sizes[1:])))
+            self.assertEqual(
+                [row['event'] for row in
+                 (json.loads(line) for line in path.read_bytes().splitlines())],
+                ['partially_written'],
+            )
+            self.assertEqual(path.read_bytes().count(b'\n'), 1)
+
+    def test_r1002_fstat_failure_closes_opened_journal_descriptor(self):
+        import errno
+        import os
+        real_open, real_fstat = os.open, os.fstat
+        journal_fds = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(path)
+            def track_open(name, flags, *args, **kwargs):
+                fd = real_open(name, flags, *args, **kwargs)
+                if name == path.name:
+                    journal_fds.append(fd)
+                return fd
+            with patch.object(t.os, 'open', side_effect=track_open), \
+                 patch.object(t.os, 'fstat',
+                              side_effect=OSError(errno.EIO, 'injected fstat failure')), \
+                 patch.object(t.os, 'write') as write, \
+                 patch.object(t.os, 'fsync') as fsync:
+                with self.assertRaises(OSError) as caught:
+                    t.journal_event(path, {'event': 'never_written'})
+                self.assertEqual(caught.exception.errno, errno.EIO)
+                write.assert_not_called()
+                fsync.assert_not_called()
+            self.assertEqual(len(journal_fds), 1)
+            with self.assertRaises(OSError) as closed:
+                real_fstat(journal_fds[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertEqual(path.read_bytes(), b'')
+
+    def test_r1002_nonregular_fstat_closes_fd_before_any_mutation(self):
+        import errno
+        import os
+        import stat
+        from types import SimpleNamespace
+        real_open, real_fstat = os.open, os.fstat
+        journal_fds = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'audit.jsonl'
+            t.create_audit_journal(path)
+            def track_open(name, flags, *args, **kwargs):
+                fd = real_open(name, flags, *args, **kwargs)
+                if name == path.name:
+                    journal_fds.append(fd)
+                return fd
+            with patch.object(t.os, 'open', side_effect=track_open), \
+                 patch.object(t.os, 'fstat',
+                              return_value=SimpleNamespace(st_mode=stat.S_IFIFO | 0o600)), \
+                 patch.object(t.os, 'write') as write, \
+                 patch.object(t.os, 'fsync') as fsync:
+                with self.assertRaisesRegex(ValueError, 'regular file'):
+                    t.journal_event(path, {'event': 'never_written'})
+                write.assert_not_called()
+                fsync.assert_not_called()
+            self.assertEqual(len(journal_fds), 1)
+            with self.assertRaises(OSError) as closed:
+                real_fstat(journal_fds[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertEqual(path.read_bytes(), b'')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
