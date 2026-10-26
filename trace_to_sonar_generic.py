@@ -2,7 +2,7 @@
 
 Local transformation only; does not contact Sonar, GitHub, or AWS.
 """
-import argparse
+import sys
 import hashlib
 import os
 from pathlib import Path
@@ -31,10 +31,7 @@ def _status(annotated: str, actual: str, line: int) -> bool | None:
     return covered
 
 
-def convert(*, source: Path, annotated: Path) -> bytes:
-    if source.name != _MODULE or annotated.name != "aws_cost_name_tagger_v3.cover":
-        raise ValueError("non-allowlisted source or trace")
-    source_data, trace_data = source.read_bytes(), annotated.read_bytes()
+def convert(*, source_data: bytes, trace_data: bytes) -> bytes:
     if b"\r" in source_data or b"\r" in trace_data:
         raise ValueError("CRLF is not supported")
     lines = source_data.decode("utf-8", errors="strict").splitlines()
@@ -57,19 +54,23 @@ def convert(*, source: Path, annotated: Path) -> bytes:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--trace", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    xml = convert(source=args.source, annotated=args.trace)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    tmp = args.output.with_name(args.output.name + ".tmp")
+    if len(sys.argv) != 1:
+        raise SystemExit("no external path arguments accepted")
+    root = Path(__file__).resolve().parent
+    source_path = root / _MODULE
+    folder = root / "offline-line-coverage"
+    trace_path = folder / "aws_cost_name_tagger_v3.cover"
+    output_path = folder / "sonar-generic-coverage.xml"
+    if source_path.is_symlink() or folder.is_symlink() or trace_path.is_symlink():
+        raise ValueError("symlink input refused")
+    xml = convert(source_data=source_path.read_bytes(), trace_data=trace_path.read_bytes())
+    temporary = folder / "sonar-generic-coverage.xml.tmp"
     try:
-        tmp.write_bytes(xml)
-        os.replace(tmp, args.output)
+        with temporary.open("xb") as file_handle:
+            file_handle.write(xml)
+        os.replace(temporary, output_path)
     finally:
-        tmp.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
     file = ET.fromstring(xml).find("file")
     lines = file.findall("lineToCover")
     hit = sum(element.attrib["covered"] == "true" for element in lines)

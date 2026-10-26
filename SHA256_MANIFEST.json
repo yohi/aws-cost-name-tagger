@@ -5,8 +5,8 @@
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "4acdbbb1bdc0f396a0cf33bc3bc184f3b8bb07a200634b0bbe01d7ebe8def6fc",
-      "bytes": 7185
+      "sha256": "1b5861f1062a73e6f34e81b490680984082e2ed2cabcf73c821ec68c53bf2523",
+      "bytes": 6989
     },
     {
       "path": ".gitignore",
@@ -60,13 +60,13 @@
     },
     {
       "path": "trace_to_sonar_generic.py",
-      "bytes": 3138,
-      "sha256": "6895a73bbabd5e9e8266f825ae7982ae46b59e3289cd2541c24d712067caefbc"
+      "bytes": 3167,
+      "sha256": "898231d325d6543fa76634c7cceaa9e5da3aa34116e3296692bc00867abdc27b"
     },
     {
       "path": "test_trace_to_sonar_generic.py",
-      "bytes": 3766,
-      "sha256": "becbb905c3be78802ccd1f55224dbb88fa9b9d00936d41c53cc260254d16ca44"
+      "bytes": 3620,
+      "sha256": "2cb8c97c740d9f12c5f9fe0a414d87547fa5fcf37526c199bb4810e44e32b27f"
     },
     {
       "path": "docs/SONAR_COVERAGE_HANDOFF_R0.md",

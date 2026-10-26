@@ -98,10 +98,7 @@ jobs:
       - name: Generate Sonar generic coverage evidence (offline only)
         if: matrix.python-version == '3.12'
         run: |
-          uv run --locked --no-build python trace_to_sonar_generic.py \
-            --source aws_cost_name_tagger_v3.py \
-            --trace offline-line-coverage/aws_cost_name_tagger_v3.cover \
-            --output offline-line-coverage/sonar-generic-coverage.xml
+          uv run --locked --no-build python trace_to_sonar_generic.py
 
       - name: Record offline coverage provenance
         if: matrix.python-version == '3.12'

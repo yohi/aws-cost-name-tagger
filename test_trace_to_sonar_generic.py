@@ -19,7 +19,7 @@ class ConverterTests(unittest.TestCase):
         self.trace.write_bytes(ann.encode())
 
     def result(self):
-        return convert(source=self.source, annotated=self.trace)
+        return convert(source_data=self.source.read_bytes(), trace_data=self.trace.read_bytes())
 
     def test_realistic_annotation(self):
         self.files(
@@ -87,12 +87,10 @@ class ConverterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CRLF"):
             self.result()
 
-    def test_reject_other_module(self):
-        self.files("print(1)\n", "    1: print(1)\n")
-        wrong = self.source.with_name("test_aws_cost_name_tagger_v3.py")
-        wrong.write_bytes(self.source.read_bytes())
-        with self.assertRaisesRegex(ValueError, "non-allowlisted"):
-            convert(source=wrong, annotated=self.trace)
+    def test_reject_empty_trace(self):
+        self.files("print(1)\n", "")
+        with self.assertRaisesRegex(ValueError, "line count"):
+            self.result()
 
 
 if __name__ == "__main__":
