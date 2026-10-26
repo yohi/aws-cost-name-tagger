@@ -372,9 +372,8 @@ def _scan_cur_file(path: Path, budget: dict, accept_row) -> tuple:
     return (_cur_file_identity(after), expanded, count, checksum.hexdigest())
 
 
-def cur_candidates(files: list[str], month: str | None, min_cost: float,
-                   max_resources: int, account: str, kind_filter: set[str] | None = None):
-    """Two bounded, receipt-matched passes; no AWS access or report on error."""
+def _cur_input_paths(files: list[str]) -> list[Path]:
+    """Validate the complete CUR file set, including inode/path aliases."""
     if not files or len(files) > MAX_CUR_FILES:
         raise ValueError("CUR input file count out of bounds")
     paths = [Path(filename) for filename in files]
@@ -387,7 +386,11 @@ def cur_candidates(files: list[str], month: str | None, min_cost: float,
         if identity in seen_inodes:
             raise ValueError("Duplicate CUR input, including hardlink/path aliases")
         seen_inodes.add(identity)
+    return paths
 
+
+def _cur_scan_periods(paths: list[Path]) -> tuple:
+    """First bounded pass: collect every month and each file's receipt."""
     periods = set()
     receipts = []
     first_budget = {"bytes": 0, "rows": 0}
@@ -403,64 +406,105 @@ def cur_candidates(files: list[str], month: str | None, min_cost: float,
 
     for path in paths:
         receipts.append(_scan_cur_file(path, first_budget, record_month))
-    if month is None and not periods:
-        raise ValueError("CUR input contains no billing rows; specify --month")
-    active_month = month or max(periods)
+    return periods, receipts
+
+
+def _cur_selected_usage(row, active_month: str, account: str) -> bool:
+    """Preserve the original selection order before currency enforcement."""
+    period = row.get("bill_billing_period_start_date", "")
+    if not isinstance(period, str):
+        raise ValueError("CUR billing period missing")
+    if len(period[:7]) != len(active_month) or not period.startswith(active_month):
+        return False
+    if row["line_item_usage_account_id"] != account:
+        return False
+    typ = row["line_item_line_item_type"]
+    if typ not in ("Usage", "DiscountedUsage", "SavingsPlanCoveredUsage"):
+        return False
+    if row.get("line_item_currency_code") != "USD":
+        raise ValueError("Non-USD CUR line item; currency conversion is not implemented")
+    return True
+
+
+def _cur_resource_key(row, account: str, kind_filter: set[str] | None):
+    """Resolve the CUR target only after selected-row currency validation."""
+    raw_id = row["line_item_resource_id"].strip()
+    if not raw_id:
+        return None
+    kind, locator, arn_region = rid_class(raw_id)
+    if raw_id.startswith("arn:"):
+        arn_account = raw_id.split(":", 5)[4]
+        if arn_account and arn_account != account:
+            return None
+    if kind == "unsupported" or (kind_filter is not None and kind not in kind_filter):
+        return None
+    region = arn_region or row.get("product_region_code", "")
+    if not region and kind == "s3_bucket":
+        region = "global"
+    if not region:
+        return None
+    return kind, locator, region
+
+
+def _cur_accumulate_usage(row, active_month, account, kind_filter, aggregates, provenance):
+    """Update one selected target, retaining distinct-count and finite budgets."""
+    if not _cur_selected_usage(row, active_month, account):
+        return
+    key = _cur_resource_key(row, account, kind_filter)
+    if key is None:
+        return
+    amount = cost_of(row)
+    if key not in aggregates and len(aggregates) >= MAX_CUR_DISTINCT_RESOURCES:
+        raise ValueError("CUR distinct-resource budget exceeded")
+    proposed_total = aggregates[key] + amount
+    if not math.isfinite(proposed_total):
+        raise ValueError("CUR aggregated amount is not finite")
+    aggregates[key] = proposed_total
+    provenance[key]["services"].add(row["line_item_product_code"])
+    provenance[key]["billing_rows"] += 1
+    provenance[key]["currency"].add(row["line_item_currency_code"])
+
+
+def _cur_scan_aggregates(paths, receipts, active_month, account, kind_filter):
+    """Second bounded pass: aggregate and compare each first-pass receipt."""
     aggregates = defaultdict(float)
     provenance = defaultdict(lambda: {"services": set(), "billing_rows": 0, "currency": set()})
 
     def aggregate_row(row):
-        period = row.get("bill_billing_period_start_date", "")
-        if not isinstance(period, str):
-            raise ValueError("CUR billing period missing")
-        if period[:7] != active_month:
-            return
-        if row["line_item_usage_account_id"] != account:
-            return
-        typ = row["line_item_line_item_type"]
-        if typ not in ("Usage", "DiscountedUsage", "SavingsPlanCoveredUsage"):
-            return
-        if row.get("line_item_currency_code") != "USD":
-            raise ValueError("Non-USD CUR line item; currency conversion is not implemented")
-        raw_id = row["line_item_resource_id"].strip()
-        if not raw_id:
-            return
-        kind, locator, arn_region = rid_class(raw_id)
-        if raw_id.startswith("arn:"):
-            arn_account = raw_id.split(":", 5)[4]
-            if arn_account and arn_account != account:
-                return
-        if kind == "unsupported" or (kind_filter is not None and kind not in kind_filter):
-            return
-        region = arn_region or row.get("product_region_code", "")
-        if not region and kind == "s3_bucket":
-            region = "global"
-        if not region:
-            return
-        amount = cost_of(row)
-        key = (kind, locator, region)
-        if key not in aggregates and len(aggregates) >= MAX_CUR_DISTINCT_RESOURCES:
-            raise ValueError("CUR distinct-resource budget exceeded")
-        proposed_total = aggregates[key] + amount
-        if not math.isfinite(proposed_total):
-            raise ValueError("CUR aggregated amount is not finite")
-        aggregates[key] = proposed_total
-        provenance[key]["services"].add(row["line_item_product_code"])
-        provenance[key]["billing_rows"] += 1
-        provenance[key]["currency"].add(row["line_item_currency_code"])
+        _cur_accumulate_usage(row, active_month, account, kind_filter,
+                              aggregates, provenance)
 
     second_budget = {"bytes": 0, "rows": 0}
     for idx, path in enumerate(paths):
         second_receipt = _scan_cur_file(path, second_budget, aggregate_row)
         if receipts[idx] != second_receipt:
             raise ValueError("CUR content or metadata changed between passes")
+    return aggregates, provenance
+
+
+def _cur_ranked_candidates(aggregates, provenance, min_cost, max_resources):
+    """Retain stable cost ranking, thresholding, cap and report projections."""
     ranked = sorted(aggregates.items(), key=lambda x: -x[1])
     ranked = [(k, v) for k, v in ranked if v >= min_cost][:max_resources]
-    return active_month, [{"kind": k[0], "locator": k[1], "region": k[2],
+    return [{"kind": k[0], "locator": k[1], "region": k[2],
         "effective_usage_cost_usd": round(v, 6),
         "source_services": sorted(provenance[k]["services"]),
         "billing_rows": provenance[k]["billing_rows"],
         "currency": sorted(provenance[k]["currency"])} for k, v in ranked]
+
+
+def cur_candidates(files: list[str], month: str | None, min_cost: float,
+                   max_resources: int, account: str, kind_filter: set[str] | None = None):
+    """Two bounded, receipt-matched passes; no AWS access or report on error."""
+    paths = _cur_input_paths(files)
+    periods, receipts = _cur_scan_periods(paths)
+    if month is None and not periods:
+        raise ValueError("CUR input contains no billing rows; specify --month")
+    active_month = month or max(periods)
+    aggregates, provenance = _cur_scan_aggregates(
+        paths, receipts, active_month, account, kind_filter)
+    return active_month, _cur_ranked_candidates(
+        aggregates, provenance, min_cost, max_resources)
 
 
 class AWSReadBudgetExceeded(RuntimeError):
