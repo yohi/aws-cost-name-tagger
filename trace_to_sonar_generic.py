@@ -35,6 +35,8 @@ def convert(*, source_data: bytes, trace_data: bytes) -> bytes:
     if b"\r" in source_data or b"\r" in trace_data:
         raise ValueError("CRLF is not supported")
     # CPython trace appends LF even when the original source has no final LF.
+    if not trace_data:
+        raise ValueError("trace/source line count mismatch")
     if not trace_data.endswith(b"\n"):
         raise ValueError("trace missing terminal LF")
     # Strictly preserve physical LF line boundaries (unlike str.splitlines).
