@@ -72,6 +72,11 @@
       "path": "docs/SONAR_COVERAGE_HANDOFF_R0.md",
       "bytes": 2490,
       "sha256": "7784a1162afd494b3727d746a1508e8a72f5929959c0fb20a5af7d680eec9929"
+    },
+    {
+      "path": "docs/SONAR_COVERAGE_CUTOVER_CONTRACT_R0.md",
+      "sha256": "cb5fbf203934f3263a5c0d07e00367ebd1153127ccc0c57bbfb630a1e4f88b53",
+      "bytes": 9453
     }
   ],
   "repository_note": "GitHub feature branch: includes committed uv.lock and Safety Hold CI; test_results.txt and uv_lock_attempt.txt retain historical ZIP-era results."
