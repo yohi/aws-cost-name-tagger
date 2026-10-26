@@ -44,7 +44,7 @@ jobs:
           test "$(uv --version | awk '{print $2}')" = "0.13.5"
 
       - name: Install pinned dependencies
-        run: uv sync --locked --python "${{ matrix.python-version }}"
+        run: uv sync --locked --no-build --no-cache --python "${{ matrix.python-version }}"
 
       - name: Verify pinned boto3 and CRT
         run: |
