@@ -48,11 +48,11 @@ jobs:
 
       - name: Verify pinned boto3 and CRT
         run: |
-          uv run --locked python -c 'import boto3, awscrt; assert boto3.__version__ == "1.43.116", boto3.__version__; print("boto3:", boto3.__version__)'
+          uv run --locked --no-build python -c 'import boto3, awscrt; assert boto3.__version__ == "1.43.116", boto3.__version__; print("boto3:", boto3.__version__)'
 
       - name: Validate SHA-256 manifest
         run: |
-          uv run --locked python - <<'PY'
+          uv run --locked --no-build python - <<'PY'
           import hashlib
           import json
           from pathlib import Path
@@ -72,10 +72,10 @@ jobs:
           PY
 
       - name: Unit tests (module runner)
-        run: uv run --locked python -m unittest -q test_aws_cost_name_tagger_v3
+        run: uv run --locked --no-build python -m unittest -q test_aws_cost_name_tagger_v3
 
       - name: Unit tests (direct script runner)
-        run: uv run --locked python test_aws_cost_name_tagger_v3.py
+        run: uv run --locked --no-build python test_aws_cost_name_tagger_v3.py
 
       # Python standard-library trace provides executable-line instrumentation
       # without adding unpinned dependencies. It is not branch/MC/DC coverage.

@@ -5,8 +5,8 @@
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "7744e50ca73a4d2f98019ee79249a589dd9fc71d82d6026929e4ebed67cb36fa",
-      "bytes": 6520
+      "sha256": "b13dda23a86febbd88d329fbf8f1f27e3559bfa44ef76bf8958a4a524cef2aa3",
+      "bytes": 6564
     },
     {
       "path": ".gitignore",
