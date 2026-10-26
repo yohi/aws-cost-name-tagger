@@ -1169,10 +1169,16 @@ def journal_event(path: Path, event: dict):
     """
     path = Path(path)
     payload = json.dumps({"utc": datetime.now(timezone.utc).isoformat(), **event}, ensure_ascii=False, sort_keys=True) + "\n"
-    flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+    # O_NONBLOCK makes a substituted FIFO fail promptly even when no reader
+    # exists; an O_NOFOLLOW leaf check alone does not constrain file type.
+    flags = (os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+             | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     with _private_directory_fd(path.parent, create=False) as dfd:
         fd = os.open(path.name, flags, dir_fd=dfd)
         try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError("Audit journal must be an existing regular file")
             data = payload.encode("utf-8")
             while data:
                 written = os.write(fd, data)
