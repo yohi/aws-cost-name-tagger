@@ -5,8 +5,8 @@
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "1e9a7adf698631fbe9b35f2329445f08430915c92d3c07828f7c761b1c95aa5b",
-      "bytes": 2137
+      "sha256": "3372fad871e97018541985a867aeb351992b80d5a5d01dc26b4d60dc3364973c",
+      "bytes": 3541
     },
     {
       "path": ".gitignore",
@@ -15,8 +15,8 @@
     },
     {
       "path": "aws_cost_name_tagger_v3.py",
-      "sha256": "7817e4761db34447a594e2d601a7df8e8e74c1be216949168cb15553aafde81a",
-      "bytes": 90498
+      "sha256": "40df1859f171d4b0c23532ca66b3d8f95db4fce225a861fcf522c233be83af0a",
+      "bytes": 90876
     },
     {
       "path": "example_report_FORMAT_ONLY.csv",
@@ -30,8 +30,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "af237189775334e0fae9ccfcd9cc8169decaadc7ab6656e61de98f5c0b8d6e64",
-      "bytes": 21607
+      "sha256": "835d261e082f35657739611041f1fcf1a2fbb1d5239bbd8e7e5c5064e3644c8c",
+      "bytes": 23389
     },
     {
       "path": "SAFETY_REVIEW_RESULT.md",
@@ -40,8 +40,8 @@
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
-      "sha256": "248d6bc93c4dbb66e11b73265898eb674a20f6b3780a3f00d809120cbbc1a200",
-      "bytes": 142727
+      "sha256": "a6e6338daaf41e7738f906bea5ca154fd2b44463a44cc5a4e859ce251ee01374",
+      "bytes": 147609
     },
     {
       "path": "test_results.txt",

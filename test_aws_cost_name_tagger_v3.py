@@ -2798,5 +2798,113 @@ class AWSReadBudgetPR14R1CorrectionsTests(unittest.TestCase):
                 self.assertEqual(len([c for c in fake.calls
                                       if c[0]=='DescribeDBClusters']),min(pages,25))
 
+
+
+class OfflineJournalBoundaryPR15Tests(unittest.TestCase):
+    """AUD-004: journals must be real files even when a leaf is substituted."""
+
+    def test_pr15_regular_journal_appends_and_preserves_prior_records(self):
+        import os
+        import stat
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'audit.jsonl'
+            t.create_audit_journal(path)
+            t.journal_event(path, {'event':'start', 'id':'one'})
+            first=path.read_bytes()
+            t.journal_event(path, {'event':'finish', 'id':'two'})
+            body=path.read_bytes()
+            self.assertTrue(body.startswith(first))
+            self.assertEqual([json.loads(line)['id'] for line in body.splitlines()],
+                             ['one','two'])
+            self.assertTrue(stat.S_ISREG(path.stat().st_mode))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o600)
+            self.assertEqual(path.stat().st_size,len(body))
+
+    def test_pr15_fifo_with_open_reader_rejected_without_writing(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo=Path(tmp)/'audit.jsonl'
+            os.mkfifo(fifo,0o600)
+            reader=os.open(fifo,os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                with self.assertRaisesRegex(ValueError,'regular file'):
+                    t.journal_event(fifo,{'event':'never_write'})
+                self.assertEqual(os.read(reader,4096),b'')
+            finally:
+                os.close(reader)
+
+    def test_pr15_fifo_without_reader_uses_nonblocking_open(self):
+        import errno
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo=Path(tmp)/'audit.jsonl'
+            os.mkfifo(fifo,0o600)
+            original_open=os.open
+            checked=[]
+
+            def intercept(path, flags, *args, **kwargs):
+                if path == fifo.name and flags & os.O_WRONLY:
+                    checked.append(flags)
+                    # A regression omitting O_NONBLOCK must fail the test
+                    # rather than hanging forever while opening a FIFO.
+                    self.assertTrue(flags & os.O_NONBLOCK)
+                return original_open(path,flags,*args,**kwargs)
+
+            with patch.object(t.os,'open',side_effect=intercept):
+                with self.assertRaises(OSError) as caught:
+                    t.journal_event(fifo,{'event':'never_write'})
+            self.assertEqual(caught.exception.errno,errno.ENXIO)
+            self.assertEqual(len(checked),1)
+
+    def test_pr15_directory_and_symlink_journals_rejected(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            directory=root/'audit.jsonl'
+            directory.mkdir()
+            with self.assertRaises(OSError):
+                t.journal_event(directory,{'event':'must_refuse'})
+            real=root/'real.jsonl'
+            real.write_text('sentinel\n',encoding='utf-8')
+            link=root/'alias.jsonl'
+            link.symlink_to(real)
+            with self.assertRaises(OSError):
+                t.journal_event(link,{'event':'must_refuse'})
+            self.assertEqual(real.read_text(encoding='utf-8'),'sentinel\n')
+
+    def test_pr15_journal_open_fd_type_check_precedes_write_and_fsync(self):
+        import os
+        import stat
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'audit.jsonl'
+            t.create_audit_journal(path)
+            with patch.object(t.os,'fstat',return_value=SimpleNamespace(
+                 st_mode=stat.S_IFIFO | 0o600)), \
+                 patch.object(t.os,'write') as write, \
+                 patch.object(t.os,'fsync') as fsync:
+                with self.assertRaisesRegex(ValueError,'regular file'):
+                    t.journal_event(path,{'event':'must_not_write'})
+                write.assert_not_called()
+                fsync.assert_not_called()
+            self.assertEqual(path.read_bytes(),b'')
+
+    def test_pr15_journal_write_or_fsync_failure_never_silent(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'audit.jsonl'
+            t.create_audit_journal(path)
+            t.journal_event(path,{'event':'first'})
+            before=path.read_bytes()
+            with patch.object(t.os,'write',side_effect=OSError('write failed')):
+                with self.assertRaisesRegex(OSError,'write failed'):
+                    t.journal_event(path,{'event':'second'})
+            self.assertEqual(path.read_bytes(),before)
+            with patch.object(t.os,'fsync',side_effect=OSError('fsync failed')):
+                with self.assertRaisesRegex(OSError,'fsync failed'):
+                    t.journal_event(path,{'event':'third'})
+            self.assertTrue(path.read_bytes().startswith(before))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
