@@ -60,13 +60,13 @@
     },
     {
       "path": "trace_to_sonar_generic.py",
-      "bytes": 3167,
-      "sha256": "898231d325d6543fa76634c7cceaa9e5da3aa34116e3296692bc00867abdc27b"
+      "bytes": 4637,
+      "sha256": "740a48627f57570906e25c340995a29d1e9de5d8708f9f2d716353edb99782ff"
     },
     {
       "path": "test_trace_to_sonar_generic.py",
-      "bytes": 3620,
-      "sha256": "2cb8c97c740d9f12c5f9fe0a414d87547fa5fcf37526c199bb4810e44e32b27f"
+      "bytes": 9513,
+      "sha256": "89e0f88f46d0d56a9beab79e1671a81017dfa020825520a3cb6a40986950bd56"
     },
     {
       "path": "docs/SONAR_COVERAGE_HANDOFF_R0.md",

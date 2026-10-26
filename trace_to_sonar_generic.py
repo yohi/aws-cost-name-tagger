@@ -34,8 +34,15 @@ def _status(annotated: str, actual: str, line: int) -> bool | None:
 def convert(*, source_data: bytes, trace_data: bytes) -> bytes:
     if b"\r" in source_data or b"\r" in trace_data:
         raise ValueError("CRLF is not supported")
-    lines = source_data.decode("utf-8", errors="strict").splitlines()
-    trace = trace_data.decode("utf-8", errors="strict").splitlines()
+    # CPython trace appends LF even when the original source has no final LF.
+    if not trace_data.endswith(b"\n"):
+        raise ValueError("trace missing terminal LF")
+    # Strictly preserve physical LF line boundaries (unlike str.splitlines).
+    lines = source_data.decode("utf-8", errors="strict").split("\n")
+    trace = trace_data.decode("utf-8", errors="strict").split("\n")
+    if source_data.endswith(b"\n"):
+        lines.pop()
+    trace.pop()  # The last trace field must be empty after its required LF.
     if not lines or len(lines) != len(trace):
         raise ValueError("trace/source line count mismatch")
     root = ET.Element("coverage", version="1")
@@ -53,6 +60,40 @@ def convert(*, source_data: bytes, trace_data: bytes) -> bytes:
     return ET.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
 
 
+def _publish_report(xml: bytes, folder: Path) -> None:
+    """Publish fully written XML, never replacing an existing report or stage."""
+    temporary = folder / "sonar-generic-coverage.xml.tmp"
+    output = folder / "sonar-generic-coverage.xml"
+    owned = published = False
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        owned = True
+        try:
+            remaining = memoryview(xml)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError("no forward progress writing coverage XML")
+                remaining = remaining[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.link(temporary, output)  # Atomic no-overwrite publication.
+        published = True
+    finally:
+        if owned:
+            try:
+                temporary.unlink()
+            except OSError:
+                if published:
+                    # A cleanup failure is an error: roll back our new output.
+                    try:
+                        output.unlink()
+                    except OSError as rollback_error:
+                        raise RuntimeError("coverage cleanup and rollback both failed") from rollback_error
+                raise
+
+
 def main() -> None:
     if len(sys.argv) != 1:
         raise SystemExit("no external path arguments accepted")
@@ -64,13 +105,7 @@ def main() -> None:
     if source_path.is_symlink() or folder.is_symlink() or trace_path.is_symlink():
         raise ValueError("symlink input refused")
     xml = convert(source_data=source_path.read_bytes(), trace_data=trace_path.read_bytes())
-    temporary = folder / "sonar-generic-coverage.xml.tmp"
-    try:
-        with temporary.open("xb") as file_handle:
-            file_handle.write(xml)
-        os.replace(temporary, output_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _publish_report(xml, folder)
     file = ET.fromstring(xml).find("file")
     lines = file.findall("lineToCover")
     hit = sum(element.attrib["covered"] == "true" for element in lines)
