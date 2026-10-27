@@ -37,7 +37,8 @@ class FakeEC2:
         return {'Reservations': [{'Instances': [{'InstanceId': INSTANCE, 'Tags': tags}]}]}
 
     def describe_snapshots(self, SnapshotIds, OwnerIds):
-        assert SnapshotIds == [SNAPSHOT] and OwnerIds == ['self']
+        assert SnapshotIds == [SNAPSHOT]
+        assert OwnerIds == ['self']
         return {'Snapshots': [{'SnapshotId': SNAPSHOT, 'OwnerId': ACCOUNT, 'VolumeId': VOLUME, 'Tags': []}]}
 
     def describe_nat_gateways(self, NatGatewayIds):
@@ -110,7 +111,7 @@ class AlgorithmTests(unittest.TestCase):
                 inv=t.Investigator(FakeSession({'ec2': ec2}), ACCOUNT)
                 out=inv.resolve(row_for('volume', VOLUME))
                 self.assertEqual((out['status'],out['name_state']), (status,state))
-                self.assertEqual(out['name_key_present'], True)
+                self.assertIs(out['name_key_present'], True)
                 self.assertEqual(out['name_raw_value'], existing)
                 self.assertEqual(bool(out['proposed_name']), status=='proposed')
                 self.assertEqual(ec2.writes, [])
@@ -2756,7 +2757,7 @@ class AWSReadBudgetPR14Tests(unittest.TestCase):
         raw=ObservingSession({'ec2':ec2, 'sts':FakeSTS(), 'iam':FakeIAM()})
         budget=t.AWSReadBudget(max_calls=4, max_elapsed=1000)
         session=t._BudgetedAWSSession(raw,budget)
-        self.assertEqual(t.assert_account(session,ACCOUNT),None)
+        self.assertIsNone(t.assert_account(session,ACCOUNT))
         result=t.Investigator(session,ACCOUNT).resolve(row_for('volume',VOLUME))
         self.assertEqual(result['status'],'proposed')
         self.assertEqual(budget.calls,3)  # STS + EBS + parent EC2
