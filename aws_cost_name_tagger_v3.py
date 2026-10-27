@@ -691,7 +691,7 @@ class Investigator:
         if direct:
             return direct, f"EBS {vid} Name={direct}"
         attachments=vol.get("Attachments",[])
-        ids=set(a.get("InstanceId") for a in attachments if a.get("InstanceId"))
+        ids={a.get("InstanceId") for a in attachments if a.get("InstanceId")}
         if len(ids)!=1:
             raise ValueError(f"EBS {vid} has {len(ids)} distinct current EC2 attachments; ambiguous")
         iid=next(iter(ids))
@@ -937,7 +937,7 @@ class Investigator:
                 role=""
                 if "resize" in comment.lower():
                     role="image-resize" if ("image" in comment.lower()) else "resize"
-                elif any(a.startswith("image.") or a.startswith("static.image.") for a in aliases):
+                elif any(a.startswith(("image.", "static.image.")) for a in aliases):
                     role="image"
                 # No arbitrary Comment->Product mapping. A Comment is weak evidence
                 # of purpose, while actual origin remains the ownership anchor.
@@ -972,7 +972,7 @@ class Investigator:
                     anchor=meaningful(conf.get("FunctionName",""))
                     if anchor:evidence=f"log group {loc} -> lambda function {function}"
                 if not anchor:raise ValueError("LogGroup cannot be linked to a structured resource name")
-                candidate=anchor if anchor.endswith("-log") or anchor.endswith("-logs") else suffix_name(anchor,"logs")
+                candidate=anchor if anchor.endswith(("-log", "-logs")) else suffix_name(anchor,"logs")
                 if not evidence:evidence=f"LogGroup explicitly named {loc}"
                 res["write_target"]=arn
             elif kind=="lambda":

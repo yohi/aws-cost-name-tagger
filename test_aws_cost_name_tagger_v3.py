@@ -102,6 +102,25 @@ class AlgorithmTests(unittest.TestCase):
             self.assertEqual(out['status'], 'manual_review')
             self.assertEqual(out['proposed_name'], '')
 
+    def test_duplicate_and_missing_ebs_owners_are_unambiguous_or_review_only(self):
+        repeated=FakeEC2(attachments=[
+            {'InstanceId': INSTANCE, 'Device': '/dev/xvda'},
+            {'InstanceId': INSTANCE, 'Device': '/dev/xvdb'},
+        ])
+        resolved=t.Investigator(FakeSession({'ec2': repeated}), ACCOUNT).resolve(
+            row_for('volume', VOLUME))
+        self.assertEqual(resolved['status'], 'proposed')
+        self.assertEqual(resolved['proposed_name'], 'scs2-prd-web-ec2-ebs-xvda-abcdef0')
+        self.assertEqual(repeated.writes, [])
+
+        no_ids=FakeEC2(attachments=[{'Device': '/dev/xvda'},
+                                    {'InstanceId': '', 'Device': '/dev/xvdb'}])
+        unresolved=t.Investigator(FakeSession({'ec2': no_ids}), ACCOUNT).resolve(
+            row_for('volume', VOLUME))
+        self.assertEqual(unresolved['status'], 'manual_review')
+        self.assertEqual(unresolved['proposed_name'], '')
+        self.assertEqual(no_ids.writes, [])
+
     def test_existing_nonempty_protected_and_empty_proposed(self):
         for existing, state, status in [('already-tagged', 'NONEMPTY', 'already_named'),
                                          ('', 'EMPTY', 'proposed'),
@@ -374,6 +393,24 @@ class LiveEvidenceV2Tests(unittest.TestCase):
         self.assertEqual(v['proposed_name'],'coord-app-prod-image-cloudfront-i7ayqu8')
         self.assertIn("'image.ogne.jp'",v['evidence'])
 
+    def test_cloudfront_alias_prefix_and_comment_priority(self):
+        arn=f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
+        cases=(
+            (['static.image.ogne.jp'], 'ogne', 'coord-app-prod-image-cloudfront-i7ayqu8'),
+            (['assets.ogne.jp'], 'ogne', 'coord-app-prod-cloudfront-i7ayqu8'),
+            (['IMAGE.ogne.jp'], 'ogne', 'coord-app-prod-cloudfront-i7ayqu8'),
+            (['image.ogne.jp'], 'resize image', 'coord-app-prod-image-resize-cloudfront-i7ayqu8'),
+        )
+        for aliases,comment,expected in cases:
+            with self.subTest(aliases=aliases,comment=comment):
+                fake=FakeCloudFront(aliases=aliases,comment=comment)
+                result=t.Investigator(FakeSession({'cloudfront':fake}),ACCOUNT).resolve(
+                    row_for('cloudfront',arn,'us-east-1'))
+                self.assertEqual(result['status'],'proposed')
+                self.assertEqual(result['confidence'],'medium')
+                self.assertEqual(result['proposed_name'],expected)
+                self.assertEqual(result['write_target'],arn)
+
     def test_cloudfront_conflicting_origin_holds(self):
         fake=FakeCloudFront(origins=['scs2-prd-web.example.net','storecms2-prd-web.example.net'])
         inv=t.Investigator(FakeSession({'cloudfront':fake}),ACCOUNT)
@@ -388,6 +425,29 @@ class LiveEvidenceV2Tests(unittest.TestCase):
         arn=f'arn:aws:cloudfront::{ACCOUNT}:distribution/E2PPT5FI7AYQU8'
         v=inv.resolve(row_for('cloudfront',arn,'us-east-1'))
         self.assertEqual(v['status'],'already_named')
+
+    def test_log_group_suffixes_preserve_proposals_and_arn(self):
+        class FakeLogTags:
+            def __init__(self):
+                self.arns=[]
+            def list_tags_for_resource(self,resourceArn):
+                self.arns.append(resourceArn)
+                return {'tags': {}}
+
+        for name,expected in (
+            ('scs2-prd-batch-log', 'scs2-prd-batch-log'),
+            ('scs2-prd-batch-logs', 'scs2-prd-batch-logs'),
+            ('scs2-prd-batch', 'scs2-prd-batch-logs'),
+        ):
+            with self.subTest(name=name):
+                fake=FakeLogTags()
+                result=t.Investigator(FakeSession({'logs':fake}),ACCOUNT).resolve(
+                    row_for('log_group',name,REGION))
+                arn=f'arn:aws:logs:{REGION}:{ACCOUNT}:log-group:{name}'
+                self.assertEqual(result['status'],'proposed')
+                self.assertEqual(result['proposed_name'],expected)
+                self.assertEqual(result['write_target'],arn)
+                self.assertEqual(fake.arns,[arn])
 
     def test_shared_scope_infrastructure_fails_closed(self):
         self.assertTrue(t.shared_scope('shared-service-prd-athena-workgroup'))
