@@ -18,23 +18,43 @@ SNAPSHOT = 'snap-0123456789abcdef0'
 
 
 class FakeEC2:
-    def __init__(self, instance_name='scs2-prd-web-ec2', volume_name=None, attachments=None, instance_extra_tags=None):
+    def __init__(self, instance_name='scs2-prd-web-ec2', volume_name=None, attachments=None,
+                 instance_extra_tags=None, volume_extra=None, parent_instance_id=INSTANCE, volume_missing=()):
         self.instance_name = instance_name
         self.instance_extra_tags = instance_extra_tags or []
         self.volume_name = volume_name
         self.attachments = attachments if attachments is not None else [
             {'InstanceId': INSTANCE, 'Device': '/dev/xvda', 'State': 'attached'}]
+        self.parent_instance_id = parent_instance_id
+        self.volume_extra = volume_extra or {}
+        self.volume_missing = tuple(volume_missing)
+        self.describe_volumes_calls = 0
+        self.describe_instances_calls = 0
+        self.describe_instances_requests = []
         self.writes = []
 
     def describe_volumes(self, VolumeIds):
         assert VolumeIds == [VOLUME]
+        self.describe_volumes_calls += 1
         tags = [] if self.volume_name is None else [{'Key': 'Name', 'Value': self.volume_name}]
-        return {'Volumes': [{'VolumeId': VOLUME, 'Attachments': self.attachments, 'Tags': tags}]}
+        vol = {'VolumeId': VOLUME, 'Attachments': self.attachments, 'Tags': tags,
+               'State': 'in-use', 'MultiAttachEnabled': False}
+        vol.update(self.volume_extra)
+        for key in self.volume_missing:
+            vol.pop(key, None)
+        return {'Volumes': [vol]}
 
     def describe_instances(self, InstanceIds):
-        assert InstanceIds == [INSTANCE]
+        # Record attempted reads BEFORE checking the request. The production
+        # resolver may catch an AssertionError, but the test oracle must not
+        # mistake that failed read for a zero-read guard.
+        self.describe_instances_calls += 1
+        self.describe_instances_requests.append(
+            list(InstanceIds) if isinstance(InstanceIds, list) else InstanceIds
+        )
+        assert InstanceIds == [self.parent_instance_id]
         tags = ([] if self.instance_name is None else [{'Key': 'Name', 'Value': self.instance_name}]) + self.instance_extra_tags
-        return {'Reservations': [{'Instances': [{'InstanceId': INSTANCE, 'Tags': tags}]}]}
+        return {'Reservations': [{'Instances': [{'InstanceId': self.parent_instance_id, 'Tags': tags}]}]}
 
     def describe_snapshots(self, SnapshotIds, OwnerIds):
         assert SnapshotIds == [SNAPSHOT]
@@ -65,6 +85,271 @@ class FakeSession:
 
 def row_for(kind, loc, region=REGION):
     return {'kind': kind, 'locator': loc, 'region': region, 'effective_usage_cost_usd': 10.0}
+
+
+class Issue35ContractTests(unittest.TestCase):
+    """Offline C1-C9 fail-closed contract; no AWS SDK/network calls."""
+
+    def resolve_fake(self, fake):
+        inv=t.Investigator(FakeSession({'ec2': fake}), ACCOUNT)
+        out=inv.resolve(row_for('volume', VOLUME))
+        self.assertEqual(fake.writes, [])
+        self.assertEqual(fake.describe_volumes_calls, 1)
+        return out
+
+    def assert_refused(self, fake):
+        out=self.resolve_fake(fake)
+        self.assertEqual(out['status'], 'manual_review', out)
+        self.assertEqual(out['proposed_name'], '', out)
+        self.assertEqual(out['confidence'], 'none', out)
+        self.assertEqual(fake.describe_instances_calls, 0, out)
+        self.assertEqual(fake.describe_instances_requests, [], out)
+        return out
+
+    def assert_proposed(self, fake):
+        out=self.resolve_fake(fake)
+        self.assertEqual(out['status'], 'proposed', out)
+        self.assertEqual(out['proposed_name'], 'scs2-prd-web-ec2-ebs-xvda-abcdef0', out)
+        self.assertEqual(out['confidence'], 'high', out)
+        self.assertEqual(fake.describe_instances_calls, 1, out)
+        self.assertEqual(fake.describe_instances_requests, [[fake.parent_instance_id]], out)
+        return out
+
+    def test_parent_read_oracle_records_swallowed_wrong_id_attempt(self):
+        # A valid attachment reaches parent lookup, but the Fake expects another ID.
+        # resolve() catches the resulting AssertionError and reports manual_review.
+        # The attempted read must still be visible to the test oracle.
+        unexpected_parent='i-11111111111111111'
+        fake=FakeEC2(parent_instance_id=unexpected_parent)
+        out=self.resolve_fake(fake)
+        self.assertEqual(out['status'],'manual_review')
+        self.assertEqual(out['proposed_name'],'')
+        self.assertEqual(fake.describe_instances_calls,1)
+        self.assertEqual(fake.describe_instances_requests,[[INSTANCE]])
+
+    def test_c1_8_and_17_digit_positive(self):
+        for iid in ('i-01234567', INSTANCE):
+            with self.subTest(iid=iid):
+                self.assert_proposed(FakeEC2(attachments=[{'InstanceId': iid, 'Device': '/dev/xvda', 'State': 'attached'}], parent_instance_id=iid))
+
+    def test_c1_owner_syntax_negative(self):
+        for iid in ('i-0123456','i-012345678','i-0123456789abcdef','i-0123456789abcdef01',
+                    'i-0123456G','I-01234567','i-１２３４５６７８',None,123,'i-01234567 '):
+            with self.subTest(iid=iid):
+                self.assert_refused(FakeEC2(attachments=[{'InstanceId':iid,'Device':'/dev/xvda','State':'attached'}]))
+
+    def test_c1_two_distinct_valid_owners_in_both_orders(self):
+        distinct=('i-0123456789abcdef0', 'i-00000000000000001')
+        for ids in (distinct, tuple(reversed(distinct))):
+            with self.subTest(ids=ids):
+                attachments=[{'InstanceId':iid,'Device':'/dev/xvda','State':'attached'} for iid in ids]
+                self.assert_refused(FakeEC2(attachments=attachments))
+
+    def test_c2_device_grammar(self):
+        for device in ('/dev/xvda','/dev/sda1','/dev/sdf'):
+            with self.subTest(device=device):
+                fake=FakeEC2(attachments=[{'InstanceId':INSTANCE,'Device':device,'State':'attached'}])
+                out=self.resolve_fake(fake)
+                self.assertEqual(out['status'],'proposed',out)
+                self.assertEqual(fake.describe_instances_calls,1)
+        for device in ('/tmp/foo','/dev/../xvda','/dev/a','/dev/','/dev/Xvda','/dev/éx','/dev/xvda\n',None,123):
+            with self.subTest(device=device):
+                self.assert_refused(FakeEC2(attachments=[{'InstanceId':INSTANCE,'Device':device,'State':'attached'}]))
+
+    def test_c2_conflicting_raw_device_both_orderings(self):
+        for d1,d2 in (('/dev/xvda','/dev/xvdb'),('/dev/xvdb','/dev/xvda'),
+                      ('/dev/a_b','/dev/a-b'),('/dev/a-b','/dev/a_b')):
+            with self.subTest(a=d1,b=d2):
+                att=[{'InstanceId':INSTANCE,'Device':d,'State':'attached'} for d in (d1,d2)]
+                self.assert_refused(FakeEC2(attachments=att))
+        self.assert_proposed(FakeEC2(attachments=[{'InstanceId':INSTANCE,'Device':'/dev/xvda','State':'attached'}]*2))
+
+    def test_c3_every_attachment_state_is_exact(self):
+        for state in (None,'attaching','detaching','busy','Attached',0,True,''):
+            for reverse in (False,True):
+                with self.subTest(state=state,reverse=reverse):
+                    wrong={'InstanceId':INSTANCE,'Device':'/dev/xvda','State':state}
+                    good={'InstanceId':INSTANCE,'Device':'/dev/xvda','State':'attached'}
+                    self.assert_refused(FakeEC2(attachments=[wrong,good] if reverse else [good,wrong]))
+        self.assert_refused(FakeEC2(attachments=[{'InstanceId':INSTANCE,'Device':'/dev/xvda'}]))
+
+    def test_c4_id_account_and_arn_before_any_name(self):
+        arn=f'arn:aws:ec2:{REGION}:{ACCOUNT}:volume/{VOLUME}'
+        for extra in ({'VolumeId':'vol-11111111111111111'}, {'VolumeId':None},
+                      {'OwnerId':'111111111111'}, {'OwnerId':None}, {'OwnerId':int(ACCOUNT)},
+                      {'OwnerId':'４５６７２０７９８５７５'}, {'OwnerId':'45672079857'},
+                      {'VolumeArn':None}, {'VolumeArn':123},
+                      {'VolumeArn':arn.replace(ACCOUNT,'111111111111')},
+                      {'VolumeArn':arn.replace(REGION,'us-east-1')},
+                      {'VolumeArn':arn.replace('arn:aws:','arn:aws-cn:')},
+                      {'VolumeArn':arn.replace(VOLUME,'vol-11111111111111111')},
+                      {'VolumeArn':arn.replace(':ec2:',':s3:')}):
+            for name in (None,'custom',' '):
+                with self.subTest(extra=extra,name=name):
+                    out=self.assert_refused(FakeEC2(volume_name=name,volume_extra=extra))
+                    self.assertEqual(out['name_state'],'UNKNOWN',out)
+        for extra in ({}, {'OwnerId':ACCOUNT}, {'VolumeArn':arn}, {'OwnerId':ACCOUNT,'VolumeArn':arn}):
+            with self.subTest(extra=extra):
+                self.assert_proposed(FakeEC2(volume_extra=extra))
+
+    def test_c5_operator_and_hidden_default(self):
+        for op in ({'Managed':False},{'Managed':False,'Principal':''},
+                   {'Managed':False,'HiddenByDefault':False},
+                   {'Managed':False,'Principal':'','HiddenByDefault':False}):
+            with self.subTest(op=op):self.assert_proposed(FakeEC2(volume_extra={'Operator':op}))
+        for op in (None, {}, {'Managed':True}, {'Managed':0}, {'Managed':None},
+                   {'Managed':False,'Principal':None}, {'Managed':False,'Principal':'aws'},
+                   {'Managed':False,'HiddenByDefault':True},
+                   {'Managed':False,'HiddenByDefault':None},
+                   {'Managed':False,'HiddenByDefault':0},
+                   {'Managed':False,'HiddenByDefault':1},
+                   {'Managed':False,'HiddenByDefault':'False'},
+                   {'Managed':False,'HiddenByDefault':[]}):
+            with self.subTest(op=op):self.assert_refused(FakeEC2(volume_extra={'Operator':op}))
+        for marker in ('AssociatedResource','InstanceOwningService'):
+            for value in ('',None,'aws:ec2'):
+                with self.subTest(marker=marker,value=value):
+                    self.assert_refused(FakeEC2(attachments=[{'InstanceId':INSTANCE,'Device':'/dev/xvda','State':'attached',marker:value}]))
+
+    def test_c6_strict_multiattach_and_c9_lifecycle(self):
+        for value in (None, True, 0, 1, 'False', [], ''):
+            with self.subTest(multi=value):self.assert_refused(FakeEC2(volume_extra={'MultiAttachEnabled':value}))
+        for state in (None,'available','creating','deleting','deleted','error','IN-USE',0,True):
+            with self.subTest(state=state):self.assert_refused(FakeEC2(volume_extra={'State':state}))
+        self.assert_refused(FakeEC2(volume_missing=('State',)))
+        self.assert_refused(FakeEC2(volume_missing=('MultiAttachEnabled',)))
+        self.assert_proposed(FakeEC2(volume_extra={'State':'in-use','MultiAttachEnabled':False}))
+
+    def test_name_protection_only_after_trusted_identity(self):
+        bad={'Attachments':None,'Operator':{'Managed':True},'State':'available','MultiAttachEnabled':True}
+        for name in ('custom',' ','\t'):
+            with self.subTest(name=name):
+                f=FakeEC2(volume_name=name,volume_extra=bad)
+                out=self.resolve_fake(f)
+                self.assertEqual(out['status'],'already_named',out)
+                self.assertEqual(out['existing_name'],name,out)
+                self.assertEqual(f.describe_instances_calls,0)
+
+    def test_attachment_collection_and_volume_binding(self):
+        for attachments in (None, [], [None], [{}], [123],
+                            [{'InstanceId':INSTANCE,'Device':'/dev/xvda','State':'attached','VolumeId':'vol-11111111111111111'}],
+                            [{'InstanceId':INSTANCE,'Device':'/dev/xvda','State':'attached','AssociatedResource':''}]):
+            with self.subTest(attachments=attachments):
+                fake=FakeEC2(volume_extra={'Attachments':attachments})
+                self.assert_refused(fake)
+        self.assert_proposed(FakeEC2(attachments=[{'InstanceId':INSTANCE,'Device':'/dev/xvda','State':'attached','VolumeId':VOLUME}]))
+
+    def test_unknown_name_blocks_parent_read(self):
+        for tags in ([{'Key':'Name'}], [{'Key':'NAME','Value':''}],
+                     [{'Key':'Name','Value':None}],
+                     [{'Key':'Name','Value':'ok'},{'Key':'Name','Value':'other'}]):
+            with self.subTest(tags=tags):
+                fake=FakeEC2(volume_extra={'Tags':tags})
+                out=self.assert_refused(fake)
+                self.assertEqual(out['name_state'],'UNKNOWN')
+
+    def test_describe_volumes_bad_shape(self):
+        for payload in ({'Volumes':'not-a-list'}, {'Volumes':[]},
+                        {'Volumes':[None]}, {'Volumes':[{'VolumeId':VOLUME}, {'VolumeId':VOLUME}]},
+                        None):
+            with self.subTest(payload=payload):
+                class Malformed(FakeEC2):
+                    def describe_volumes(self, VolumeIds):
+                        self.describe_volumes_calls += 1
+                        return payload
+                self.assert_refused(Malformed())
+
+    def test_parent_failure_is_not_preguard_failure(self):
+        f=FakeEC2(instance_name=None)
+        out=self.resolve_fake(f)
+        self.assertEqual(out['status'],'manual_review')
+        self.assertEqual(out['proposed_name'],'')
+        self.assertEqual(f.describe_instances_calls,1)
+        self.assertEqual(f.describe_instances_requests,[[INSTANCE]])
+
+    def test_c8_per_row_api_errors_both_orderings(self):
+        from botocore.exceptions import ClientError, EndpointConnectionError
+        failed_volume='vol-11111111111111111'
+        class TwoResourceEC2(FakeEC2):
+            def __init__(self, error_kind):
+                super().__init__()
+                self.error_kind=error_kind
+            def describe_volumes(self, VolumeIds):
+                if VolumeIds==[failed_volume]:
+                    if self.error_kind=='ClientError':
+                        raise ClientError({'Error':{'Code':'RequestLimitExceeded','Message':'synthetic'}},'DescribeVolumes')
+                    raise EndpointConnectionError(endpoint_url='https://synthetic.invalid')
+                return super().describe_volumes(VolumeIds)
+        for error_kind in ('ClientError','BotoCoreError'):
+            for bad_first in (False,True):
+                with self.subTest(error_kind=error_kind,bad_first=bad_first):
+                    fake=TwoResourceEC2(error_kind)
+                    inv=t.Investigator(FakeSession({'ec2':fake}),ACCOUNT)
+                    items=[row_for('volume',VOLUME),row_for('volume',failed_volume)]
+                    if bad_first:items.reverse()
+                    out=[inv.resolve(x) for x in items]
+                    by_id={i['locator']:r for i,r in zip(items,out)}
+                    self.assertEqual(by_id[VOLUME]['status'],'proposed')
+                    self.assertEqual(by_id[failed_volume]['status'],'api_error')
+                    self.assertEqual(by_id[failed_volume]['proposed_name'],'')
+                    self.assertEqual(fake.writes,[])
+
+    def test_c8_plan_mixed_report_completion_and_prepublication_stderr(self):
+        import contextlib
+        import io
+        from botocore.exceptions import ClientError, EndpointConnectionError
+        failed_volume='vol-11111111111111111'
+
+        class DualVolumeEC2(FakeEC2):
+            def __init__(self, error_kind):
+                super().__init__()
+                self.error_kind=error_kind
+            def describe_volumes(self, VolumeIds):
+                if VolumeIds==[failed_volume]:
+                    if self.error_kind=='ClientError':
+                        raise ClientError({'Error':{'Code':'SyntheticLimit','Message':'synthetic'}}, 'DescribeVolumes')
+                    raise EndpointConnectionError(endpoint_url='https://synthetic.invalid')
+                return super().describe_volumes(VolumeIds)
+
+        headers=['bill_billing_period_start_date','line_item_usage_account_id',
+                 'line_item_line_item_type','line_item_resource_id','line_item_unblended_cost',
+                 'product_region_code','line_item_product_code','line_item_currency_code']
+        real_publish=t.publish_staged_reports
+        for error_kind in ('ClientError','BotoCoreError'):
+            for failing_first in (False,True):
+                with self.subTest(error_kind=error_kind,failing_first=failing_first):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        cur=Path(tmp)/'cost.csv.gz'
+                        ordered=[failed_volume,VOLUME] if failing_first else [VOLUME,failed_volume]
+                        rows=[['2026-10-01',ACCOUNT,'Usage',rid,'12',REGION,'AmazonEC2','USD'] for rid in ordered]
+                        with gzip.open(cur,'wt',encoding='utf-8',newline='') as fh:
+                            writer=csv.writer(fh);writer.writerow(headers);writer.writerows(rows)
+                        args=type('Args',(),{'cur':[str(cur)],'month':'2026-10','account':ACCOUNT,
+                            'profile':None,'min_cost':10,'max_resources':10,'kinds':None,
+                            'products':None,'output':str(Path(tmp)/'plan.json')})()
+                        ec2=DualVolumeEC2(error_kind)
+                        stderr=io.StringIO()
+                        prepublication=[]
+                        def monitor(pairs):
+                            prepublication.append(stderr.getvalue())
+                            return real_publish(pairs)
+                        with patch.object(t,'build_session',return_value=FakeSession({'ec2':ec2})),                              patch.object(t,'assert_account'),                              patch.object(t,'publish_staged_reports',side_effect=monitor),                              contextlib.redirect_stderr(stderr),contextlib.redirect_stdout(io.StringIO()):
+                            result=t.plan(args)
+                        self.assertEqual(prepublication,[''])
+                        by_id={row['locator']:row for row in result['records']}
+                        self.assertEqual(by_id[VOLUME]['status'],'proposed')
+                        self.assertEqual(by_id[failed_volume]['status'],'api_error')
+                        self.assertEqual(by_id[failed_volume]['proposed_name'],'')
+                        self.assertEqual(len(result['records']),2)
+                        self.assertEqual(json.loads(Path(args.output).read_text())['count'],2)
+                        self.assertEqual(ec2.writes,[])
+
+    def test_global_safety_hold_still_blocks_direct_write(self):
+        f=FakeEC2()
+        inv=t.Investigator(FakeSession({'ec2':f}),ACCOUNT)
+        with self.assertRaises(RuntimeError):inv.write_name(row_for('volume',VOLUME))
+        with self.assertRaises(SystemExit):t.apply(None)
+        self.assertEqual(f.writes,[])
 
 
 class AlgorithmTests(unittest.TestCase):
@@ -104,13 +389,13 @@ class AlgorithmTests(unittest.TestCase):
 
     def test_duplicate_and_missing_ebs_owners_are_unambiguous_or_review_only(self):
         repeated=FakeEC2(attachments=[
-            {'InstanceId': INSTANCE, 'Device': '/dev/xvda'},
-            {'InstanceId': INSTANCE, 'Device': '/dev/xvdb'},
+            {'InstanceId': INSTANCE, 'Device': '/dev/xvda', 'State': 'attached'},
+            {'InstanceId': INSTANCE, 'Device': '/dev/xvdb', 'State': 'attached'},
         ])
         resolved=t.Investigator(FakeSession({'ec2': repeated}), ACCOUNT).resolve(
             row_for('volume', VOLUME))
-        self.assertEqual(resolved['status'], 'proposed')
-        self.assertEqual(resolved['proposed_name'], 'scs2-prd-web-ec2-ebs-xvda-abcdef0')
+        self.assertEqual(resolved['status'], 'manual_review')
+        self.assertEqual(resolved['proposed_name'], '')
         self.assertEqual(repeated.writes, [])
 
         no_ids=FakeEC2(attachments=[{'Device': '/dev/xvda'},

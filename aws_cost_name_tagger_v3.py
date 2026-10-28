@@ -651,10 +651,44 @@ class Investigator:
     def volume(self, region: str, vid: str):
         key=(region,vid)
         if key not in self._volumes:
-            items=self.client("ec2",region).describe_volumes(VolumeIds=[vid]).get("Volumes",[])
-            if len(items)!=1:
-                raise ValueError("Volume not unique/absent")
-            self._volumes[key]=items[0]
+            response=self.client("ec2",region).describe_volumes(VolumeIds=[vid])
+            if not isinstance(response, dict) or type(response.get("Volumes")) is not list:
+                raise ValueError("Malformed DescribeVolumes response")
+            items=response["Volumes"]
+            if len(items)!=1 or type(items[0]) is not dict:
+                raise ValueError("Volume not unique/absent or malformed")
+            vol=items[0]
+            if type(vol.get("VolumeId")) is not str or vol["VolumeId"] != vid:
+                raise ValueError("Returned VolumeId differs from requested VolumeId")
+            # C4: supplied positive provenance takes priority over even a NONEMPTY Name.
+            if "OwnerId" in vol:
+                owner=vol["OwnerId"]
+                if (type(owner) is not str or
+                        re.fullmatch(r"[0-9]{12}", owner, re.ASCII) is None or
+                        owner != self.account):
+                    raise ValueError("Volume OwnerId does not match verified account")
+            if "VolumeArn" in vol:
+                arn=vol["VolumeArn"]
+                if type(arn) is not str:
+                    raise ValueError("Malformed VolumeArn")
+                parts=arn.split(":",5)
+                if len(parts)!=6:
+                    raise ValueError("Malformed VolumeArn")
+                _,partition,service,arn_region,account,resource=parts
+                # AWS partition is bound to the region, not inferred from the ARN.
+                if region.startswith("cn-"):
+                    expected_partition="aws-cn"
+                elif region.startswith("us-gov-"):
+                    expected_partition="aws-us-gov"
+                elif region.startswith(("us-iso-","us-isob-","eu-isoe-","us-isof-")):
+                    raise ValueError("Unsupported restricted partition for VolumeArn")
+                else:
+                    expected_partition="aws"
+                if (parts[0]!="arn" or partition!=expected_partition or
+                        service!="ec2" or arn_region!=region or
+                        account!=self.account or resource!=f"volume/{vid}"):
+                    raise ValueError("VolumeArn identity mismatch")
+            self._volumes[key]=vol
         return self._volumes[key]
 
     def subnet(self, region: str, subnet_id: str):
@@ -690,17 +724,50 @@ class Investigator:
         direct=meaningful(name_of(tagmap(vol.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)))
         if direct:
             return direct, f"EBS {vid} Name={direct}"
-        attachments=vol.get("Attachments",[])
-        ids={a.get("InstanceId") for a in attachments if a.get("InstanceId")}
-        if len(ids)!=1:
-            raise ValueError(f"EBS {vid} has {len(ids)} distinct current EC2 attachments; ambiguous")
-        iid=next(iter(ids))
-        anchor, path=self.parent_instance(region,iid)
-        device=next((a.get("Device","") for a in attachments if a.get("InstanceId")==iid),"")
-        if not device:
-            raise ValueError("EBS attachment device unknown")
-        device=device.split("/")[-1].replace("_","-")
-        return suffix_name(anchor,"ebs",device,vid[-7:]), f"EBS {vid} -> attachment {iid} {device} -> {path}"
+        # C9/C6 strict boolean and lifecycle gates apply ONLY to Name ABSENT/EMPTY.
+        if type(vol.get("State")) is not str or vol["State"]!="in-use":
+            raise ValueError("EBS Volume State must be in-use")
+        if type(vol.get("MultiAttachEnabled")) is not bool or vol["MultiAttachEnabled"] is not False:
+            raise ValueError("EBS MultiAttachEnabled must be exactly False")
+        # C5-S: conflicting managed/visibility evidence cannot establish EC2 ownership.
+        if "Operator" in vol:
+            operator=vol["Operator"]
+            if type(operator) is not dict or operator.get("Managed") is not False:
+                raise ValueError("EBS Volume Operator is managed or malformed")
+            if "Principal" in operator and (type(operator["Principal"]) is not str or operator["Principal"]!=""):
+                raise ValueError("EBS Volume Operator Principal is not neutral")
+            if "HiddenByDefault" in operator and (type(operator["HiddenByDefault"]) is not bool or operator["HiddenByDefault"] is not False):
+                raise ValueError("EBS Volume Operator HiddenByDefault is contradictory")
+        attachments=vol.get("Attachments")
+        if type(attachments) is not list or not attachments:
+            raise ValueError("EBS attachments missing, empty or malformed")
+        owners=set()
+        devices=set()
+        for att in attachments:
+            if type(att) is not dict:
+                raise ValueError("Malformed EBS attachment record")
+            iid=att.get("InstanceId")
+            device=att.get("Device")
+            if type(iid) is not str or re.fullmatch(r"i-(?:[0-9a-f]{8}|[0-9a-f]{17})",iid,re.ASCII) is None:
+                raise ValueError("Invalid EBS EC2 InstanceId")
+            if type(device) is not str or re.fullmatch(r"\A/dev/[a-z][a-z0-9_-]{0,62}[a-z0-9]\Z", device, re.ASCII) is None:
+                raise ValueError("Invalid raw EBS attachment Device")
+            if type(att.get("State")) is not str or att["State"]!="attached":
+                raise ValueError("EBS attachment State must be attached")
+            if "VolumeId" in att and (type(att["VolumeId"]) is not str or att["VolumeId"]!=vid):
+                raise ValueError("Attachment VolumeId mismatch")
+            if "AssociatedResource" in att or "InstanceOwningService" in att:
+                raise ValueError("EBS service managed attachment marker supplied")
+            owners.add(iid)
+            devices.add(device)
+        if len(owners)!=1 or len(devices)!=1:
+            raise ValueError("EBS attachment owner/device evidence ambiguous")
+        iid=next(iter(owners))
+        raw_device=next(iter(devices))
+        # No parent read until every unfiltered attachment has passed all gates.
+        anchor,path=self.parent_instance(region,iid)
+        suffix_device=raw_device.split("/")[-1].replace("_","-")
+        return suffix_name(anchor,"ebs",suffix_device,vid[-7:]), f"EBS {vid} -> attachment {iid} {suffix_device} -> {path}"
 
     def eip_owner(self, region, alloc_id):
         addr=self.client("ec2",region).describe_addresses(AllocationIds=[alloc_id]).get("Addresses",[])
