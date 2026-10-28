@@ -526,6 +526,26 @@ class AlgorithmTests(unittest.TestCase):
                     t.plan(args,session=object())
                 cur.assert_not_called()
 
+    def test_plan_dryrun_result_collision_preflights_before_cur_aws_or_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / 'p.json'
+            collision = output.with_suffix('.result.csv')
+            original = b'keep existing dryrun result'
+            collision.write_bytes(original)
+            args = type('Args', (), {'cur': ['unused.csv.gz'], 'month': '2026-10',
+                'account': ACCOUNT, 'profile': None, 'min_cost': 1,
+                'max_resources': 10, 'kinds': None, 'output': str(output)})()
+            with patch.object(t, 'cur_candidates') as cur, \
+                 patch.object(t, 'build_session') as session, \
+                 patch.object(t, 'publish_staged_reports') as publish:
+                with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                    t.plan(args, extra_mode='dryrun')
+                cur.assert_not_called()
+                session.assert_not_called()
+                publish.assert_not_called()
+            self.assertEqual(collision.read_bytes(), original)
+
     def test_apply_yes_writes_only_after_matching_live_recheck(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan=Path(tmp)/'p.json';review=Path(tmp)/'review.csv';log=Path(tmp)/'audit.json'

@@ -1739,7 +1739,6 @@ def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
     out=Path(args.output)
     review=out.with_suffix(".review.csv")
     report=out.with_suffix(".report.csv")
-    result=out.with_suffix(".result.csv")
     destinations=report_output_paths(out, mode=extra_mode)
     # Validate the output trust contract before CUR parsing and AWS session use.
     preflight_report_destination(out)
