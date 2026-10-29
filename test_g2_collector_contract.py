@@ -271,6 +271,44 @@ class I1MockOnlyTests(unittest.TestCase):
                     c.build_plan(ACCOUNT, (REGION,), start, end, as_of)
         self.assertTrue(c.build_plan(ACCOUNT, (REGION,), START, END, AS_OF))
 
+    def test_event_history_window_boundaries_and_utc_inputs(self):
+        cases = [
+            ("exactly 90 days old", "2026-07-25T00:00:00Z",
+             "2026-07-25T00:00:01Z", True),
+            ("one second too old", "2026-07-24T23:59:59Z",
+             "2026-07-25T00:00:01Z", False),
+            ("start equals end", "2026-10-22T00:00:00Z",
+             "2026-10-22T00:00:00Z", False),
+            ("start after end", "2026-10-22T00:00:01Z",
+             "2026-10-22T00:00:00Z", False),
+            ("end equals as_of", "2026-10-22T00:00:00Z",
+             "2026-10-23T00:00:00Z", True),
+            ("end one second after as_of", "2026-10-22T00:00:00Z",
+             "2026-10-23T00:00:01Z", False),
+            ("valid short interval", "2026-10-22T00:00:00Z",
+             "2026-10-22T00:00:01Z", True),
+        ]
+        for label, start, end, accepted in cases:
+            with self.subTest(label=label):
+                if not accepted:
+                    with self.assertRaises(c.ContractError):
+                        c.build_plan(ACCOUNT, (REGION,), start, end, AS_OF)
+                    continue
+                plan = c.build_plan(ACCOUNT, (REGION,), start, end, AS_OF)
+                requests = [probe.arguments for probe in plan
+                            if probe.operation == "LookupEvents"]
+                self.assertEqual(requests, [{"StartTime": start, "EndTime": end}])
+
+        invalid_utc_inputs = [
+            ("bad date", "not-a-date", END, AS_OF),
+            ("non-UTC offset", "2026-10-01T00:00:00+01:00", END, AS_OF),
+            ("naive date", "2026-10-01T00:00:00", END, AS_OF),
+        ]
+        for label, start, end, as_of in invalid_utc_inputs:
+            with self.subTest(label=label):
+                with self.assertRaises(c.ContractError):
+                    c.build_plan(ACCOUNT, (REGION,), start, end, as_of)
+
     def test_plan_rejects_bad_account_or_regions(self):
         for account, regions in (("bad", (REGION,)), (ACCOUNT, ()),
                                  (ACCOUNT, (REGION, REGION)), (ACCOUNT, ("bad",))):

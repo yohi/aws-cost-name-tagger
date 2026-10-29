@@ -84,7 +84,7 @@ def build_plan(account: str, regions: tuple[str, ...],
             or any(not isinstance(r, str) or not REGION.fullmatch(r) for r in regions)):
         raise ContractError("Explicit distinct AWS regions required")
     start, end, as_of = _time(start_utc), _time(end_utc), _time(as_of_utc)
-    if (not start < end or start < as_of - timedelta(days=90)
+    if (start >= end or start < as_of - timedelta(days=90)
             or end > as_of):
         raise ContractError("Event History window must be within the 90 days before as_of_utc")
     queries = [
