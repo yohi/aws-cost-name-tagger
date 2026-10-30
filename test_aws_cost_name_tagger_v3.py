@@ -1635,6 +1635,58 @@ class OfflineSafetyBoundariesR1Tests(unittest.TestCase):
 class ReportPublishSafetyPRCTests(unittest.TestCase):
     """Offline PR-C contracts: source type, private directories and cleanup."""
 
+    def test_group_c_destination_enter_failure_closes_source_fd(self):
+        import contextlib
+        import errno
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'stage'
+            source_dir.mkdir(mode=0o700)
+            destination_dir = root / 'destination'
+            destination_dir.mkdir(mode=0o700)
+            source = source_dir / 'report.json'
+            source.write_bytes(b'staged report')
+            existing = destination_dir / 'existing.json'
+            existing.write_bytes(b'keep this report')
+            destination = destination_dir / 'new-report.json'
+            destination_error = PermissionError('destination enter failed')
+            real_private_directory_fd = t._private_directory_fd
+            source_fds = []
+
+            @contextlib.contextmanager
+            def track_source_fd(path, *, create=True):
+                with real_private_directory_fd(path, create=create) as fd:
+                    source_fds.append(fd)
+                    yield fd
+
+            @contextlib.contextmanager
+            def fail_destination_enter(path, *, create=True):
+                raise destination_error
+                yield
+
+            def private_directory_fd(path, *, create=True):
+                if Path(path) == source_dir:
+                    return track_source_fd(path, create=create)
+                if Path(path) == destination_dir:
+                    return fail_destination_enter(path, create=create)
+                return real_private_directory_fd(path, create=create)
+
+            with patch.object(t, '_private_directory_fd', side_effect=private_directory_fd), \
+                 patch.object(t.os, 'link') as link:
+                with self.assertRaises(PermissionError) as raised:
+                    t.publish_staged_reports([(source, destination)])
+
+            self.assertIs(raised.exception, destination_error)
+            self.assertEqual(len(source_fds), 1)
+            with self.assertRaises(OSError) as closed_fd:
+                os.fstat(source_fds[0])
+            self.assertEqual(closed_fd.exception.errno, errno.EBADF)
+            link.assert_not_called()
+            self.assertFalse(destination.exists())
+            self.assertEqual(existing.read_bytes(), b'keep this report')
+
     def test_t09_symlink_fifo_and_directory_sources_are_not_published(self):
         import os
 
