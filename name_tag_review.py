@@ -15,10 +15,10 @@ def _reject(code: str = "BLOCKED_NAME_REVIEW") -> NoReturn:
     raise ApprovalRejected(code)
 
 
-def _mapping(value: object) -> Mapping[str, object]:
+def _mapping(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
         _reject()
-    return value
+    return dict(value)
 
 
 def _text(record: Mapping[str, object], key: str) -> str:
@@ -26,6 +26,76 @@ def _text(record: Mapping[str, object], key: str) -> str:
     if not isinstance(value, str) or not value:
         _reject()
     return value
+
+
+def _validate_resource_arn(
+    *, kind: str, resource: str, arn: str, locator: str, evidence: str,
+) -> None:
+    resource_prefixes = {
+        "instance": "instance/", "volume": "volume/", "snapshot": "snapshot/",
+        "eni": "network-interface/", "eip": "elastic-ip/", "nat": "natgateway/",
+        "endpoint": "vpc-endpoint/", "rds_instance": "db:",
+        "opensearch": "domain/", "log_group": "log-group:",
+    }
+    if kind in resource_prefixes:
+        prefix = resource_prefixes[kind]
+        if not resource.startswith(prefix) or resource.removeprefix(prefix) != locator:
+            _reject()
+    elif kind == "rds_cluster":
+        _validate_rds_cluster(resource, locator, arn, evidence)
+    elif kind == "elbv2":
+        if not resource.startswith("loadbalancer/") or arn != locator:
+            _reject()
+    elif kind == "apigw_stage":
+        _validate_apigw_stage(resource, locator, arn)
+    elif kind == "cloudfront":
+        if not resource.startswith("distribution/") or arn != locator:
+            _reject()
+    elif kind in {"athena_workgroup", "lambda", "wafv2"}:
+        expected_prefix = {"athena_workgroup": "workgroup/", "lambda": "function:"}.get(kind)
+        if (expected_prefix is not None and not resource.startswith(expected_prefix)) or arn != locator:
+            _reject()
+        if kind == "wafv2" and re.fullmatch(r"(?:global|regional)/webacl/[^/]+/[^/]+", resource) is None:
+            _reject()
+
+
+def _validate_rds_cluster(resource: str, locator: str, arn: str, evidence: str) -> None:
+    prefix = "cluster:"
+    if not resource.startswith(prefix):
+        _reject()
+    arn_identifier = resource.removeprefix(prefix)
+    if arn_identifier == locator:
+        return
+    resource_id = re.search(r"DbClusterResourceId=([A-Za-z0-9-]+)", evidence)
+    valid_locator = re.fullmatch(r"cluster-[a-z0-9]{14,}", locator, re.IGNORECASE)
+    if (valid_locator is None or resource_id is None
+            or resource_id.group(1).casefold() != locator.casefold()
+            or f"ARN={arn}" not in evidence):
+        _reject()
+
+
+def _validate_apigw_stage(resource: str, locator: str, arn: str) -> None:
+    match = re.fullmatch(r"/restapis/([^/]+)/stages/([^/]+)", resource)
+    locator_parts = locator.split("|")
+    if (match is None or len(locator_parts) != 3 or locator_parts[2] != arn
+            or locator_parts[0] != match.group(1) or locator_parts[1] != match.group(2)):
+        _reject()
+
+
+def _validate_arn_scope(
+    *, kind: str, region: str, account: str, arn_region: str, arn_account: str, resource: str,
+) -> None:
+    if kind == "apigw_stage":
+        if arn_account:
+            _reject()
+    elif arn_account != account:
+        _reject()
+    global_region = kind == "cloudfront" or (kind == "wafv2" and resource.startswith("global/"))
+    if global_region:
+        if region != "us-east-1" or arn_region not in {"", "us-east-1"}:
+            _reject()
+    elif arn_region != region:
+        _reject()
 
 
 def _canonical_arn(
@@ -57,61 +127,65 @@ def _canonical_arn(
             _reject()
         return partition
 
-    if kind == "apigw_stage":
-        if arn_account:
-            _reject()
-    elif arn_account != account:
-        _reject()
-    global_region = kind == "cloudfront" or (kind == "wafv2" and resource.startswith("global/"))
-    if global_region:
-        if region != "us-east-1" or arn_region not in {"", "us-east-1"}:
-            _reject()
-    elif arn_region != region:
-        _reject()
+    _validate_arn_scope(
+        kind=kind, region=region, account=account, arn_region=arn_region,
+        arn_account=arn_account, resource=resource,
+    )
 
-    resource_ids = {
-        "instance": ("instance/",), "volume": ("volume/",),
-        "snapshot": ("snapshot/",), "eni": ("network-interface/",),
-        "eip": ("elastic-ip/",), "nat": ("natgateway/",),
-        "endpoint": ("vpc-endpoint/",),
-        "rds_instance": ("db:",),
-        "opensearch": ("domain/",), "log_group": ("log-group:",),
-    }
-    if kind in resource_ids:
-        prefix = resource_ids[kind][0]
-        if not resource.startswith(prefix) or resource[len(prefix):] != locator:
-            _reject()
-    elif kind == "rds_cluster":
-        prefix = "cluster:"
-        if not resource.startswith(prefix):
-            _reject()
-        arn_identifier = resource[len(prefix):]
-        if arn_identifier != locator:
-            if re.fullmatch(r"cluster-[a-z0-9]{14,}", locator, re.IGNORECASE) is None:
-                _reject()
-            resource_id = re.search(r"DbClusterResourceId=([A-Za-z0-9-]+)", evidence)
-            if (resource_id is None or resource_id.group(1).casefold() != locator.casefold()
-                    or f"ARN={arn}" not in evidence):
-                _reject()
-    elif kind == "elbv2":
-        if not resource.startswith("loadbalancer/") or arn != locator:
-            _reject()
-    elif kind == "apigw_stage":
-        match = re.fullmatch(r"/restapis/([^/]+)/stages/([^/]+)", resource)
-        locator_parts = locator.split("|")
-        if (match is None or len(locator_parts) != 3 or locator_parts[2] != arn
-                or locator_parts[0] != match.group(1) or locator_parts[1] != match.group(2)):
-            _reject()
-    elif kind == "cloudfront":
-        if not resource.startswith("distribution/") or arn != locator:
-            _reject()
-    elif kind in {"athena_workgroup", "lambda", "wafv2"}:
-        expected_prefix = {"athena_workgroup": "workgroup/", "lambda": "function:"}.get(kind)
-        if (expected_prefix is not None and not resource.startswith(expected_prefix)) or arn != locator:
-            _reject()
-        if kind == "wafv2" and re.fullmatch(r"(?:global|regional)/webacl/[^/]+/[^/]+", resource) is None:
-            _reject()
+    _validate_resource_arn(
+        kind=kind, resource=resource, arn=arn, locator=locator, evidence=evidence,
+    )
     return partition
+
+
+def _plan_record(plan_bytes: bytes, record: Mapping[str, object], plan_digest: str) -> dict[str, object]:
+    if record.get("plan_sha256") != plan_digest:
+        _reject()
+    try:
+        plan = _mapping(json.loads(plan_bytes.decode("utf-8", "strict")))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _reject()
+    if plan.get("schema_version") != 2:
+        _reject()
+    account = _text(record, "account")
+    if re.fullmatch(r"\d{12}", account) is None or plan.get("account") != account:
+        _reject()
+    proposal_id = _text(record, "proposal_id")
+    records = plan.get("records")
+    if not isinstance(records, list):
+        _reject()
+    matches = [_mapping(candidate) for candidate in records
+               if isinstance(candidate, Mapping)
+               and _mapping(candidate).get("proposal_id") == proposal_id]
+    if len(matches) != 1:
+        _reject()
+    plan_record = matches[0]
+    for key in ("kind", "region", "locator", "resource_arn", "status", "confidence",
+                "name_state", "proposed_name", "evidence"):
+        if record.get(key) != plan_record.get(key):
+            _reject()
+    return plan_record
+
+
+def _validate_review_state(record: Mapping[str, object], evidence: str) -> tuple[str, str, str]:
+    if record.get("status") != "proposed":
+        _reject()
+    confidence = _text(record, "confidence")
+    if confidence.lower() not in {"high", "medium"}:
+        _reject()
+    state = record.get("name_state")
+    if state == "ABSENT":
+        if record.get("name_key_present") is not False or record.get("name_raw_value") is not None:
+            _reject()
+    elif state == "EMPTY":
+        if record.get("name_key_present") is not True or record.get("name_raw_value") != "":
+            _reject()
+    else:
+        _reject()
+    evidence_digest = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+    if record.get("evidence_digest") != evidence_digest:
+        _reject()
+    return str(state), confidence, evidence_digest
 
 
 def prepare_name_payload(
@@ -128,34 +202,8 @@ def prepare_name_payload(
 ) -> dict[str, object]:
     """Build the unsigned Name payload for an Owner to sign out of band."""
     plan_digest = hashlib.sha256(plan_bytes).hexdigest()
-    if record.get("plan_sha256") != plan_digest:
-        _reject()
-    try:
-        parsed: object = json.loads(plan_bytes.decode("utf-8", "strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        _reject()
-    plan = _mapping(parsed)
-    if plan.get("schema_version") != 2:
-        _reject()
-
     account = _text(record, "account")
-    if not re.fullmatch(r"[0-9]{12}", account) or plan.get("account") != account:
-        _reject()
-    proposal_id = _text(record, "proposal_id")
-    records_value = plan.get("records")
-    if not isinstance(records_value, list):
-        _reject()
-    records: list[object] = records_value
-    matches = [row for candidate in records
-               if isinstance(candidate, Mapping)
-               for row in [_mapping(candidate)]
-               if row.get("proposal_id") == proposal_id]
-    if len(matches) != 1:
-        _reject()
-    plan_record = _mapping(matches[0])
-    for key in ("kind", "region", "locator", "resource_arn", "status", "confidence", "name_state", "proposed_name", "evidence"):
-        if record.get(key) != plan_record.get(key):
-            _reject()
+    plan_record = _plan_record(plan_bytes, record, plan_digest)
 
     kind = _text(record, "kind")
     region = _text(record, "region")
@@ -165,23 +213,8 @@ def prepare_name_payload(
     partition = _canonical_arn(
         arn, account=account, region=region, kind=kind, locator=locator, evidence=evidence,
     )
-    if record.get("status") != "proposed":
-        _reject()
     confidence = _text(record, "confidence")
-    if confidence.lower() not in {"high", "medium"}:
-        _reject()
-    name_state = record.get("name_state")
-    if name_state not in {"ABSENT", "EMPTY"}:
-        _reject()
-    if name_state == "ABSENT" and (
-        record.get("name_key_present") is not False or record.get("name_raw_value") is not None
-    ):
-        _reject()
-    if name_state == "EMPTY" and (record.get("name_key_present") is not True or record.get("name_raw_value") != ""):
-        _reject()
-    evidence_digest = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
-    if record.get("evidence_digest") != evidence_digest:
-        _reject()
+    name_state, confidence, evidence_digest = _validate_review_state(record, evidence)
     suggested_name = _text(record, "proposed_name")
     if not approved_name.strip():
         _reject()
