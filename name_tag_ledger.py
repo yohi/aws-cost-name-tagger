@@ -15,8 +15,6 @@ import re
 import socket
 import sqlite3
 import stat
-import subprocess
-import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +26,8 @@ from name_tag_approval import (
     ApprovalRejected,
     OwnerTrust,
     VerifiedEnvelope,
+    _select_signer_lines,
+    _verify_signature,
     approval_digest,
     revalidate_verified_envelope,
 )
@@ -213,91 +213,6 @@ def _canonical_scope_payload(payload: Mapping[str, Any]) -> bytes:
     return _canon(canonical).encode("utf-8")
 
 
-def _fingerprint_for_key_line(key_line: str) -> str | None:
-    """Return SHA256 fingerprint for a single OpenSSH public key line."""
-    parts = key_line.split()
-    if len(parts) < 2:
-        return None
-    with tempfile.TemporaryDirectory() as directory:
-        key_path = Path(directory) / "key.pub"
-        key_path.write_text(" ".join(parts[-2:]) + "\n", encoding="ascii")
-        result = subprocess.run(
-            ["ssh-keygen", "-lf", str(key_path), "-E", "sha256"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if result.returncode != 0:
-            return None
-        return result.stdout.split()[1]
-
-
-def _select_signer_lines(
-    trust: OwnerTrust, owner_id: str, eligible_fingerprints: set[str]
-) -> list[str]:
-    """Return allowed_signers lines matching owner and enrolled fingerprints."""
-    try:
-        trust_path: Any = getattr(trust, "_path")
-        lines = trust_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError, ApprovalRejected):
-        raise LedgerError("BLOCKED_OWNER_AUTHN") from None
-
-    selected: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        parts = stripped.split()
-        if len(parts) < 3:
-            continue
-        key_index = None
-        for idx, part in enumerate(parts):
-            if part.startswith(("ssh-", "ecdsa-", "sk-")):
-                key_index = idx
-                break
-        if key_index is None or key_index < 1:
-            continue
-        identities = parts[0].split(",")
-        if owner_id not in identities:
-            continue
-        fp = _fingerprint_for_key_line(stripped)
-        if fp in eligible_fingerprints:
-            selected.append(stripped)
-    return selected
-
-
-def _try_verify_signature(
-    signature: bytes, message: bytes, owner_id: str, namespace: str, signer_line: str
-) -> bool:
-    with tempfile.TemporaryDirectory() as directory:
-        sig_path = Path(directory) / "signature"
-        signer_path = Path(directory) / "allowed_signers"
-        sig_path.write_bytes(signature)
-        signer_path.write_text(signer_line + "\n", encoding="utf-8")
-        signer_path.chmod(0o600)
-        result = subprocess.run(
-            [
-                "ssh-keygen",
-                "-Y",
-                "verify",
-                "-f",
-                str(signer_path),
-                "-I",
-                owner_id,
-                "-n",
-                namespace,
-                "-s",
-                str(sig_path),
-            ],
-            input=message,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-    return result.returncode == 0
-
-
 def _verify_owner_signature(
     signature: bytes,
     message: bytes,
@@ -306,17 +221,12 @@ def _verify_owner_signature(
     trust: OwnerTrust,
     candidate_lines: list[str],
 ) -> str:
-    """Try candidate signer lines; return the verifying fingerprint."""
-    trust._check_file()
-    if not candidate_lines:
-        raise LedgerError("BLOCKED_OWNER_AUTHN")
-    for line in candidate_lines:
-        fp = _fingerprint_for_key_line(line)
-        if fp is None:
-            continue
-        if _try_verify_signature(signature, message, owner_id, namespace, line):
-            return fp
-    raise LedgerError("BLOCKED_OWNER_AUTHN")
+    try:
+        return _verify_signature(
+            signature, message, owner_id, namespace, trust, candidate_lines
+        )
+    except ApprovalRejected:
+        raise LedgerError("BLOCKED_OWNER_AUTHN") from None
 
 
 def verify_scope_decision(
@@ -397,7 +307,10 @@ def verify_scope_decision(
     if not entries:
         raise LedgerError("BLOCKED_OWNER_AUTHN")
 
-    candidate_lines = _select_signer_lines(trust, owner_id, set(entries))
+    try:
+        candidate_lines = _select_signer_lines(trust, owner_id, set(entries))
+    except ApprovalRejected:
+        raise LedgerError("BLOCKED_OWNER_AUTHN") from None
     try:
         verifying_fingerprint = _verify_owner_signature(
             signature, canonical, owner_id, SCOPE_DECISION_NAMESPACE, trust, candidate_lines
