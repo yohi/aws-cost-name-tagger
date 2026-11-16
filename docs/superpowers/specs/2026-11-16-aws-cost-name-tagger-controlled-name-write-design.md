@@ -134,6 +134,10 @@
 
 署名と検証は同一のRFC 8785準拠canonicalizerを使い、OpenSSHの`-n`署名namespaceと`payload.approval_namespace`を一致照合する。実行承認のnamespaceとの取り違えを拒否する。検証時は公開鍵の登録済みfingerprint、ID、許可role、期限、署名、canonical payload digest、plan/ARN/Name/根拠の一致をすべて照合する。鍵の失効・ローテーション・Owner権限変更時は旧鍵の新規実行許可を拒否する。
 
+**署名検証後の真正性・不変性契約（ACT-RG-F006限定訂正）:** Owner承認の認証入力境界は**未解析のUTF-8 JSONバイト列**であり、全階層のオブジェクトで重複キーを検出し、**Mapping変換より前に拒否**する。厳格パーサーは`object_pairs_hook`相当で階層ごとのキー重複を拒否し、非UTF-8、非有限数、不正JSON、未知キー、曖昧な型、非決定的canonicalizationも拒否する。既に任意のパーサーでMappingへ変換されたJSONは、キー重複が消失し得るため認証入力として採用しない。厳格パースした`payload`から`canonical_payload_bytes = JCS_UTF8(payload)`、`content_id = lowercase_hex(SHA256(canonical_payload_bytes))`を再計算し、Envelopeの`approval_id`または`authorization_id`と一致させ、**同じcanonical bytes**への登録済みOwner署名・namespace・Owner ID/role・期限を検証する。
+
+検証成功時にのみ`VerifiedEnvelope`を作り、`kind`（`name`/`execution`）、元の署名付きEnvelope JSONの不変バイト列、canonical Payloadの不変バイト列、`content_id`、署名参照、Owner ID、および**再帰的に不変なPayloadスナップショット**を保持する。元の入力Mapping・バッファを後から変更しても認証済み値は変化しない。下流は保護済みOwner Trust Anchorで元の署名付きバイト列を**厳格再解析・署名再検証**し、再生成したkind/owner/canonical bytes/content ID/不変Payloadが保存スナップショットと一致したときだけ認証情報として扱う。Pythonの型名・`isinstance`・コンストラクタ・自己申告IDを真正性の証拠にしない。不一致または再検証不能は`BLOCKED_OWNER_AUTHN`で送信禁止。既存のOwner登録/失効HOLDは維持する。
+
 **Trust Anchorの運用上のHOLD:** 署名方式の採用候補を記載しても、Owner鍵の実在・本人紐付け・登録/失効手順・保護されたallowlistの所在・実行ホストへの安全な配布は**未承認/未検証**である。将来、実行者が変更できないOS権限の管理領域にOwner信頼情報を事前配置し、書換え・symlink置換・許可roleの改ざんを検出できる状態がOwner承認されるまでは `BLOCKED_OWNER_AUTHN` として**AWS書込みゼロ**。同一UIDから改ざんできる署名検証設定しかない場合もHOLDする。
 
 ### 6.2 一回限り実行承認
@@ -141,6 +145,8 @@
 実行承認も`ExecutionAuthorizationPayload`と`ExecutionAuthorizationEnvelope`を分離する。署名対象の`payload`には、`schema_version=1`、`authorization_namespace=aws-cost-name-tagger-execution-v1`、**単一のName承認`approval_id`**、**単一の`resource_arn`・`approved_name`・`aws_operation`**（サービス/API版を固定）、実行Account/Partition/Region、実行Identity（STS Principal ARNだけで権限が証明されたとは扱わない）、実行コード版/ハッシュ、`writer_control_scope_id`、リスク受容・writer統制証拠・副作用分析証拠の参照、Owner ID/登録鍵fingerprint・許可role、発行時刻・期限、固有の`execution_nonce`を含める。
 
 `authorization_id`と`signature_ref`は**Envelope側だけ**に格納する。生成手順を`E = JCS_UTF8(execution_payload)`、`authorization_id = lowercase_hex(SHA256(E))`、次にOpenSSHの専用namespace `aws-cost-name-tagger-execution-v1`で**同じ`E`を署名**、最後に`{payload, authorization_id, signature_ref}`を保存する、と固定する。Name承認の`approval_id`は既に検証済みのIDを**実行Payload内で参照する値**であり、実行承認の自己IDではない。検証では署名済み`E`・再計算した`authorization_id`・namespace・Owner信頼鍵/role/期限/nonce・Name承認と全対象属性の一致を必須とし、`authorization_id`や`signature_ref`自体を`execution_payload`に含めて循環させない。OpenSSH署名、IDのdigest、CSV、自由入力だけではOwner権限や非再利用性を証明しない。
+
+**Execution Payloadの検証済み参照（ACT-RG-F006限定訂正）:** `ExecutionAuthorizationEnvelope`の用途は`kind=execution`として固定し、§6.1の厳格JSONパース・不変スナップショット・署名の再検証契約を適用する。Intent、Runtime Policy、Guarded Executor、AuthorizedWritePortは、変更可能な元Mappingや自己申告属性から`resource_arn`・`approved_name`・`writer_control_scope_id`・`aws_operation`を取り直さず、**現在のTrust Anchorによる再検証に成功した署名済みExecution Payload**とその`authorization_id`からのみ取得する。再検証後の内容変更や用途不一致は実行承認を成立させず、変更API呼出0件とする。
 
 Ownerには**この1件のARN・最終Name・更新API・実行Identityと残余リスク**を再表示して実行承認を得る。検証済み署名だけでは再利用を防げないため、承認ID・nonce・送信意図を同一ホストの**信頼された単一ライター・永続台帳**で照合し、未使用→使用済みへの耐久遷移が確定しなければAWS変更要求を出さない。台帳が改ざん・競合・不一致・消失の場合は `BLOCKED_AUTH_REPLAY`。クラッシュ後に同じ承認を再実行しない。台帳を別ホストから共有できない場合、複数ホスト/複数operatorを許可しない。
 
@@ -215,6 +221,8 @@ Ownerには**この1件のARN・最終Name・更新API・実行Identityと残余
 **クラッシュ復旧時の未完了Intent Gate（ACT-RG-F004限定訂正）:** AWS変更APIを許可する前に、権威ある単一ホストの永続台帳で対象`writer_control_scope_id`の最新状態と未完了Intentの有無を、単一writer排他境界内で照合する。ここで`CURRENT_EXECUTION_INTENT`は、**同一プロセス・同一実行・同一排他区間内で新規作成・耐久化され、送信を行う主体が一時的な実行内所有コンテキストを保持するIntent**に限る。`PRIOR_INCOMPLETE_INTENT`は、過去実行、再起動前、別実行、または当該操作に属さない未完了Intentである。PID・永続実行ID・Intent内の自己申告値が一致するだけではCURRENTと判定しない。所有コンテキストの再起動後の復元は禁止する。
 
 **正当な新規Intentの初回送信条件:** (1) scopeが`CLEARED`で台帳全体が健全、(2) 新規作成前の同scopeの`PRIOR_INCOMPLETE_INTENT`が0件、(3) 単一writer排他下で承認済みARN・Name・`authorization_id`・nonce・scopeを固定した新規Intentの耐久化が完了、(4) 送信直前の再照合でも他の未完了Intentが0件でscope状態が不変、(5) 同Intentの送信権を`SEND_ATTEMPT_CONSUMED`として**AWS呼出前に耐久記録済み**、(6) 同じ排他実行の一時的所有コンテキストにより、**その1回の呼出しがまだ発行されていない**ことを検証できる場合に限り、`ALLOW_FIRST_SEND`を付与する。この例外は新規Intent自身の初回送信だけに適用し、過去の未完了Intentや別実行・再起動後の要求には適用しない。台帳の照合・Intent登録・送信権消費・初回呼出しの割当を同一排他実行で直列化し、SDK自動retry、二回目の呼出し、別主体による送信を禁止する。Intent登録または送信権消費の耐久化に失敗すれば送信ゼロ。`SEND_ATTEMPT_CONSUMED`を耐久化した後にクラッシュした場合、AWSへ送ったか不明でも送信権は復活しない。AWS側の物理的exactly-onceは保証しない。
+
+**Intent生成時の認証境界（ACT-RG-F006限定訂正）:** `create_intent(authorization: VerifiedEnvelope, *, scope_id: str) -> IntentHandle`は、保護されたOwner Trust Anchorで`kind=execution`の元Envelopeバイト列・署名・canonical bytes・`authorization_id`を再検証する。入力された`VerifiedEnvelope`と再検証済みスナップショットが一致しない、偽造されている、失効/期限切れ、署名済みARN/Name/scope/操作と呼出条件が一致しない場合は、**台帳に新規Intentを生成する前にFail-Closed**とする。受け入れた場合もIntentと`FirstSendPermit`の拘束内容は再検証済み署名Payloadからだけ導出し、後から変更された値は使わない。既存の`SEND_ATTEMPT_CONSUMED`、単回送信、HOLD、クラッシュ後の再送禁止は変更しない。
 
 クラッシュ・送信応答不明・Readback不能・Readback不一致・結果の終端記録前の異常終了は、当該Intentを**未完了**として扱う。特にReadback不一致検出後、scopeの`HOLD`を`fsync`する前にクラッシュして旧`CLEARED`が残っても、先行する耐久Intentから実効的に送信禁止とする。Readback不一致時は、**scopeの`HOLD`を耐久確定するより前にIntentを終端完了扱いへ移してはならない**。結果一致の確認後でも終端記録が未完了なら未完了Intentとして停止する。未完了Intentの影響scopeを特定できなければホスト全体をFail-Closed。旧承認・nonce・Intentの再利用、自動再送、自動ロールバックは禁止する。
 
