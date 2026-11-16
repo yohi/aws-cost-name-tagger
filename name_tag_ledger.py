@@ -222,9 +222,8 @@ def _verify_owner_signature(
     candidate_lines: list[str],
 ) -> str:
     try:
-        return _verify_signature(
-            signature, message, owner_id, namespace, trust, candidate_lines
-        )
+        trust._check_file()
+        return _verify_signature(signature, message, owner_id, namespace, candidate_lines)
     except ApprovalRejected:
         raise LedgerError("BLOCKED_OWNER_AUTHN") from None
 
@@ -308,7 +307,8 @@ def verify_scope_decision(
         raise LedgerError("BLOCKED_OWNER_AUTHN")
 
     try:
-        candidate_lines = _select_signer_lines(trust, owner_id, set(entries))
+        trust_data = trust._check_file()
+        candidate_lines = _select_signer_lines(trust_data, owner_id, set(entries))
     except ApprovalRejected:
         raise LedgerError("BLOCKED_OWNER_AUTHN") from None
     try:
