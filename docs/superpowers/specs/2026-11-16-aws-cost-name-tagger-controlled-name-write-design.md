@@ -212,7 +212,9 @@ Ownerには**この1件のARN・最終Name・更新API・実行Identityと残余
 - API timeout・通信断・クラッシュ・Readback不能で`OUTCOME_UNKNOWN`となった場合、旧`INV-N07`を維持し**当該実行の後続送信をすべて停止**。現行は1 ARN/1実行なので自動後続送信は設けない。独立範囲への継続は新規の明示的Owner判断と独立承認による別実行に限り、元の承認を再利用しない。
 - 自動復旧・自動ロールバックは行わない。Ownerが現況を確認して新しい計画と新しい承認で対処する。
 
-**クラッシュ復旧時の未完了Intent Gate（ACT-RG-F004限定訂正）:** AWS変更APIを許可する前に、権威ある単一ホストの永続台帳で対象`writer_control_scope_id`の最新状態と**当該scopeに属する未完了Intentの有無**を、単一writerの排他境界内で照合する。`CLEARED`が記録されていても未完了Intentが1件でもあれば送信は禁止する。新規Intentは承認済みの対象ARN・Name・`authorization_id`・nonce・scopeを一意に拘束し、**AWS送信前に耐久記録**する。登録したばかりのIntentは、その同一プロセス・同一実行が送信する1操作だけに対応し、別実行・再起動後の送信許可には流用できない。台帳の読み取り、scope照合、未完了Intent検査、Intentの確定は単一writerで直列化し、競合実行を拒否する。初回送信前のIntent永続化に失敗した場合も送信ゼロ。
+**クラッシュ復旧時の未完了Intent Gate（ACT-RG-F004限定訂正）:** AWS変更APIを許可する前に、権威ある単一ホストの永続台帳で対象`writer_control_scope_id`の最新状態と未完了Intentの有無を、単一writer排他境界内で照合する。ここで`CURRENT_EXECUTION_INTENT`は、**同一プロセス・同一実行・同一排他区間内で新規作成・耐久化され、送信を行う主体が一時的な実行内所有コンテキストを保持するIntent**に限る。`PRIOR_INCOMPLETE_INTENT`は、過去実行、再起動前、別実行、または当該操作に属さない未完了Intentである。PID・永続実行ID・Intent内の自己申告値が一致するだけではCURRENTと判定しない。所有コンテキストの再起動後の復元は禁止する。
+
+**正当な新規Intentの初回送信条件:** (1) scopeが`CLEARED`で台帳全体が健全、(2) 新規作成前の同scopeの`PRIOR_INCOMPLETE_INTENT`が0件、(3) 単一writer排他下で承認済みARN・Name・`authorization_id`・nonce・scopeを固定した新規Intentの耐久化が完了、(4) 送信直前の再照合でも他の未完了Intentが0件でscope状態が不変、(5) 同Intentの送信権を`SEND_ATTEMPT_CONSUMED`として**AWS呼出前に耐久記録済み**、(6) 同じ排他実行の一時的所有コンテキストにより、**その1回の呼出しがまだ発行されていない**ことを検証できる場合に限り、`ALLOW_FIRST_SEND`を付与する。この例外は新規Intent自身の初回送信だけに適用し、過去の未完了Intentや別実行・再起動後の要求には適用しない。台帳の照合・Intent登録・送信権消費・初回呼出しの割当を同一排他実行で直列化し、SDK自動retry、二回目の呼出し、別主体による送信を禁止する。Intent登録または送信権消費の耐久化に失敗すれば送信ゼロ。`SEND_ATTEMPT_CONSUMED`を耐久化した後にクラッシュした場合、AWSへ送ったか不明でも送信権は復活しない。AWS側の物理的exactly-onceは保証しない。
 
 クラッシュ・送信応答不明・Readback不能・Readback不一致・結果の終端記録前の異常終了は、当該Intentを**未完了**として扱う。特にReadback不一致検出後、scopeの`HOLD`を`fsync`する前にクラッシュして旧`CLEARED`が残っても、先行する耐久Intentから実効的に送信禁止とする。Readback不一致時は、**scopeの`HOLD`を耐久確定するより前にIntentを終端完了扱いへ移してはならない**。結果一致の確認後でも終端記録が未完了なら未完了Intentとして停止する。未完了Intentの影響scopeを特定できなければホスト全体をFail-Closed。旧承認・nonce・Intentの再利用、自動再送、自動ロールバックは禁止する。
 
@@ -256,17 +258,19 @@ PROPOSED -> NAME_APPROVED -> EXEC_AUTHORIZED
 
 **送信前チェックと解除手順:** 各実行は署名済み`writer_control_scope_id`と台帳上の固定対象対応を一致確認する。初回の実行開始時および各AWS変更API送信の直前に、単一writerの排他境界内で**最新の耐久状態**を読み、`CLEARED`以外なら送信ゼロとする。異常観測後は`HOLD`の永続化を完了してから当該実行を終了する。異常時に`HOLD`を記録できなければホストの台帳自体を`UNKNOWN`として全送信禁止にする。`HOLD → CLEARED`は、原因とwriter統制健全性の再確認を示す証拠とHuman Ownerの**独立した明示判断**を揃え、台帳に解除根拠・承認者・時刻を耐久記録した場合だけ許可する。解除は旧Name承認・実行承認・nonceの再利用を意味しない。無関係スコープの別実行でも同じ権威台帳を照合し、範囲の独立性を立証できない場合は送信しない。
 
-**未完了Intentを含む実効scope状態の判定（ACT-RG-F004限定訂正）:** 権威ある台帳は、scope状態だけでなく、同一ホストで実行をまたいで保持されるIntentの存在・対応scope・未完了/終端状態も管理する。スコープ状態とIntent履歴が**両方とも完全に検証可能**であることを送信許可の前提とし、Intent履歴の欠落・破損・読取不能を「未完了Intentなし」と推定しない。初回起動・再起動・新たな実行開始時と**各AWS変更API送信直前**に、単一writer排他下で最新の永続状態を検証する。
+**未完了Intentを含む実効scope状態の判定（ACT-RG-F004限定訂正）:** 権威ある台帳は、scope状態だけでなく、同一ホストで実行をまたいで保持されるIntentの存在・対応scope・未完了/終端状態も管理する。スコープ状態とIntent履歴が**両方とも完全に検証可能**であることを送信許可の前提とし、Intent履歴の欠落・破損・読取不能を「未完了Intentなし」と推定しない。初回起動・再起動・新たな実行開始時と**各AWS変更API送信直前**に、単一writer排他下で最新の永続状態を検証する。 **新規Intentの登録前は未完了0件を要求し、登録後の初回送信判定では§7.4で定義した`CURRENT_EXECUTION_INTENT`1件のみを例外として扱う。** `ALLOW_FIRST_SEND`は永続scope状態ではなく、同一排他実行内だけの一時的判定である。`SEND_ATTEMPT_CONSUMED`は永続的な送信権消費を表し、初回呼出し済みの一時的所有コンテキストは再使用不可。起動・再起動後には永続ID等からCURRENTを復元せず、未完了IntentはすべてPRIORとして扱う。
 
-| 保存済みscope状態 | 関連する未完了Intent | 実効状態 / 送信可否 |
-|---|---|---|
-| `CLEARED` | 0件（履歴の完全性を検証済み） | 他の全Gateが成立するときのみ送信候補 |
-| `CLEARED` | 1件以上 | `BLOCKED_INCOMPLETE_INTENT`。送信禁止 |
-| `HOLD` | 任意 | `BLOCKED_SCOPE_HOLD`。送信禁止 |
-| `UNKNOWN` | 任意 | `BLOCKED_SCOPE_STATE_UNKNOWN`。送信禁止 |
-| 台帳・Intent・scope対応が欠落、破損、不整合、読取不能 | 不明 | `BLOCKED_SCOPE_STATE_UNKNOWN`。ホスト全体の送信禁止 |
+| 保存済みscope状態 | 関連する未完了Intent | 実行コンテキスト | 実効判定 / 送信可否 |
+|---|---|---|---|
+| `CLEARED` | 0件（履歴の完全性を検証済み） | 新規実行 | 他の全Gate成立時のみ新規Intentの作成候補 |
+| `CLEARED` | 現在実行の新規Intent1件のみ | 同一排他実行・初回呼出し未発行・`SEND_ATTEMPT_CONSUMED`耐久記録済み | `ALLOW_FIRST_SEND`。**当該初回呼出し1回のみ** |
+| `CLEARED` | 過去・別実行の未完了Intentが1件以上 | 任意 | `BLOCKED_INCOMPLETE_INTENT`。送信禁止 |
+| `CLEARED` | 自分のIntentでも、同じ実行から初回呼出しを既に発行済み | 二回目・再送要求 | `BLOCKED_INTENT_REPLAY`。送信禁止 |
+| `HOLD` | 任意 | 任意 | `BLOCKED_SCOPE_HOLD`。送信禁止 |
+| `UNKNOWN` | 任意 | 任意 | `BLOCKED_SCOPE_STATE_UNKNOWN`。送信禁止 |
+| 台帳・Intent・scope対応が欠落、破損、不整合、読取不能 | 不明 | 任意 | `BLOCKED_SCOPE_STATE_UNKNOWN`。影響範囲不明ならホスト全体送信禁止 |
 
-**復旧と解除:** 未完了Intentを検出したら、影響するscopeを実行をまたいで停止し、影響範囲を特定できない場合にはホスト全体を停止する。別scopeを送信候補にできるのは、台帳全体が健全で影響範囲の独立性を確認でき、別途有効な承認がある場合だけ。未完了Intent/HOLDの解除には、AWS現況・writer統制健全性の再確認、Human Ownerの**独立した明示承認**、解除根拠・対象scope・承認者・時刻の**耐久記録**をすべて要する。解除を記録する前に旧Intentの未完了状態を消去したり、旧`CLEARED`のみで復旧させたりしない。解除済みの履歴も再利用禁止の証跡として保持し、旧Name承認・実行承認・nonce・Intentでの再送を認めない。単一ホストの台帳が正常性を保証できない間は、新しいBroker等を導入せずにFail-Closedを維持する。
+**復旧と解除:** 過去の未完了Intentを検出したら、影響するscopeを実行をまたいで停止し、影響範囲を特定できない場合にはホスト全体を停止する。§7.4に従って単一排他実行内で新規作成した自分のIntentだけは初回送信条件を満たす場合に限り例外とする。別scopeを送信候補にできるのは、台帳全体が健全で影響範囲の独立性を確認でき、別途有効な承認がある場合だけ。未完了Intent/HOLDの解除には、AWS現況・writer統制健全性の再確認、Human Ownerの**独立した明示承認**、解除根拠・対象scope・承認者・時刻の**耐久記録**をすべて要する。解除を記録する前に旧Intentの未完了状態を消去したり、旧`CLEARED`のみで復旧させたりしない。解除済みの履歴も再利用禁止の証跡として保持し、旧Name承認・実行承認・nonce・Intentでの再送を認めない。単一ホストの台帳が正常性を保証できない間は、新しいBroker等を導入せずにFail-Closedを維持する。
 
 ## 9. セキュリティGateとOwner決定
 
@@ -312,6 +316,18 @@ PROPOSED -> NAME_APPROVED -> EXEC_AUTHORIZED
 | T-F004-07 | 独立scopeに別の有効承認がある | 台帳健全性・範囲独立・他Gate成立時のみ新たな実行候補 |
 | T-F004-08 | Owner承認なし、または解除耐久化前にHOLD解除を試みる | 解除拒否・送信0件 |
 | T-F004-09 | Ownerによる解除を耐久化した後に旧nonce/実行承認を再利用 | 再利用拒否。新しい個別承認を要求 |
+
+**ACT-RG-F004 正常初回送信と旧Intent拒否の追加オフラインテスト（mock/stubのみ）:**
+
+| ID | 試験 | 期待結果 |
+|---|---|---|
+| T-F004-10 | 台帳健全・scope `CLEARED`・過去未完了Intentなし。新規Intentを耐久化して送信権を消費 | 正当な初回AWS更新要求をmockで**1回だけ許可** |
+| T-F004-11 | 過去の未完了Intentが残るscopeで新規Intent作成・送信を試みる | `BLOCKED_INCOMPLETE_INTENT`、送信0件 |
+| T-F004-12 | 再起動後、同じIntent ID・永続実行ID・PID相当値を使って送信する | CURRENTと認めず送信0件 |
+| T-F004-13 | 同一実行で初回呼出し後、同じIntentの二回目を試みる | `BLOCKED_INTENT_REPLAY`、追加送信0件 |
+| T-F004-14 | `SEND_ATTEMPT_CONSUMED`耐久化直後、AWS呼出前にクラッシュ | 復旧後は送信権を復元せず、再送0件 |
+| T-F004-15 | `SEND_ATTEMPT_CONSUMED`の永続化失敗 | 初回送信も禁止、送信0件 |
+| T-F004-16 | 新規Intent登録後、初回送信直前にscope状態が`HOLD`に変化 | `ALLOW_FIRST_SEND`不成立、送信0件 |
 
 受入テストは、Intent確定・変更要求・Readback・HOLD記録・Intent終端・解除記録の各永続化境界にクラッシュを挿入し、再起動後の送信可否を判定する。実AWS接続、ソース/CI変更、本番での故障試験は本Design限定訂正の範囲外。
 
