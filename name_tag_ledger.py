@@ -101,6 +101,30 @@ def _canonicalize_arn_set(arns: Sequence[object] | None) -> frozenset[str]:
 
 
 
+def _ensure_target_arns_unaliased(
+    conn: sqlite3.Connection, scope_id: str, target_arns: frozenset[str]
+) -> None:
+    existing_target_sets = conn.execute(
+        """
+        SELECT scope_id, target_arns FROM scopes
+        WHERE target_arns IS NOT NULL AND scope_id != ?
+        """,
+        (scope_id,),
+    ).fetchall()
+    for _, stored_arns in existing_target_sets:
+        try:
+            decoded_arns = json.loads(stored_arns)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+        if (
+            not isinstance(decoded_arns, list)
+            or any(not isinstance(arn, str) for arn in decoded_arns)
+        ):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        if set(decoded_arns).intersection(target_arns):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+
+
 def _valid_window(not_before: datetime, not_after: datetime, now: datetime) -> None:
     """Fail-closed validity-window check."""
     if now < not_before or now > not_after:
@@ -786,22 +810,9 @@ class IntentLedger:
                 if intents is not None:
                     raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
-                # Detect aliased/fixed target scopes: any existing scope or HOLD covering any ARN.
-                existing_target_sets = conn.execute(
-                    "SELECT target_arns FROM scopes WHERE target_arns IS NOT NULL"
-                ).fetchall()
-                for (stored_arns,) in existing_target_sets:
-                    try:
-                        decoded_arns = json.loads(stored_arns)
-                    except (json.JSONDecodeError, TypeError) as exc:
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
-                    if (
-                        not isinstance(decoded_arns, list)
-                        or any(not isinstance(arn, str) for arn in decoded_arns)
-                    ):
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                    if set(decoded_arns).intersection(decision.target_arns):
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                _ensure_target_arns_unaliased(
+                    conn, decision.scope_id, decision.target_arns
+                )
 
                 timestamp = self._iso(now)
                 conn.execute(
@@ -900,26 +911,9 @@ class IntentLedger:
                 if incomplete is not None:
                     raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
-                # A released scope must not alias another scope's target ARNs.
-                existing_target_sets = conn.execute(
-                    """
-                    SELECT target_arns FROM scopes
-                    WHERE target_arns IS NOT NULL AND scope_id != ?
-                    """,
-                    (decision.scope_id,),
-                ).fetchall()
-                for (stored_arns,) in existing_target_sets:
-                    try:
-                        decoded_arns = json.loads(stored_arns)
-                    except (json.JSONDecodeError, TypeError) as exc:
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
-                    if (
-                        not isinstance(decoded_arns, list)
-                        or any(not isinstance(arn, str) for arn in decoded_arns)
-                    ):
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                    if set(decoded_arns).intersection(decision.target_arns):
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                _ensure_target_arns_unaliased(
+                    conn, decision.scope_id, decision.target_arns
+                )
 
                 timestamp = self._iso(now)
                 conn.execute(
