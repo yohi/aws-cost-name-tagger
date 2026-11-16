@@ -7,7 +7,22 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
 
-from name_tag_approval import VerifiedEnvelope, approval_digest, canonical_payload
+from name_tag_approval import (
+    ApprovalRejected,
+    VerifiedEnvelope,
+    approval_digest,
+    canonical_payload,
+)
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    """Validate and normalize a timezone-aware datetime to UTC."""
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Evidence validity bounds must be timezone-aware datetimes")
+    try:
+        return value.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        raise ValueError("Evidence validity bounds must be representable in UTC") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +39,22 @@ class ScopeEvidence:
     writer_evidence_digest: str
     responsible_owner: str
 
+    def __post_init__(self) -> None:
+        """Freeze ARN membership and normalize the evidence validity window."""
+        for name in ("account", "partition", "region", "writer_control_scope_id", "writer_evidence_digest", "responsible_owner"):
+            if type(getattr(self, name)) is not str:
+                raise TypeError(f"{name} must be a string")
+        if type(self.controlled_arns) not in (set, frozenset, list, tuple):
+            raise TypeError("controlled_arns must be a collection of ARN strings")
+        normalized_arns: set[str] = set()
+        normalized_arns.update(self.controlled_arns)
+        controlled_arns = frozenset(normalized_arns)
+        if any(type(arn) is not str or not arn for arn in controlled_arns):
+            raise ValueError("controlled_arns must contain non-empty strings")
+        object.__setattr__(self, "controlled_arns", controlled_arns)
+        object.__setattr__(self, "not_before_utc", _utc_datetime(self.not_before_utc))
+        object.__setattr__(self, "not_after_utc", _utc_datetime(self.not_after_utc))
+
 
 @dataclass(frozen=True, slots=True)
 class SideEffectEvidence:
@@ -37,6 +68,19 @@ class SideEffectEvidence:
     not_before_utc: datetime
     not_after_utc: datetime
 
+    def __post_init__(self) -> None:
+        """Freeze evidence references and normalize the validity window."""
+        if type(self.target_arn) is not str:
+            raise TypeError("target_arn must be a string")
+        if type(self.evidence_references) not in (list, tuple):
+            raise TypeError("evidence_references must be a list or tuple")
+        references = tuple(reference for reference in self.evidence_references)
+        if any(type(reference) is not str for reference in references):
+            raise ValueError("evidence_references must contain strings")
+        object.__setattr__(self, "evidence_references", references)
+        object.__setattr__(self, "not_before_utc", _utc_datetime(self.not_before_utc))
+        object.__setattr__(self, "not_after_utc", _utc_datetime(self.not_after_utc))
+
 
 @dataclass(frozen=True, slots=True)
 class SafetyDecision:
@@ -49,7 +93,14 @@ class SafetyDecision:
 
 def _valid_window(start: datetime, end: datetime, now: datetime) -> bool:
     """Check an inclusive, timezone-aware evidence validity interval."""
-    if start.tzinfo is None or end.tzinfo is None or now.tzinfo is None:
+    if (
+        type(start) is not datetime
+        or type(end) is not datetime
+        or type(now) is not datetime
+        or start.tzinfo is None
+        or end.tzinfo is None
+        or now.tzinfo is None
+    ):
         return False
     try:
         instant = now.astimezone(timezone.utc)
@@ -66,7 +117,7 @@ def _verified_name_approval(approval: VerifiedEnvelope) -> bool:
         return False
     try:
         canonical = canonical_payload(approval.payload, kind="name")
-    except (TypeError, ValueError):
+    except (ApprovalRejected, TypeError, ValueError):
         return False
     return (
         canonical == approval.canonical_payload_bytes
@@ -83,9 +134,13 @@ def check_target_safety(
     now_utc: datetime,
 ) -> SafetyDecision:
     """Fail closed unless verified Name approval and both evidence sets agree."""
+    if type(scope) is not ScopeEvidence:
+        return SafetyDecision(False, "BLOCKED_WRITER_UNKNOWN", None)
     scope_id = scope.writer_control_scope_id
     if not _verified_name_approval(approval):
         return SafetyDecision(False, "BLOCKED_OWNER_AUTHN", scope_id)
+    if type(side_effects) is not SideEffectEvidence:
+        return SafetyDecision(False, "BLOCKED_SIDE_EFFECT_UNASSESSED", scope_id)
 
     payload = approval.payload
     if (
@@ -100,7 +155,7 @@ def check_target_safety(
     if not _valid_window(scope.not_before_utc, scope.not_after_utc, now_utc):
         return SafetyDecision(False, "BLOCKED_SCOPE_EXPIRED", scope_id)
     if not _valid_window(side_effects.not_before_utc, side_effects.not_after_utc, now_utc):
-        return SafetyDecision(False, "BLOCKED_SCOPE_EXPIRED", scope_id)
+        return SafetyDecision(False, "BLOCKED_SIDE_EFFECT_UNASSESSED", scope_id)
 
     if (
         not scope.writer_control_scope_id
