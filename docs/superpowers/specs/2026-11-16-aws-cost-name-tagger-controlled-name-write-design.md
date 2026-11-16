@@ -3,10 +3,10 @@
 - **作成日:** 2026-11-16（JST）
 - **リポジトリ:** [yohi/aws-cost-name-tagger](https://github.com/yohi/aws-cost-name-tagger)
 - **固定参照:** `master` / `497ad6a3f08e9207f39c92a29dfabc549afa127b`
-- **文書状態:** `DOCUMENT_REMEDIATION_DRAFT / HUMAN_OWNER_CHECKPOINT_PENDING`（R0.2採択・規範変更・AWS実行は未承認）
-- **Reviewed HEAD:** `a1204ff0223ff5e36dfc987fade1c530be2a1c0e`（対象Design R0.2を固定）
-- **反映対象パス:** `docs/superpowers/specs/2026-11-16-aws-cost-name-tagger-controlled-name-write-design.md`（このR0.2.1案は未Commit・未Push）
-- **作業境界:** ACT-RG-F001〜F004の**オフライン文書限定訂正案**。AWS API呼出、IAM変更、ソース変更、Commit/Push/PR、Safety Hold解除は禁止。
+- **文書状態:** `DOCUMENT_REMEDIATION_COMMITTED / HUMAN_OWNER_DESIGN_ADOPTION_PENDING`（Design採択・規範変更・AWS実行は未承認）
+- **Reviewed HEAD:** `b8b78209578bd0b878e4a0f155d966bd112e1973`（今回のF001/F004限定訂正の基準）
+- **反映対象パス:** `docs/superpowers/specs/2026-11-16-aws-cost-name-tagger-controlled-name-write-design.md`（R0.2.1はGitHubへCommit・Push済み。今回のF001/F004限定訂正も同一ファイルに反映）
+- **作業境界:** ACT-RG-F001/F004の**ドキュメント限定訂正**とHuman Ownerが許可した同一featureブランチへのCommit・Pushのみ。AWS API呼出、IAM変更、ソース・CI変更、PR/Merge、Safety Hold解除は禁止。
 - **承認の出所:** 2026-11-16のHuman Ownerとのbrainstormingで決定した方式B・対象C・High/Medium・根拠付き修正・資源単位Fail-Closed・実行別承認、および限定書き込み設計R0.1への承認を入力条件とする。**本Design R0.2/R0.2.1自体の採択、旧規範の更新、AWS実行は未承認。**
 
 ## 1. Why / Project Goal Charter
@@ -97,43 +97,50 @@
 
 ```json
 {
-  "schema_version": 1,
-  "plan_sha256": "<exact-plan-digest>",
-  "account": "<12-digit-account>",
-  "partition": "aws",
-  "region": "<validated-resource-region>",
-  "kind": "volume",
-  "resource_arn": "<canonical-verified-resource-arn>",
-  "locator": "<verified-resource-id>",
-  "name_state_at_plan": "ABSENT",
-  "confidence": "high",
-  "evidence_digest": "<canonical-evidence-digest>",
-  "suggested_name": "<original-proposal>",
-  "approved_name": "<owner-final-name>",
-  "edit_reason": "<required-if-changed>",
-  "decision": "APPROVED",
-  "owner_decision_reference": "<audit-reference-not-authentication>",
-  "owner_principal_id": "<enrolled-owner-id>",
-  "owner_key_fingerprint": "<pinned-approved-public-key-fingerprint>",
-  "issued_at_utc": "<utc-timestamp>",
-  "expires_at_utc": "<utc-timestamp>",
-  "decision_nonce": "<unpredictable-unique-nonce>",
-  "approval_id": "<digest-of-canonical-signed-payload>",
+  "payload": {
+    "schema_version": 1,
+    "approval_namespace": "aws-cost-name-tagger-name-approval-v1",
+    "plan_sha256": "<exact-plan-digest>",
+    "account": "<12-digit-account>",
+    "partition": "aws",
+    "region": "<validated-resource-region>",
+    "kind": "volume",
+    "resource_arn": "<canonical-verified-resource-arn>",
+    "locator": "<verified-resource-id>",
+    "name_state_at_plan": "ABSENT",
+    "confidence": "high",
+    "evidence_digest": "<canonical-evidence-digest>",
+    "suggested_name": "<original-proposal>",
+    "approved_name": "<owner-final-name>",
+    "edit_reason": "<required-if-changed>",
+    "decision": "APPROVED",
+    "owner_decision_reference": "<audit-reference-not-authentication>",
+    "owner_principal_id": "<enrolled-owner-id>",
+    "owner_key_fingerprint": "<pinned-approved-public-key-fingerprint>",
+    "issued_at_utc": "<utc-timestamp>",
+    "expires_at_utc": "<utc-timestamp>",
+    "decision_nonce": "<unpredictable-unique-nonce>"
+  },
+  "approval_id": "<sha256-lowercase-hex-of-canonical-payload-bytes>",
   "signature_ref": "<detached-owner-signature>"
 }
 ```
 
-このJSONは説明用であり、文字列中の`<...>`はプレースホルダー。`signature_ref`は署名対象ペイロードから除外したdetached署名参照とする。`approval_id`は署名対象を識別するdigestであり、それ自体は認証ではない。`account`・Name値・証拠が変更されれば新しいOwner署名が必要。S3などNameを提案できるが書き込めない種別もNameレビューに含められる。
+このJSONは概念スキーマであり、文字列中の`<...>`はプレースホルダー。**署名対象の`NameApprovalPayload`は`payload`オブジェクトの全フィールドだけ**で構成し、`approval_id`および`signature_ref`は`NameApprovalEnvelope`の外側フィールドとする。両者を`payload`へ再挿入しない。S3などNameを提案できるが書き込めない種別もNameレビューに含められる。
+
+**ID算出・署名・検証の順序（ACT-RG-F001）:** (1) Ownerが`payload`の全項目（`schema_version`・`approval_namespace`・Owner ID・鍵fingerprint・Account/ARN/Name/根拠・時刻・nonceを含む）を確定する。(2) RFC 8785（JCS）準拠のcanonical JSONをUTF-8バイト列`B = JCS_UTF8(payload)`として1回定義する。(3) `approval_id = lowercase_hex(SHA256(B))`を算出する。(4) `B`だけをOpenSSHの専用署名namespace `aws-cost-name-tagger-name-approval-v1`で署名し、detached `signature_ref`を作る。(5) `{payload, approval_id, signature_ref}`をEnvelopeとして保管する。検証時は同じ`payload`から`B`とIDを独立再計算し、登録済みOwner鍵で同じ`B`の署名を照合する。正規化・再計算・署名・Owner本人性・期限・nonce・対象情報のいずれかが不明または不一致なら書込み禁止。IDは一意な内容識別子であって認証そのものではない。署名対象の全フィールドという表現は**Payload内の全フィールド**を指し、Envelope全体を指さない。未知フィールド、重複キー、曖昧な型や非決定的なcanonicalizationは拒否する。
 
 **本人確認・作成/検証権限の採用方式（ACT-RG-F001）:** 新規Brokerやクラウド認証サービスを必須にせず、既存OpenSSHの署名・検証機構（例：`ssh-keygen -Y sign/-Y verify`）を利用する方式をこのDesignの**採用候補**とする。信頼元はHuman Ownerが別途本人確認して登録を明示承認した**Owner ID→公開鍵fingerprint→許可role**の固定allowlist（`allowed_signers`相当）だけであり、実行者から自由に指定された公開鍵、承認CSVの氏名欄、Git commit author、STS Principalを信頼根拠にしない。Owner私有鍵の管理者のみが承認を作成可能で、実行主体は署名を検証するだけ。候補ファイルの作成・コピー権限と、**有効なOwner承認を発行できる権限**を明確に分離する。
 
-署名対象は**UTF-8・RFC 8785（JCS）相当の一意なcanonical JSON**とし、署名および検証で同じcanonicalizerを使用する。`signature_ref`等の包絡情報は署名対象から除外するが、対象全フィールド、承認種別、schema version、`owner_principal_id`、期限、nonceは必ず署名範囲に入れる。Name承認では専用namespace `aws-cost-name-tagger-name-approval-v1` を用い、実行承認の署名との取り違えを拒否する。検証時は公開鍵の登録済みfingerprint、ID、許可role、期限、署名、canonical payload digest、plan/ARN/Name/根拠の一致をすべて照合する。鍵の失効・ローテーション・Owner権限変更時は旧鍵の新規実行許可を拒否する。
+署名と検証は同一のRFC 8785準拠canonicalizerを使い、OpenSSHの`-n`署名namespaceと`payload.approval_namespace`を一致照合する。実行承認のnamespaceとの取り違えを拒否する。検証時は公開鍵の登録済みfingerprint、ID、許可role、期限、署名、canonical payload digest、plan/ARN/Name/根拠の一致をすべて照合する。鍵の失効・ローテーション・Owner権限変更時は旧鍵の新規実行許可を拒否する。
 
 **Trust Anchorの運用上のHOLD:** 署名方式の採用候補を記載しても、Owner鍵の実在・本人紐付け・登録/失効手順・保護されたallowlistの所在・実行ホストへの安全な配布は**未承認/未検証**である。将来、実行者が変更できないOS権限の管理領域にOwner信頼情報を事前配置し、書換え・symlink置換・許可roleの改ざんを検出できる状態がOwner承認されるまでは `BLOCKED_OWNER_AUTHN` として**AWS書込みゼロ**。同一UIDから改ざんできる署名検証設定しかない場合もHOLDする。
 
 ### 6.2 一回限り実行承認
 
-`authorization`は**単一の`approval_id`、単一の`resource_arn`、単一の`approved_name`、単一の`aws_operation`**（操作のサービス/API版を固定）、実行Account/Partition/Region、実行Identity（STS Principal ARNだけで権限が証明されたとは扱わない）、コード版/ハッシュ、承認作成時刻・期限、リスク受容・writer統制証拠参照・副作用分析証拠参照、固有の`execution_nonce`・`authorization_id`をcanonical payloadに含める。Name承認と異なるnamespace `aws-cost-name-tagger-execution-v1` で、登録済みOwner鍵の**別署名**を検証する。Name承認の署名を実行署名として使い回せない。検証は、署名の暗号学的妥当性、信頼済みOwner ID/role、失効・期限、Name承認と全対象属性の照合を含む。
+実行承認も`ExecutionAuthorizationPayload`と`ExecutionAuthorizationEnvelope`を分離する。署名対象の`payload`には、`schema_version=1`、`authorization_namespace=aws-cost-name-tagger-execution-v1`、**単一のName承認`approval_id`**、**単一の`resource_arn`・`approved_name`・`aws_operation`**（サービス/API版を固定）、実行Account/Partition/Region、実行Identity（STS Principal ARNだけで権限が証明されたとは扱わない）、実行コード版/ハッシュ、`writer_control_scope_id`、リスク受容・writer統制証拠・副作用分析証拠の参照、Owner ID/登録鍵fingerprint・許可role、発行時刻・期限、固有の`execution_nonce`を含める。
+
+`authorization_id`と`signature_ref`は**Envelope側だけ**に格納する。生成手順を`E = JCS_UTF8(execution_payload)`、`authorization_id = lowercase_hex(SHA256(E))`、次にOpenSSHの専用namespace `aws-cost-name-tagger-execution-v1`で**同じ`E`を署名**、最後に`{payload, authorization_id, signature_ref}`を保存する、と固定する。Name承認の`approval_id`は既に検証済みのIDを**実行Payload内で参照する値**であり、実行承認の自己IDではない。検証では署名済み`E`・再計算した`authorization_id`・namespace・Owner信頼鍵/role/期限/nonce・Name承認と全対象属性の一致を必須とし、`authorization_id`や`signature_ref`自体を`execution_payload`に含めて循環させない。OpenSSH署名、IDのdigest、CSV、自由入力だけではOwner権限や非再利用性を証明しない。
 
 Ownerには**この1件のARN・最終Name・更新API・実行Identityと残余リスク**を再表示して実行承認を得る。検証済み署名だけでは再利用を防げないため、承認ID・nonce・送信意図を同一ホストの**信頼された単一ライター・永続台帳**で照合し、未使用→使用済みへの耐久遷移が確定しなければAWS変更要求を出さない。台帳が改ざん・競合・不一致・消失の場合は `BLOCKED_AUTH_REPLAY`。クラッシュ後に同じ承認を再実行しない。台帳を別ホストから共有できない場合、複数ホスト/複数operatorを許可しない。
 
@@ -201,6 +208,7 @@ Ownerには**この1件のARN・最終Name・更新API・実行Identityと残余
 - SDKの通常自動retryは無効。書込みは1リソースにつき一つの明示的な更新要求のみ。送信・受理・変更の「物理的なexactly-once」を保証するとは記載しない。
 - **送信前に**`WRITE_INTENT_RECORDED`を耐久記録し、`fsync`失敗なら送信禁止。クラッシュ・timeout・応答不明は`OUTCOME_UNKNOWN`として再送禁止。
 - `Readback`で確定Nameが一致すれば`APPLIED_VERIFIED`とできるが、他者の中間更新がなかったことまでは証明しない。**Name不一致・想定外の値変化は`WRITER_CONTROL_SUSPECTED`（競合の証明ではない）**として、同一writer統制範囲の未送信対象を**即座にHOLD**。原因確認と統制健全性の再評価が完了するまで解除不可。Readback不能は結果未確定として`OUTCOME_UNKNOWN`を優先する。
+- **writer統制範囲の永続HOLD（ACT-RG-F004）:** ReadbackのName不一致・想定外のName変化を検出した実行は、署名済み実行Payloadに拘束された`writer_control_scope_id`の状態を、同一ホストの権威ある単一writer永続台帳で`HOLD`へ遷移させる。関連ARNは承認時に固定したスコープ対応へ紐付け、スコープ名の付替えや新IDの発行でHOLDを回避してはならない。`HOLD`の耐久記録を`fsync`等で確定するまで、以降の送信を許可しない。記録に失敗した場合は台帳健全性`UNKNOWN`として**同一ホストの全AWS書込み経路をFail-Closed**とする。既に送信した操作は自動取消・自動ロールバックしない。
 - API timeout・通信断・クラッシュ・Readback不能で`OUTCOME_UNKNOWN`となった場合、旧`INV-N07`を維持し**当該実行の後続送信をすべて停止**。現行は1 ARN/1実行なので自動後続送信は設けない。独立範囲への継続は新規の明示的Owner判断と独立承認による別実行に限り、元の承認を再利用しない。
 - 自動復旧・自動ロールバックは行わない。Ownerが現況を確認して新しい計画と新しい承認で対処する。
 
@@ -211,7 +219,8 @@ Ownerには**この1件のARN・最終Name・更新API・実行Identityと残余
 | ある対象のNameがNONEMPTY・UNKNOWN、証拠差分、adapter非対応 | 当該ARNを`BLOCKED_RESOURCE`。別ARNは独立した承認でのみ実行可能 |
 | Name変更によるIAM/ABAC・イベント・自動化等の副作用未確認（旧`INV-N09`） | 当該ARNを`BLOCKED_SIDE_EFFECT_UNASSESSED`。共通影響があれば影響範囲全体をHOLD |
 | API timeout、応答不明、クラッシュ、Readback不能で結果未確定 | `OUTCOME_UNKNOWN`。**旧`INV-N07`に従い当該実行の後続送信を全面停止**し、再送禁止 |
-| Readback Name不一致・想定外のName変化 | `FAILED_READBACK` + `WRITER_CONTROL_SUSPECTED`。当該ARNと**同一writer統制範囲**の未送信対象をHOLD。原因未確定のまま継続不可 |
+| Readback Name不一致・想定外のName変化 | `FAILED_READBACK` + `WRITER_CONTROL_SUSPECTED`。同一`writer_control_scope_id`の**永続HOLD**を記録し、その範囲の未送信対象を後続の別実行も含めて停止。競合の証明とは扱わない |
+| スコープHOLD台帳の欠落・破損・未初期化・不一致・読取不能、またはHOLDの永続化失敗 | `BLOCKED_SCOPE_STATE_UNKNOWN`。欠落を`CLEARED`と推定せず、同一ホストの送信を停止。状態と統制範囲の検証が回復するまで解除不可 |
 | 実行Identity/Account不一致、Owner署名/信頼元/台帳の不一致・改ざん、監査ジャーナル書込不能 | 関連する実行全体を停止 |
 | 他writerの統制喪失、対象群に共通する権限/設定異常 | **影響範囲全体**をHOLD。無関係な対象範囲への再開は、独立性確認・新しい別承認・Owner判断が必須 |
 | すでに更新成功した対象 | 自動ロールバックしない。結果と残余リスクを保持 |
@@ -231,6 +240,17 @@ PROPOSED -> NAME_APPROVED -> EXEC_AUTHORIZED
 - 機密情報・認証トークンをログに出さない。既存のprivateディレクトリの保護と排他的ファイル操作を維持する。
 - 実行の重複防止には権威あるローカル単一writer台帳を使う（同一ホスト・信頼されたUIDの範囲）。別ホスト/複数operator/同一UID敵対者を完全排他する設計には拡張しない。それらを統制できないなら初回実行対象から除外する。
 - Read予算・時間予算の不足が見込まれる場合は送信前に停止。実行中のdeadlineは物理HTTP処理の厳密な期限ではない。
+
+
+**writer統制範囲の永続状態契約（ACT-RG-F004）:** 認可の使い回し防止用台帳と同じ**単一ホスト・権威ある単一writerの永続台帳**で、実行をまたぐ`writer_control_scope_id`ごとの状態を管理する。スコープ識別はAccount/Partition/Region・統制されるwriter集合/対象境界に紐付けて固定し、承認済みの対象ARNとの対応を記録する。台帳は保護されたローカルファイルと排他的アクセス・永続化を前提とし、別の認証基盤・Broker・クラウドサービスを追加しない。**台帳の永続性が確認できない環境、複数ホストの同期がない環境、並列実行を排他できない環境ではAWS送信を禁止**する。
+
+| 永続状態 | 定義と次回実行時の扱い |
+|---|---|
+| `CLEARED` | Ownerが統制証拠を確認し、当該scopeの初期有効化/解除を明示判断し、耐久記録された状態。ほかの実行Gateが成立するときだけ送信候補 |
+| `HOLD` | Readback不一致・想定外のName変化または統制喪失が検出され、影響対象群への送信を禁止する状態。実行をまたいで保持 |
+| `UNKNOWN` | 未登録・台帳欠落・破損・不整合・読取不能・排他失敗・永続化不能等。**Fail-Closed**であり、黙って`CLEARED`を生成しない |
+
+**送信前チェックと解除手順:** 各実行は署名済み`writer_control_scope_id`と台帳上の固定対象対応を一致確認する。初回の実行開始時および各AWS変更API送信の直前に、単一writerの排他境界内で**最新の耐久状態**を読み、`CLEARED`以外なら送信ゼロとする。異常観測後は`HOLD`の永続化を完了してから当該実行を終了する。異常時に`HOLD`を記録できなければホストの台帳自体を`UNKNOWN`として全送信禁止にする。`HOLD → CLEARED`は、原因とwriter統制健全性の再確認を示す証拠とHuman Ownerの**独立した明示判断**を揃え、台帳に解除根拠・承認者・時刻を耐久記録した場合だけ許可する。解除は旧Name承認・実行承認・nonceの再利用を意味しない。無関係スコープの別実行でも同じ権威台帳を照合し、範囲の独立性を立証できない場合は送信しない。
 
 ## 9. セキュリティGateとOwner決定
 
