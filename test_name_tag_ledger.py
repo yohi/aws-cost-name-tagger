@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -165,7 +166,7 @@ class LedgerTestBase(unittest.TestCase):
 
     def _fixture_only_seed_cleared_scope(self, ledger):
         """Insert a fixture-only CLEARED scope row; rejected by public API."""
-        with sqlite3.connect(str(ledger._path)) as conn:
+        with closing(sqlite3.connect(str(ledger._path))) as conn, conn:
             ts = NOW.isoformat()
             conn.execute(
                 """
@@ -296,15 +297,16 @@ class LedgerTestBase(unittest.TestCase):
         if path is None:
             path = self.root / "ledger.db"
         ledger = open_ledger(path, trusted_host=True)
+        self.addCleanup(ledger.close)
         object.__setattr__(ledger, "_trust", self.trust)
         ledger._now = lambda: NOW
         return ledger
 
     def _initialize_scope(self, ledger: Any, scope_id: str = "scope-1") -> None:
-        decision = self._verify_scope_decision_for(ledger, "INITIALIZE", scope_id=scope_id)
+        envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id=scope_id)
         scope = self._scope_evidence(scope_id=scope_id)
         side_effects = [self._side_effect(arn) for arn in scope.controlled_arns]
-        initialize_scope(ledger, decision, scope=scope, side_effects=side_effects)
+        initialize_scope(ledger, envelope, action="INITIALIZE", scope=scope, side_effects=side_effects)
 
     def _failing_commit(self, ledger: Any, exception: Exception):
         """Return a context manager that makes the ledger's connection commit fail."""
@@ -319,6 +321,10 @@ class LedgerTestBase(unittest.TestCase):
                 return ctx
 
             def __exit__(ctx, *args):
+                try:
+                    ctx._real._conn.rollback()
+                except Exception:
+                    pass
                 return ctx._real.__exit__(*args)
 
             def __getattr__(ctx, name):
@@ -411,12 +417,9 @@ class ScopeVerificationTests(LedgerTestBase):
         self._initialize_scope(ledger)
         hold_scope(ledger, "scope-1", reason="safety")
         before = ledger._path.read_bytes()
-        decision = self._verify_scope_decision_for(ledger, "INITIALIZE", scope_id="scope-1")
+        envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-1")
         with self.assertRaises(LedgerError) as ctx:
-            initialize_scope(
-                ledger,
-                decision,
-                scope=self._scope_evidence(scope_id="scope-1"),
+            initialize_scope(ledger, envelope, action="INITIALIZE", scope=self._scope_evidence(scope_id="scope-1"),
                 side_effects=[self._side_effect()],
             )
         self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
@@ -430,12 +433,9 @@ class ScopeVerificationTests(LedgerTestBase):
         auth = self._verified_execution()
         create_intent(ledger, auth, scope_id="scope-1")
         before = ledger._path.read_bytes()
-        decision = self._verify_scope_decision_for(ledger, "INITIALIZE", scope_id="scope-1")
+        envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-1")
         with self.assertRaises(LedgerError) as ctx:
-            initialize_scope(
-                ledger,
-                decision,
-                scope=self._scope_evidence(scope_id="scope-1"),
+            initialize_scope(ledger, envelope, action="INITIALIZE", scope=self._scope_evidence(scope_id="scope-1"),
                 side_effects=[self._side_effect()],
             )
         self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
@@ -459,17 +459,12 @@ class ScopeVerificationTests(LedgerTestBase):
 
     def test_scope_arn_set_or_evidence_mismatch_denied(self):
         ledger = self._open_ledger()
-        decision = self._verify_scope_decision(
-            self._scope_envelope("INITIALIZE", scope_id="scope-1", target_arns=[ARN, OTHER_ARN]),
-            "INITIALIZE",
-        )
-        # Evidence only covers one ARN.
+        envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-1", target_arns=[ARN, OTHER_ARN])
         scope = self._scope_evidence(scope_id="scope-1", target_arns=frozenset({ARN}))
         side_effects = [self._side_effect(arn) for arn in scope.controlled_arns]
         with self.assertRaises(LedgerError) as ctx:
-            initialize_scope(ledger, decision, scope=scope, side_effects=side_effects)
+            initialize_scope(ledger, envelope, action="INITIALIZE", scope=scope, side_effects=side_effects)
         self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
-
     def test_fixture_cleared_never_enables_production(self):
         db = self.root / "fixture.db"
         ledger = self._open_ledger(db)
@@ -667,7 +662,8 @@ except Exception as exc:
             ledger, "INITIALIZE", scope_id="scope-b", target_arns=[OTHER_ARN]
         )
         scope_b = self._scope_evidence(scope_id="scope-b", target_arns=frozenset({OTHER_ARN}))
-        initialize_scope(ledger, decision_b, scope=scope_b, side_effects=[self._side_effect(OTHER_ARN)])
+        init_envelope_b = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-b", target_arns=[OTHER_ARN])
+        initialize_scope(ledger, init_envelope_b, action="INITIALIZE", scope=scope_b, side_effects=[self._side_effect(OTHER_ARN)])
         auth_a = self._verified_execution(scope_id="scope-a")
         auth_b = self._verified_execution(scope_id="scope-b", resource_arn=OTHER_ARN)
         handle_a = create_intent(ledger, auth_a, scope_id="scope-a")
@@ -684,15 +680,12 @@ except Exception as exc:
         ledger = self._open_ledger(db)
         self._initialize_scope(ledger)
         hold_scope(ledger, "scope-1", reason="safety")
-        decision = self._verify_scope_decision_for(ledger, "INITIALIZE", scope_id="scope-1")
+        release_envelope = self._scope_envelope("RELEASE", ledger=ledger, scope_id="scope-1")
+        release_envelope["signature_ref"] = base64.b64encode(b"bogus").decode()
         with self.assertRaises(LedgerError) as ctx:
-            release_scope(
-                ledger,
-                decision,
-                scope=self._scope_evidence(scope_id="scope-1"),
+            release_scope(ledger, release_envelope, action="RELEASE", scope=self._scope_evidence(scope_id="scope-1"),
                 side_effects=[self._side_effect()],
             )
-        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
 
     def test_t_f004_09_release_does_not_revive_prior_intent_nonce_authorization(self):
         db = self.root / "t-f004-09.db"
@@ -703,11 +696,8 @@ except Exception as exc:
         consume_first_send(ledger, handle)
         record_readback(ledger, handle, name_after="web-prod", outcome="APPLIED_VERIFIED")
         hold_scope(ledger, "scope-1", reason="safety")
-        decision = self._verify_scope_decision_for(ledger, "RELEASE", scope_id="scope-1", host_binding=ledger._host_binding)
-        release_scope(
-            ledger,
-            decision,
-            scope=self._scope_evidence(scope_id="scope-1"),
+        release_envelope = self._scope_envelope("RELEASE", ledger=ledger, scope_id="scope-1")
+        release_scope(ledger, release_envelope, action="RELEASE", scope=self._scope_evidence(scope_id="scope-1"),
             side_effects=[self._side_effect()],
         )
         self.assertEqual(effective_scope_state(ledger, "scope-1"), "CLEARED")
@@ -834,12 +824,12 @@ class AdditionalCrashTests(LedgerTestBase):
     def test_initialize_crash_before_commit_stays_blocked(self):
         db = self.root / "init-crash.db"
         ledger = self._open_ledger(db)
-        decision = self._verify_scope_decision_for(ledger, "INITIALIZE", scope_id="scope-1", host_binding=ledger._host_binding)
+        init_envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-1")
         scope = self._scope_evidence(scope_id="scope-1")
         side_effects = [self._side_effect()]
         with self._failing_commit(ledger, RuntimeError("disk full")):
             with self.assertRaises(RuntimeError):
-                initialize_scope(ledger, decision, scope=scope, side_effects=side_effects)
+                initialize_scope(ledger, init_envelope, action="INITIALIZE", scope=scope, side_effects=side_effects)
         ledger2 = self._open_ledger(db)
         self.assertEqual(effective_scope_state(ledger2, "scope-1"), "UNKNOWN")
 
@@ -848,12 +838,12 @@ class AdditionalCrashTests(LedgerTestBase):
         ledger = self._open_ledger(db)
         self._initialize_scope(ledger)
         hold_scope(ledger, "scope-1", reason="safety")
-        decision = self._verify_scope_decision_for(ledger, "RELEASE", scope_id="scope-1", host_binding=ledger._host_binding)
+        release_envelope = self._scope_envelope("RELEASE", ledger=ledger, scope_id="scope-1")
         scope = self._scope_evidence(scope_id="scope-1")
         side_effects = [self._side_effect()]
         with self._failing_commit(ledger, RuntimeError("disk full")):
             with self.assertRaises(RuntimeError):
-                release_scope(ledger, decision, scope=scope, side_effects=side_effects)
+                release_scope(ledger, release_envelope, action="RELEASE", scope=scope, side_effects=side_effects)
         ledger2 = self._open_ledger(db)
         self.assertEqual(effective_scope_state(ledger2, "scope-1"), "HOLD")
         ledger2 = self._open_ledger(db)
@@ -869,16 +859,110 @@ class AdditionalCrashTests(LedgerTestBase):
         consume_first_send(ledger, handle)
         record_readback(ledger, handle, name_after="web-prod", outcome="APPLIED_VERIFIED")
         hold_scope(ledger, "scope-1", reason="safety")
-        decision = self._verify_scope_decision_for(ledger, "RELEASE", scope_id="scope-1", host_binding=ledger._host_binding)
-        release_scope(
-            ledger,
-            decision,
-            scope=self._scope_evidence(scope_id="scope-1"),
+        release_envelope = self._scope_envelope("RELEASE", ledger=ledger, scope_id="scope-1")
+        release_scope(ledger, release_envelope, action="RELEASE", scope=self._scope_evidence(scope_id="scope-1"),
             side_effects=[self._side_effect()],
         )
         with self.assertRaises(LedgerError) as ctx:
             create_intent(ledger, auth, scope_id="scope-1")
         self.assertEqual(ctx.exception.code, "BLOCKED_AUTH_REPLAY")
+
+
+
+
+    def test_side_effect_coverage_required(self):
+        ledger = self._open_ledger()
+        envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-1", target_arns=[ARN, OTHER_ARN])
+        scope = self._scope_evidence(scope_id="scope-1", target_arns=frozenset({ARN, OTHER_ARN}))
+        with self.assertRaises(LedgerError) as ctx:
+            initialize_scope(ledger, envelope, action="INITIALIZE", scope=scope, side_effects=[])
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_side_effect_digest_must_match(self):
+        ledger = self._open_ledger()
+        scope = self._scope_evidence(scope_id="scope-1")
+        envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-1")
+        bad_effect = self._side_effect(arn=ARN)
+        bad_effect = replace(bad_effect, evidence_references=("tampered",))
+        with self.assertRaises(LedgerError) as ctx:
+            initialize_scope(ledger, envelope, action="INITIALIZE", scope=scope, side_effects=[bad_effect])
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_side_effect_coverage_rejects_wrong_target(self):
+        ledger = self._open_ledger()
+        scope = self._scope_evidence(scope_id="scope-1")
+        envelope = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-1")
+        with self.assertRaises(LedgerError) as ctx:
+            initialize_scope(
+                ledger,
+                envelope,
+                action="INITIALIZE",
+                scope=scope,
+                side_effects=[self._side_effect(OTHER_ARN)],
+            )
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_create_intent_rejects_arn_outside_scope(self):
+        ledger = self._open_ledger(self.root / "cross-arn.db")
+        self._initialize_scope(ledger, scope_id="scope-a")
+        auth = self._verified_execution(scope_id="scope-a", resource_arn=OTHER_ARN)
+        with self.assertRaises(LedgerError) as ctx:
+            create_intent(ledger, auth, scope_id="scope-a")
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_record_readback_commit_failure_keeps_scope_cleared(self):
+        db = self.root / "readback-commit-fail.db"
+        ledger = self._open_ledger(db)
+        self._initialize_scope(ledger)
+        auth = self._verified_execution()
+        handle = create_intent(ledger, auth, scope_id="scope-1")
+        consume_first_send(ledger, handle)
+        with self._failing_commit(ledger, sqlite3.OperationalError("disk full")):
+            with self.assertRaises(LedgerError) as ctx:
+                record_readback(ledger, handle, name_after="other-name", outcome="FAILED_READBACK")
+            self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        ledger2 = self._open_ledger(db)
+        with closing(sqlite3.connect(str(db))) as conn, conn:
+            scope_state = conn.execute(
+                "SELECT state FROM scopes WHERE scope_id = ?", ("scope-1",)
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT state FROM intents WHERE intent_id = ?", (handle.intent_id,)
+            ).fetchone()
+        self.assertEqual(scope_state, "CLEARED")
+        self.assertEqual(row[0], "SEND_ATTEMPT_CONSUMED")
+
+    def test_cross_scope_arn_alias_rejected(self):
+        db = self.root / "alias.db"
+        ledger = self._open_ledger(db)
+        self._initialize_scope(ledger, scope_id="scope-a")
+        init_b = self._scope_envelope("INITIALIZE", ledger=ledger, scope_id="scope-b", target_arns=[ARN])
+        scope_b = self._scope_evidence(scope_id="scope-b", target_arns=frozenset({ARN}))
+        with self.assertRaises(LedgerError) as ctx:
+            initialize_scope(ledger, init_b, action="INITIALIZE", scope=scope_b, side_effects=[self._side_effect(ARN)])
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_scope_transition_rejects_decision_object_in_envelope_payload(self):
+        ledger = self._open_ledger()
+        decision = self._verify_scope_decision_for(ledger, "INITIALIZE")
+        envelope: dict[str, object] = {"payload": decision}
+        with self.assertRaises(LedgerError) as ctx:
+            initialize_scope(
+                ledger,
+                envelope,
+                action="INITIALIZE",
+                scope=self._scope_evidence(),
+                side_effects=[self._side_effect()],
+            )
+        self.assertEqual(ctx.exception.code, "BLOCKED_OWNER_AUTHN")
+
+    def test_unrecognized_readback_outcome_holds_scope(self):
+        ledger = self._open_ledger()
+        self._initialize_scope(ledger)
+        handle = create_intent(ledger, self._verified_execution(), scope_id="scope-1")
+        consume_first_send(ledger, handle)
+        record_readback(ledger, handle, name_after=None, outcome="UNRECOGNIZED_RESULT")
+        self.assertEqual(effective_scope_state(ledger, "scope-1"), "HOLD")
 
 
 # ---------------------------------------------------------------------------

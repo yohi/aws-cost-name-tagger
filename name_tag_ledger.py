@@ -18,7 +18,7 @@ import stat
 import subprocess
 import tempfile
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -59,17 +59,12 @@ class LedgerError(Exception):
 ScopeAction = Literal["INITIALIZE", "RELEASE"]
 
 
-_VERIFIED_SENTINEL = object()
 _LEDGER_CONSTRUCTOR_SENTINEL = object()
 
 
 @dataclass(frozen=True, slots=True)
 class VerifiedScopeDecision:
-    """Verifier-created, immutable proof of an Owner scope decision.
-
-    Can only be constructed by ``verify_scope_decision``; the private
-    ``_verified`` sentinel proves verifier-minted provenance.
-    """
+    """Parsed Owner scope decision; state transitions reverify its raw envelope."""
 
     action: ScopeAction
     scope_id: str
@@ -86,7 +81,6 @@ class VerifiedScopeDecision:
     expires_at_utc: datetime
     reason: str
     decision_nonce: str
-    _verified: object = field(default=False, repr=False)
 
 
 def _canonicalize_arn_set(arns: Sequence[object] | None) -> frozenset[str]:
@@ -102,11 +96,6 @@ def _canonicalize_arn_set(arns: Sequence[object] | None) -> frozenset[str]:
 
 
 
-
-def _require_verified_provenance(decision: VerifiedScopeDecision) -> None:
-    """Reject any caller-constructed VerifiedScopeDecision."""
-    if type(decision) is not VerifiedScopeDecision or decision._verified is not _VERIFIED_SENTINEL:
-        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
 
 
@@ -251,9 +240,7 @@ def _select_signer_lines(
     try:
         trust_path: Any = getattr(trust, "_path")
         lines = trust_path.read_text(encoding="utf-8").splitlines()
-    except ApprovalRejected:
-        raise LedgerError("BLOCKED_OWNER_AUTHN") from None
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError, ApprovalRejected):
         raise LedgerError("BLOCKED_OWNER_AUTHN") from None
 
     selected: list[str] = []
@@ -344,7 +331,7 @@ def verify_scope_decision(
     Fails closed with ``BLOCKED_OWNER_AUTHN`` for signature/role/key problems or
     ``BLOCKED_SCOPE_STATE_UNKNOWN`` for scope-shape problems.
     """
-    if now_utc.tzinfo is None:
+    if not isinstance(trust, OwnerTrust) or now_utc.tzinfo is None:
         raise LedgerError("BLOCKED_OWNER_AUTHN")
 
     if not isinstance(envelope, Mapping):
@@ -411,9 +398,12 @@ def verify_scope_decision(
         raise LedgerError("BLOCKED_OWNER_AUTHN")
 
     candidate_lines = _select_signer_lines(trust, owner_id, set(entries))
-    verifying_fingerprint = _verify_owner_signature(
-        signature, canonical, owner_id, SCOPE_DECISION_NAMESPACE, trust, candidate_lines
-    )
+    try:
+        verifying_fingerprint = _verify_owner_signature(
+            signature, canonical, owner_id, SCOPE_DECISION_NAMESPACE, trust, candidate_lines
+        )
+    except ApprovalRejected:
+        raise LedgerError("BLOCKED_OWNER_AUTHN") from None
 
     entry = entries.get(verifying_fingerprint)
     if entry is None or entry.revoked or entry.role != allowed_role:
@@ -453,7 +443,6 @@ def verify_scope_decision(
         expires_at_utc=expiry,
         reason=reason,
         decision_nonce=decision_nonce,
-        _verified=_VERIFIED_SENTINEL,
     )
 
 
@@ -534,6 +523,10 @@ class _CloseableConnection:
         return self._conn
 
     def __exit__(self, *_exc: object) -> None:
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:
+            pass
         self._conn.close()
 
     def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
@@ -580,6 +573,17 @@ class IntentLedger:
     def _unlock(self) -> None:
         if self._lock_fd is not None:
             fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+
+    def close(self) -> None:
+        """Release the advisory lock and close the lock file descriptor."""
+        self._unlock()
+        lock_fd = self._lock_fd
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
 
     # ------------------------------------------------------------------
     # Schema / integrity
@@ -714,6 +718,7 @@ class IntentLedger:
             self._validate_ledger_state(conn)
             return self._effective_scope_state(conn, scope_id)
 
+
     def _effective_scope_state(self, conn: sqlite3.Connection, scope_id: str) -> str:
         row = conn.execute(
             "SELECT state FROM scopes WHERE scope_id = ?", (scope_id,)
@@ -767,6 +772,15 @@ class IntentLedger:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
         if decision.owner_principal_id != scope.responsible_owner:
             raise LedgerError("BLOCKED_OWNER_AUTHN")
+        # Complete per-ARN side-effect coverage.
+        covered = {effect.target_arn for effect in side_effects}
+        if covered != set(scope.controlled_arns):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        if len(side_effects) != len(covered):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        computed_digest = _side_effect_digest(side_effects)
+        if computed_digest != decision.side_effect_evidence_digest:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
     def _check_decision_replay(
         self, conn: sqlite3.Connection, decision: VerifiedScopeDecision
@@ -791,8 +805,9 @@ class IntentLedger:
         )
     def initialize_scope(
         self,
-        decision: VerifiedScopeDecision,
+        envelope: Mapping[str, object],
         *,
+        action: ScopeAction,
         scope: ScopeEvidence,
         side_effects: Sequence[SideEffectEvidence],
     ) -> None:
@@ -801,18 +816,22 @@ class IntentLedger:
         Requires a verified INITIALIZE decision and matching evidence.  Rejects
         scopes that are already registered, held, or have any prior history.
         """
-        if decision.action != "INITIALIZE":
+        if action != "INITIALIZE":
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
         if not self._trusted_host:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
         now = self._now()
+        trust = self._trust
+        if not isinstance(trust, OwnerTrust):
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        decision = verify_scope_decision(
+            envelope, trust=trust, action=action, now_utc=now
+        )
         self._assert_decision_matches_evidence(decision, scope, side_effects, now)
 
         if decision.expires_at_utc <= now:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-
-        _require_verified_provenance(decision)
 
         self._lock()
         try:
@@ -905,8 +924,9 @@ class IntentLedger:
 
     def release_scope(
         self,
-        decision: VerifiedScopeDecision,
+        envelope: Mapping[str, object],
         *,
+        action: ScopeAction,
         scope: ScopeEvidence,
         side_effects: Sequence[SideEffectEvidence],
     ) -> None:
@@ -915,18 +935,22 @@ class IntentLedger:
         Requires a verified RELEASE decision and fresh evidence.  Does not
         revive prior Intents, nonces, or authorizations.
         """
-        if decision.action != "RELEASE":
+        if action != "RELEASE":
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
         if not self._trusted_host:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
         now = self._now()
+        trust = self._trust
+        if not isinstance(trust, OwnerTrust):
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        decision = verify_scope_decision(
+            envelope, trust=trust, action=action, now_utc=now
+        )
         self._assert_decision_matches_evidence(decision, scope, side_effects, now)
 
         if decision.expires_at_utc <= now:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-
-        _require_verified_provenance(decision)
 
         self._lock()
         try:
@@ -1119,6 +1143,24 @@ class IntentLedger:
                 if self._effective_scope_state(conn, scope_id) != "CLEARED":
                     raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
+                scope_row = conn.execute(
+                    "SELECT target_arns FROM scopes WHERE scope_id = ?", (scope_id,)
+                ).fetchone()
+                if scope_row is None or not isinstance(scope_row[0], str):
+                    raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                try:
+                    decoded_target_arns = json.loads(scope_row[0])
+                except json.JSONDecodeError as exc:
+                    raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+                if (
+                    not isinstance(decoded_target_arns, list)
+                    or any(not isinstance(arn, str) for arn in decoded_target_arns)
+                ):
+                    raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                controlled_arns = frozenset(decoded_target_arns)
+                if resource_arn not in controlled_arns:
+                    raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+
                 # Idempotency / replay guard: one authorization_id may not be reused.
                 reused = conn.execute(
                     "SELECT 1 FROM intents WHERE authorization_id = ? LIMIT 1",
@@ -1293,8 +1335,8 @@ class IntentLedger:
                 now = self._now()
                 timestamp = self._iso(now)
 
-                # Failure/unknown outcomes require durable scope HOLD before terminal.
-                if outcome in ("FAILED_READBACK", "OUTCOME_UNKNOWN", "WRITER_CONTROL_SUSPECTED"):
+                # Any outcome other than explicit success requires durable scope HOLD before terminal.
+                if outcome != "APPLIED_VERIFIED":
                     conn.execute(
                         "UPDATE scopes SET state = ?, reason = ?, updated_at_utc = ? WHERE scope_id = ?",
                         ("HOLD", f"readback:{outcome}", timestamp, scope_id),
@@ -1328,9 +1370,8 @@ class IntentLedger:
         except LedgerError as exc:
             # Re-raise known LedgerErrors (e.g., replay) as-is.
             raise exc
-        except Exception as exc:
-            # Any unexpected failure (including commit failure) means the ledger
-            # could not durably record the HOLD/terminal outcome; block the host.
+        except sqlite3.Error as exc:
+            # A database failure means the HOLD/terminal state is not durable.
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
         finally:
             self._unlock()
@@ -1464,22 +1505,24 @@ def effective_scope_state(ledger: IntentLedger, scope_id: str) -> str:
 
 def initialize_scope(
     ledger: IntentLedger,
-    decision: VerifiedScopeDecision,
+    envelope: Mapping[str, object],
     *,
+    action: ScopeAction,
     scope: ScopeEvidence,
     side_effects: Sequence[SideEffectEvidence],
 ) -> None:
-    ledger.initialize_scope(decision, scope=scope, side_effects=side_effects)
+    ledger.initialize_scope(envelope, action=action, scope=scope, side_effects=side_effects)
 
 
 def release_scope(
     ledger: IntentLedger,
-    decision: VerifiedScopeDecision,
+    envelope: Mapping[str, object],
     *,
+    action: ScopeAction,
     scope: ScopeEvidence,
     side_effects: Sequence[SideEffectEvidence],
 ) -> None:
-    ledger.release_scope(decision, scope=scope, side_effects=side_effects)
+    ledger.release_scope(envelope, action=action, scope=scope, side_effects=side_effects)
 
 
 def hold_scope(ledger: IntentLedger, scope_id: str, *, reason: str) -> None:
@@ -1500,109 +1543,3 @@ def record_readback(
     ledger: IntentLedger, handle: IntentHandle, *, name_after: str | None, outcome: str
 ) -> None:
     ledger.record_readback(handle, name_after=name_after, outcome=outcome)
-
-# ---------------------------------------------------------------------------
-# Test-only fixture seeding (never enables production initialization)
-# ---------------------------------------------------------------------------
-
-
-def _fixture_only_seed_cleared_scope(
-    db_path: Path, *, scope_id: str, host_binding: str | None = None
-) -> None:
-    """Test-only helper: write an explicitly marked fixture CLEARED scope.
-
-    Production ``open_ledger`` rejects any ledger containing fixture markers.
-    """
-    if host_binding is None:
-        host_binding = _host_binding(db_path)
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS ledger_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS scopes (
-                scope_id TEXT PRIMARY KEY,
-                state TEXT NOT NULL CHECK(state IN ('CLEARED', 'HOLD', 'UNKNOWN')),
-                account TEXT,
-                partition TEXT,
-                region TEXT,
-                target_arns TEXT,
-                writer_evidence_digest TEXT,
-                side_effect_evidence_digest TEXT,
-                host_binding TEXT,
-                owner_principal_id TEXT,
-                decision_id TEXT,
-                issued_at_utc TEXT,
-                expires_at_utc TEXT,
-                reason TEXT,
-                fixture_only INTEGER NOT NULL DEFAULT 0,
-                created_at_utc TEXT NOT NULL,
-                updated_at_utc TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS scope_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scope_id TEXT NOT NULL,
-                state TEXT NOT NULL,
-                decision_id TEXT,
-                decision_nonce TEXT,
-                owner_principal_id TEXT,
-                writer_evidence_digest TEXT,
-                side_effect_evidence_digest TEXT,
-                target_arns TEXT,
-                reason TEXT,
-                timestamp_utc TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS used_decisions (
-                scope_id TEXT NOT NULL,
-                decision_id TEXT NOT NULL,
-                decision_nonce TEXT NOT NULL,
-                used_at_utc TEXT NOT NULL,
-                PRIMARY KEY (scope_id, decision_id)
-            );
-            """
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
-            ("host_binding", host_binding),
-        )
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            """
-            INSERT INTO scopes (
-                scope_id, state, account, partition, region, target_arns,
-                writer_evidence_digest, side_effect_evidence_digest, host_binding,
-                owner_principal_id, decision_id, issued_at_utc, expires_at_utc,
-                reason, fixture_only, created_at_utc, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                scope_id,
-                "CLEARED",
-                "000000000000",
-                "aws",
-                "us-east-1",
-                "[]",
-                "0" * 64,
-                "0" * 64,
-                host_binding,
-                "fixture-owner",
-                "fixture-decision",
-                now,
-                now,
-                "fixture-only",
-                1,
-                now,
-                now,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO scope_history (scope_id, state, decision_id, reason, timestamp_utc) VALUES (?, ?, ?, ?, ?)",
-            (scope_id, "CLEARED", "fixture-decision", "fixture-only", now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
