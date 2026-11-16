@@ -212,6 +212,10 @@ Ownerには**この1件のARN・最終Name・更新API・実行Identityと残余
 - API timeout・通信断・クラッシュ・Readback不能で`OUTCOME_UNKNOWN`となった場合、旧`INV-N07`を維持し**当該実行の後続送信をすべて停止**。現行は1 ARN/1実行なので自動後続送信は設けない。独立範囲への継続は新規の明示的Owner判断と独立承認による別実行に限り、元の承認を再利用しない。
 - 自動復旧・自動ロールバックは行わない。Ownerが現況を確認して新しい計画と新しい承認で対処する。
 
+**クラッシュ復旧時の未完了Intent Gate（ACT-RG-F004限定訂正）:** AWS変更APIを許可する前に、権威ある単一ホストの永続台帳で対象`writer_control_scope_id`の最新状態と**当該scopeに属する未完了Intentの有無**を、単一writerの排他境界内で照合する。`CLEARED`が記録されていても未完了Intentが1件でもあれば送信は禁止する。新規Intentは承認済みの対象ARN・Name・`authorization_id`・nonce・scopeを一意に拘束し、**AWS送信前に耐久記録**する。登録したばかりのIntentは、その同一プロセス・同一実行が送信する1操作だけに対応し、別実行・再起動後の送信許可には流用できない。台帳の読み取り、scope照合、未完了Intent検査、Intentの確定は単一writerで直列化し、競合実行を拒否する。初回送信前のIntent永続化に失敗した場合も送信ゼロ。
+
+クラッシュ・送信応答不明・Readback不能・Readback不一致・結果の終端記録前の異常終了は、当該Intentを**未完了**として扱う。特にReadback不一致検出後、scopeの`HOLD`を`fsync`する前にクラッシュして旧`CLEARED`が残っても、先行する耐久Intentから実効的に送信禁止とする。Readback不一致時は、**scopeの`HOLD`を耐久確定するより前にIntentを終端完了扱いへ移してはならない**。結果一致の確認後でも終端記録が未完了なら未完了Intentとして停止する。未完了Intentの影響scopeを特定できなければホスト全体をFail-Closed。旧承認・nonce・Intentの再利用、自動再送、自動ロールバックは禁止する。
+
 ### 7.5 リソース単位Fail-Closedと共通停止
 
 | 失敗・差異 | 扱い |
@@ -252,6 +256,18 @@ PROPOSED -> NAME_APPROVED -> EXEC_AUTHORIZED
 
 **送信前チェックと解除手順:** 各実行は署名済み`writer_control_scope_id`と台帳上の固定対象対応を一致確認する。初回の実行開始時および各AWS変更API送信の直前に、単一writerの排他境界内で**最新の耐久状態**を読み、`CLEARED`以外なら送信ゼロとする。異常観測後は`HOLD`の永続化を完了してから当該実行を終了する。異常時に`HOLD`を記録できなければホストの台帳自体を`UNKNOWN`として全送信禁止にする。`HOLD → CLEARED`は、原因とwriter統制健全性の再確認を示す証拠とHuman Ownerの**独立した明示判断**を揃え、台帳に解除根拠・承認者・時刻を耐久記録した場合だけ許可する。解除は旧Name承認・実行承認・nonceの再利用を意味しない。無関係スコープの別実行でも同じ権威台帳を照合し、範囲の独立性を立証できない場合は送信しない。
 
+**未完了Intentを含む実効scope状態の判定（ACT-RG-F004限定訂正）:** 権威ある台帳は、scope状態だけでなく、同一ホストで実行をまたいで保持されるIntentの存在・対応scope・未完了/終端状態も管理する。スコープ状態とIntent履歴が**両方とも完全に検証可能**であることを送信許可の前提とし、Intent履歴の欠落・破損・読取不能を「未完了Intentなし」と推定しない。初回起動・再起動・新たな実行開始時と**各AWS変更API送信直前**に、単一writer排他下で最新の永続状態を検証する。
+
+| 保存済みscope状態 | 関連する未完了Intent | 実効状態 / 送信可否 |
+|---|---|---|
+| `CLEARED` | 0件（履歴の完全性を検証済み） | 他の全Gateが成立するときのみ送信候補 |
+| `CLEARED` | 1件以上 | `BLOCKED_INCOMPLETE_INTENT`。送信禁止 |
+| `HOLD` | 任意 | `BLOCKED_SCOPE_HOLD`。送信禁止 |
+| `UNKNOWN` | 任意 | `BLOCKED_SCOPE_STATE_UNKNOWN`。送信禁止 |
+| 台帳・Intent・scope対応が欠落、破損、不整合、読取不能 | 不明 | `BLOCKED_SCOPE_STATE_UNKNOWN`。ホスト全体の送信禁止 |
+
+**復旧と解除:** 未完了Intentを検出したら、影響するscopeを実行をまたいで停止し、影響範囲を特定できない場合にはホスト全体を停止する。別scopeを送信候補にできるのは、台帳全体が健全で影響範囲の独立性を確認でき、別途有効な承認がある場合だけ。未完了Intent/HOLDの解除には、AWS現況・writer統制健全性の再確認、Human Ownerの**独立した明示承認**、解除根拠・対象scope・承認者・時刻の**耐久記録**をすべて要する。解除を記録する前に旧Intentの未完了状態を消去したり、旧`CLEARED`のみで復旧させたりしない。解除済みの履歴も再利用禁止の証跡として保持し、旧Name承認・実行承認・nonce・Intentでの再送を認めない。単一ホストの台帳が正常性を保証できない間は、新しいBroker等を導入せずにFail-Closedを維持する。
+
 ## 9. セキュリティGateとOwner決定
 
 - **現行の規範状態:** `G1_NOT_PROVEN / G2_NOT_VERIFIED / SAFETY_HOLD_ACTIVE / AWS_WRITE_BLOCKED`。
@@ -282,6 +298,22 @@ PROPOSED -> NAME_APPROVED -> EXEC_AUTHORIZED
 8. intent永続化失敗では送信ゼロ。timeout/5xx/クラッシュ相当のunknown outcomeで同一承認を自動再送せず、旧`INV-N07`に従い**同一実行の後続送信は0件**。
 9. Readback一致／不一致／読み取り失敗を区別。不一致を`WRITER_CONTROL_SUSPECTED`として同一writer統制範囲の未送信対象をHOLDする（writer競合の証明とはしない）。独立した対象のみ、別のOwner判断/承認下で実行可能とする。
 10. 共通Identity不一致・台帳異常では影響実行全体を停止。
+
+**ACT-RG-F004 クラッシュ復旧の追加オフライン受入テスト（mock/stub・送信APIは模擬）:**
+
+| ID | 故障注入・状況 | 期待結果 |
+|---|---|---|
+| T-F004-01 | Intentを耐久記録した直後、送信前にクラッシュ | 再起動後も未完了Intentを検知。旧承認・nonceによる送信0件 |
+| T-F004-02 | AWS更新要求の送信後、Readback前にクラッシュ | 当該scopeは`BLOCKED_INCOMPLETE_INTENT`、自動再送0件 |
+| T-F004-03 | Readback不一致後、scope HOLDの`fsync`前にクラッシュ | 保存済みの旧`CLEARED`があっても未完了Intentを優先し送信0件 |
+| T-F004-04 | HOLDの耐久記録後、Intentの終端記録前にクラッシュ | `BLOCKED_SCOPE_HOLD`を維持し、別実行も送信0件 |
+| T-F004-05 | Intent台帳・scope対応の欠落/破損/読取不能 | 範囲を確定できなければホスト全体`BLOCKED_SCOPE_STATE_UNKNOWN` |
+| T-F004-06 | 同一scopeの別実行が送信を試みる | HOLD/未完了Intentの照合により送信0件 |
+| T-F004-07 | 独立scopeに別の有効承認がある | 台帳健全性・範囲独立・他Gate成立時のみ新たな実行候補 |
+| T-F004-08 | Owner承認なし、または解除耐久化前にHOLD解除を試みる | 解除拒否・送信0件 |
+| T-F004-09 | Ownerによる解除を耐久化した後に旧nonce/実行承認を再利用 | 再利用拒否。新しい個別承認を要求 |
+
+受入テストは、Intent確定・変更要求・Readback・HOLD記録・Intent終端・解除記録の各永続化境界にクラッシュを挿入し、再起動後の送信可否を判定する。実AWS接続、ソース/CI変更、本番での故障試験は本Design限定訂正の範囲外。
 
 ### 10.2 本来の業務目的での完了条件
 
