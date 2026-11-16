@@ -1,0 +1,194 @@
+# AWS Cost Name Tagger v3.6 — Name補完専用 / Safety Hold
+
+[English](README.md)
+
+> この文書は既存のv3.6運用情報を含む日本語版です。矛盾がある場合は英語版 `README.md` を正とします。
+
+更新: 2026-10-21 (JST)。この版は **Nameタグの提案と関連根拠のレポート出力だけ**を行います。プロダクト分類（Productタグとの対応表、alias解決、原価配賦）は別の処理の責務です。
+
+**AWS変更は禁止したままです。** `run --mode y` はレビューの記録のみ、`apply` は必ず拒否し、`Investigator.write_name()` も必ず例外を送出します。`dryrun` も AWS 読み取り・ローカルレポート生成のみです。
+
+## Controlled Name承認（Phase A）
+
+`name_tag_controlled.py` は、既存planに根拠を結び付けた未署名Name payloadの作成と、別個のName承認・実行認可envelopeの検証に対応します。Owner署名はツール外で行い、Owner秘密鍵は保存しません。
+
+```bash
+uv run --locked python name_tag_controlled.py prepare-name \
+  --plan ./private-reports/plan.json --proposal-id proposal-1 \
+  --approved-name web-prd-name --edit-reason "" \
+  --owner-principal-id owner@example.test --owner-key-fingerprint SHA256:replace-me \
+  --issued-at-utc 2026-11-16T12:00:00Z --expires-at-utc 2026-11-17T12:00:00Z \
+  --decision-nonce nonce-1 --output ./private-reports/name-payload.json
+```
+
+未署名payloadファイルは末尾改行を含まない正規UTF-8 bytesです。OwnerはName namespaceでこのbytesを署名し、そのSHA-256を`approval_id`として、分離署名をenvelopeに格納します。署名・envelope作成はCLI外で行い、秘密鍵を保存しません。`verify-name` と `verify-execution` は、envelope内の署名を検証します。検証には `/etc/aws-cost-name-tagger/owner-trust.json` と `/etc/aws-cost-name-tagger/allowed_signers` の事前登録済みroot管理Trust Anchorが必要です。前者は後者のSHA-256とOwner ID・fingerprint・role対応を持ち、両ファイルはroot管理とします。CLIはTrust Anchorの作成・変更をしません。このPhase A変更ではTrust Anchorを登録しないため、Ownerによる別途の決定がない状態では `BLOCKED_OWNER_AUTHN` で停止します。CLIには公開鍵指定、Safety Hold解除、production stubの迂回オプションはありません。
+
+`owner-trust.json` は `schema_version`、`allowed_signers_sha256`、`owners` のみを含むversion 1 JSONです。各Ownerはfingerprintから `role` と任意の `revoked` に対応付けます。allowed_signersには対応するOwner ID、namespace、公開鍵が必要です。CLIから設定ファイルのpathや公開鍵を指定できません。
+
+`simulate` はin-processのテスト用fake harnessからだけ利用でき、通常のCLI起動では拒否します。`execute-approved` は常に `AWS_WRITE_BLOCKED` を返します。Phase AではAWS書込み、IAM変更、Safety Hold解除を行わず、オフラインテストの成功はPhase Bや実AWS書込みの承認を意味しません。
+
+## v3.5 → v3.6 の変更点（OwnerのR1.1要件）
+
+**Name補完対象:** `Name` キーがない（`ABSENT`）か、**キーは存在し値が厳密に空文字 `""`**（`EMPTY`）の場合だけName候補とする。いずれも、関連関係・名前の妥当性が不足すれば `manual_review` に留めます。
+
+| Nameキー | Name値 | `name_state` | Name候補 | 保護 |
+|---|---|---|---|---|
+| なし | — | `ABSENT` | 根拠がある場合のみ | Safety HoldでAWS書込禁止 |
+| あり | `""`（長さ0） | `EMPTY` | 根拠がある場合のみ | Safety HoldでAWS書込禁止 |
+| あり | `" "`・`"\t"` 等、長さ1以上 | `NONEMPTY` | なし (`already_named`) | 既存値を保護 |
+| あり | `"scs2-prd-web-ec2"` 等 | `NONEMPTY` | なし (`already_named`) | 既存値を保護 |
+| 不正な型、APIエラー、取得不能、`name`/`NAME` のような紛らわしいキー | 不明 | `UNKNOWN` | なし (`manual_review` / `api_error`) | Fail Closed |
+
+**取得値をtrimして空を判定しません。** 空白1文字でも`NONEMPTY`です。`Name`キーの重複や値欠落はUNKNOWNとして扱います。
+
+**PR-BのAWSサービス別入力契約:** タグ取得元のAPIごとに、`list`形式（EC2系・RDS・OpenSearch・ELBv2・CloudFront・Athena・WAFv2・S3）または`dict`形式（API Gateway・CloudWatch Logs・Lambda）を明示し、不一致・不正なキー型・値型・同一キー重複は`UNKNOWN`としてName候補を生成しません。タグ値の`Value`がSDKレスポンスモデル上任意であるlist形式のEC2系・RDS・ELBv2・CloudFront・Athenaでは、**非Nameキーだけ**`Value`省略を空文字に正規化します。`Name`の`Value`欠落はサービスを問わず拒否します。OpenSearch・WAFv2・S3のlist形式は`Value`必須です。親リソースのタグも同じ形式契約で検証し、不正なら候補生成を止めます（子側の正常なABSENT状態自体は変更しません）。サービスがタグ項目そのものを省略したときは、既存の空集合既定値を維持します。正常な空文字・非NameのProductエイリアス不一致は拒否理由にしません。Pythonのdictは重複キーを表現できないため、重複検査はlist形式が対象です。ここでいう省略許容はbotocoreモデル上のスキーマ互換性であり、実AWSが必ずその形で返すことを証明するものではありません。
+
+**PR-B FND-12-R2-003（ページネーション）:** Athenaの`ListTagsForResource`は`NextToken`、WAFv2の同APIは**トップレベル**の`NextMarker`で未取得ページを通知します。本版は追加ページを取得せず、継続トークンが返された時点で**Name状態を`UNKNOWN`・候補なし・`manual_review`**としてfail-closedにします。1ページ目のタグから`ABSENT`/`EMPTY`を確定しません。継続トークンがない（または`null`）単一ページは従来どおり評価します。**WAFv2のみ、`NextMarker=""`も正常な終端マーカーとして扱い、`ABSENT`/`EMPTY`/`NONEMPTY`を通常判定します。** AWS CLI公式例が空文字を返す一方、WAFv2 APIモデルでは`NextMarker`に最小長1の制約があります。この仕様表現の差異を記録し、非空トークンおよび不正な非文字列マーカーは引き続き拒否します。Athenaの`NextToken`に関するfail-closed契約は変更しません。この判断はAWS読み取り件数を増やさない限定防御で、複数ページのタグを網羅取得する機能や実AWSでのページ分割の確認ではありません。
+
+**出力の互換性:** `plan.json` の `schema_version` を **2** に上げ、全候補に `name_state`・`name_key_present`・`name_raw_value`・`existing_name` を付与。CSV（review/report/result/監査/selected）でもNameの状態を独立した列で出力します。`name_key_present` は `true`/`false`、取得不能のときは `null` です。`name_raw_value` は、正常に取得できたName文字列（未設定は `null`、EMPTYは `""`）を保持します。異常な型ではRAWは利用せず `null` とし、UNKNOWNで拒否します。
+
+**候補IDの互換性:** v3.6の `proposal_id` は旧v3.5と異なる専用名前空間にし、ABSENTとEMPTYを必ず区別します。旧レビューCSVや承認候補を流用せず、新しいdryrun結果をレビューしてください。`proposal_id` はレビュー識別子であり、書き込み認可ではありません。
+
+**変更しない点:** `Product`名／別名の解釈は別工程。EBS→EC2のName継承、RDS所属、CloudFrontオリジン等の推定は維持。`Y` は人間のレビュー記録のみ、`apply`と`write_name`は常時拒否し、Name追加・Name空文字更新は**いずれも実施しません**。
+
+## v3.4 → v3.5 から継承した機能
+
+- `Product=storecms` / `Name=storecms2-...`、`Product=ogne` / `Name=coord-app-...`、`Product=ros` / `Name=ros-sftp-...` 等は、**Name候補を拒否する理由にしない**。alias辞書も導入しません。
+- EBS・ENI・EIPは接続先EC2の**既存Nameのみ**を引き継ぎます。`Product`は参照根拠に観測値として残る場合がありますが、判定には使用しません。
+- RDSは実際のクラスタ所属を照合し、既存NameまたはDB識別子から候補を生成します。`Product`タグとの文字列一致検証はしません。
+- CloudFrontはオリジン・Alias・Commentから名前と用途を推定します。`Product`による補正・変換はしません。
+- `shared-service-prd-*` のような共通基盤も**共有基盤としての記述的Name**を提案できます（`medium`）。特定のプロダクトへの割り当てはしません。
+- CLIオプション `--products` を廃止。対象絞り込みは `--kinds`、`--min-cost` など、**リソース種類と費用**で行います。旧オプション使用はエラーで停止します。
+- `Name` と `Product` の整合性を担保する責任は本ツールにはありません。下流の製品分類ロジックで別途検証してください。
+
+### PR #13 — CUR Input Integrity & Bounded Processing（オフライン契約）
+
+`plan`／`run`のCUR処理はAWSセッション生成より前に、各CSV.gzファイルを2回読み取り、展開後のSHA-256・行数・バイト数と元ファイルのdevice/inode/size/mtime/ctimeを照合します。`run`はログイン・STS・IAMより前に全CURから候補を確定し、検証済み候補のスナップショットを`plan`へ引き渡すため再集計しません。ログイン後とレポート作成前には入力ファイル識別情報を再検査し、変更時は停止します。両パスで不一致があれば候補・レポートを生成せず停止します。同じinodeを持つ入力の複数指定（同一パス・hardlink・symlink別名）を拒否し、重複加算を防ぎます。
+
+| 上限 | 現在の固定値（1パスあたり） |
+| --- | --- |
+| CURファイル数 | 64 |
+| CSVデータ行数（全ファイル合算） | 2,000,000 |
+| gzip展開後のバイト数（全ファイル合算） | 512 MiB |
+| gzip展開後の1物理行 | 1 MiB |
+| CSV論理レコード（改行を含む引用フィールドを含めたバイト数） | 1 MiB |
+| CSV論理レコードの最大フィールド数（ヘッダー含む） | 512 |
+| 集計対象ユニークリソース数 | 250,000 |
+
+選択対象レコードの費用は必須の有限数値です。空・非数値・NaN・±Infinityおよび集計時オーバーフローを拒否します。通常のRI/SP/Usage費用項目の意味、対象月選択、最終`--max-resources`の候補上限は維持します。CSVの列名重複や行の欠損・余剰列も拒否します。ヘッダー欠落とCURで必須となる8列の欠落も拒否します。空のgzipは明示月があっても拒否し、必須列のあるヘッダーだけの0行CURは月の明示がある場合に限り空の候補として受理します。複数の物理行にまたがる正常な引用フィールドは、論理レコード上限内で受理します。**CSVパーサーは`strict=True`で動作し、EOFまでに引用符が閉じない不完全なCSVは`csv.Error`として拒否します。** 一方、正常な複数行引用フィールドや`""`による引用符エスケープは受理します。CSV構文エラーは`plan`・`run`ともAWSログイン、STS/IAM参照およびレポート生成前に検出する契約です。Fee等の非対象行は金額の検証対象ではありません。
+
+**保証境界:** この検査は通常の入力事故とgzip展開の資源枯渇に対する限定防御です。ファイル走査前後のstatと2パスのデコード内容ハッシュは、同一UIDの敵対的改変、時計/メタデータ偽装、非信頼ネットワークファイルシステム上の完全なスナップショット一貫性を証明しません。gzip圧縮入力全体を先読みして署名検証する機能もありません。大規模CURが上限を超える場合は自動で増量せず、別途上限変更をレビューしてください。全CUR月次データの網羅性や原本真正性も未証明です。
+
+### PR #14 — AWS Read Budget & Pagination Safety（AUD-002）
+
+`plan`と`run`でCUR入力を検証した後、アプリケーションから明示的に行うAWS読み取りSDK呼び出しを**同一の読み取り予算**で管理します。`run`のSTS・IAM表示と`plan`のSTS再確認・各リソースのAPI読取が同一カウンターを消費します。直接`Investigator`を呼ぶ場合にも独立した予算が付きます。
+
+| 制約 | 固定値 |
+| --- | ---: |
+| AWS読み取りAPI呼び出し | 500回（STS/IAM/リソース共通） |
+| 読み取り開始からの経過時間チェック | 120秒 |
+| RDSクラスタのResourceId検索 | 最大25ページ |
+| SDK内部の最大試行 | 1回（`total_max_attempts=1`） |
+| SDK接続タイムアウト | 5秒 |
+| SDKレスポンス読み取りタイムアウト | 10秒 |
+
+すべてのSDK読み取りに共通のSessionラッパーを用い、呼び出し**前**に予算を消費します。読み取り以外のメソッドとSDK paginator/waiterの暗黙的な利用は許可しません。予算が尽きた対象は`UNKNOWN / manual_review / proposed_name=""`として処理し、`plan`は**途中までの候補をレポート公開しません**。AWS読み取り完了後だけでなく、JSON/CSVのステージングとfsyncが完了した**公開直前**にも経過時間を再検査し、期限を超えていれば全候補の公開を中止します。**未完了・失敗した計画の候補名はstderrにも出力せず**、候補ごとの表示はファイル公開成功後に行います。RDSの継続Markerは同一トークンが再出現すると拒否し、上限ページを越えた場合も未取得のリソースがあるとしてName候補を拒否します。Athena／WAFv2の既存の未取得タグページに対するfail-closed動作は維持します。
+
+**保証範囲の明確化:** 500回は本ツールが明示的に呼ぶSDKメソッド回数であり、AWSの請求単位、credential-providerによる透過的通信、DNS等の通信回数、別プロセス、SDKの隠れた非操作呼び出しを厳密に合算するものではありません。`total_max_attempts=1`によりbotocoreの通常のAPIリトライ増幅を抑えますが、経過時間チェックは次のAPI呼び出し前とレポート公開直前に行うため、**実行中の1リクエスト、および公開処理中の壁時計上限を保証しません**。期限超過後の公開開始は拒否しますが、公開の途中で期限をまたぐ状況に対する完全な一括原子性・ハードデッドライン保証ではありません。これは実AWS環境の料金・レート制限やHost/Gateway権限を検証したものではなく、限界値の変更は別途レビューしてください。
+
+### PR #15 — Offline Safety Boundary & Coverage（AUD-004 / AUD-005）
+
+**監査ジャーナル:** `journal_event()`は、最後のパス要素も`O_NOFOLLOW`で開いた後、取得したFDに対し`os.fstat()`で**通常ファイル（`S_ISREG`）**であることを検証してから書き込みます。非通常ファイルなら書き込み・`fsync`前に例外で停止します。`O_NONBLOCK`を併用するため、読取側のないFIFOへ置換されても書込オープンで無期限に待機しません。実ジャーナルの既存追記と`fsync`、以前に書き込まれた行の保持、symlink拒否は維持します。これらは、同一UIDによる敵対的競合を完全に防止する保証ではありません。
+
+**Python互換性:** Safety Hold CIの固定依存テストをPython **3.10・3.11・3.12** でそれぞれ実行し、全組み合わせで`uv sync --locked`とユニットテスト2方式、SHA-256マニフェスト検証を行います。OSは引き続きUbuntu Linuxのみを対象とし、他OSを許可する変更ではありません。G2の標準・ネットワーク遮断Dockerテストは従来どおりPython 3.12に固定します。
+
+**実行行カバレッジ:** Python 3.12で標準ライブラリ`trace --count --missing --summary`を使い、ソース実行行の計測結果と未実行行をGitHub Actionsのartifactに保存します。**行カバレッジの参考計測であり、分岐・安全状態・MC/DCカバレッジを証明しません。** 特定のパーセンテージをもってG1/G2 Gateの証明とみなさず、数値および未実行領域は今後の安全性テスト追加の優先順位付けに利用します。新規の外部計測パッケージは追加していません。
+
+### FND-15-R1-003 — CI Tool Version / Coverage Provenance
+
+Safety Hold CIは既知チェックサム情報を備えた`astral-sh/setup-uv v10.3.2`の固定コミット`07a047e608db84b3d8c06cd9a7c7dcc9c355c18e`を使用し、インストールするuvを**0.13.5に指定**します。`uv --version`のプラットフォーム表記に左右されずバージョン番号を比較し、不一致なら停止します。OSは`ubuntu-latest`、Pythonは各マイナーバージョン指定であるため、**ジョブ環境全体のバイト単位の固定ではありません**。依存パッケージは従来どおり`uv.lock`で固定します。Python 3.10/3.11/3.12のロック済みCIを継続します。
+
+Python 3.12の行カバレッジ成果物は、注釈付き`.cover`ファイル・サマリーのほかに`coverage-evidence.json`を同梱します。このJSONは各ファイルのバイト数とSHA-256、実行環境のPython・uvバージョン、GitHub Actionsの`GITHUB_SHA`、checkoutしたGitのHEADとtree SHAを記録します。JSON自体のSHA-256とGitHubが返すアップロード済みArtifactのID・digestはCIログにも出力します。これらは**再現性・同一性照合用の受領情報であり、署名や第三者による真正性証明ではありません**。PR CIはマージテストコミットで実行されるため、`GITHUB_SHA`とPRのレビューHEADが異なり得ます。両者を比較する際はtree SHAを別途照合します。
+
+保存期間はGithub Actionsの設定で許容される範囲の**最大90日を要求**します。公開リポジトリにおける90日の上限と、リポジトリ・組織による実効保持設定の制約があります。**90日を超える永続的な監査保管は未実装**であり、必要ならOwnerが管理する独立ストレージと保存・アクセス・ハッシュ照合の設計を別途承認してください。結果の保存はCIの成功または正式G1/G2 Gate解除を意味しません。
+
+### 維持する安全条件
+
+- `Name` キーが存在して**非空文字**なら `already_named` として保護。`Name=""` は候補（根拠があるときのみ）。空白文字は非空として保護。
+- 親子関係が複数候補・不明、または命名に必要な根拠が不足する場合は `manual_review`。
+- EBS Snapshotは作成時点の所有者が証明できないため、自動推定しません。
+- 命名プレフィックスの解析は「Nameの構造・環境名」の確認のみ。**AWS `Product` タグや製品カタログへのマッピングではありません。**
+- S3タグ更新なし。すべてのAWS書き込み経路を無効化。ローカルレポートはPOSIX `0600`、新規ディレクトリ `0700`、symlink追跡禁止、上書き禁止。
+- ステージング→複数ファイル公開は通常エラー時ロールバック可能ですが、**SIGKILL・電源断時の一括原子性は保証できません**。
+- **PR-C候補の公開境界:** `plan`・`run`の既定`--output`は`./.aws-cost-name-tagger/name_tag_plan.json`です。専用ディレクトリがなければモード`0700`で作成します。明示指定の`--output`も、AWSログイン・CUR処理・AWS APIより前に公開先ディレクトリとplan/review/reportの既存ファイル衝突を検査します。`--mode dryrun`を指定した場合はresult、`--mode y`を指定した場合はselected/auditの衝突もログイン前に確認します。対話モードで選択が未確定の場合、追加ファイルはモード選択後・plan生成前に確認します。公開先とステージング元は実効UIDが所有し、group/otherの権限を許さないprivateディレクトリが必要です。既存ディレクトリは自動`chmod`せず、不一致は`PermissionError`で停止します。共有ディレクトリ直下へ直接出力する既存利用方法は変更が必要です。
+- **検証済み実行環境はUbuntu Linuxに限定します。** 実行前にLinux/Ubuntuの判別、`O_DIRECTORY`・`O_NOFOLLOW`、`open/mkdir/stat/link/unlink` の`dir_fd`、`stat/link`の`follow_symlinks=False`能力を確認し、非対応ならAWSアクセス前に停止します。macOS/APFS（ACLや所有権無効ボリュームを含む）・他のLinuxディストリビューション等の安全性は未検証であり、本実装では拒否します。UbuntuでもACL・マウント設定・親ディレクトリの信頼性を含む実効隔離を普遍的に証明したものではありません。
+- **同一UIDや特権プロセスを敵対的とする隔離保証はありません。** 通常のパス名チェック、所有者/mode検証、dirfdでは、同一UIDによるエントリ置換や変更可能な親パス全般を排除できません。これらを含める脅威モデルは別設計とGate判断が必要です。
+- ステージング元のsymlink・FIFO・ディレクトリ等の非通常ファイルは公開しません。ロールバック自体が失敗した場合は、主障害とcleanup障害、残存した可能性のある出力先を例外情報として通知します（クラッシュ時の永続性保証ではありません）。
+
+## 環境
+
+- **PR-C候補: Ubuntu Linuxのみサポート。** macOSおよび他の未検証OSでは実行前に停止します。macOSの実機/APFS/ACL試験は実施しておらず、`0700`だけで実効隔離を保証しません。
+- Python 3.10以降、`uv`、対話型 `aws login --remote` を利用する場合は対応AWS CLI。
+- `pyproject.toml`: `boto3[crt]==1.43.116`。
+- **このGitHubリポジトリには `uv.lock` をコミット済み**で、`boto3[crt]==1.43.116` がロックされています。元のv3.6配布ZIPには `uv.lock` が含まれていません。2026-10-22にGitHub Actionsで指定環境の **76/76 テストPASS（2通り）** を確認しました。
+
+```bash
+# 以下のコマンドはリポジトリのルートディレクトリで実行します。
+uv sync --locked
+uv run --locked python -m unittest -v test_aws_cost_name_tagger_v3
+uv run --locked python test_aws_cost_name_tagger_v3.py
+```
+
+## 実行例（AWS読み取り専用）
+
+`--output`を省略すると、カレントディレクトリ直下のprivateな`./.aws-cost-name-tagger/name_tag_plan.json`が既定になります。明示的な`--output`を使う場合、既存の出力先ディレクトリは`0700`相当のprivateな権限・実効UIDの所有が必要です。既存の`0755`ディレクトリ（リポジトリ直下等）に直接出力するとAWS認証前に拒否します。新規の中間ディレクトリは必要に応じて`0700`で作成します。
+
+認証は別途ログインするか、`--login ask`で案内します。対象AWSアカウントと実際のIAM主体が表示されますが、ロール名・STSだけでは実効権限は証明されません。可能な限り読み取り専用ロールを使用してください。
+
+```bash
+aws login --remote --profile saas-prd-ro
+aws sts get-caller-identity --profile saas-prd-ro
+
+uv run --locked python aws_cost_name_tagger_v3.py run \
+  --cur /path/to/aws-resource-cost-detail-00001_202610.csv.gz \
+  --month 2026-10 --account 456720798575 \
+  --profile saas-prd-ro --login skip --mode dryrun \
+  --min-cost 10 --max-resources 100 \
+  --output ./private-reports/high-cost/plan.json
+
+uv run --locked python aws_cost_name_tagger_v3.py run \
+  --cur /path/to/aws-resource-cost-detail-00001_202610.csv.gz \
+  --month 2026-10 --account 456720798575 \
+  --profile saas-prd-ro --login skip --mode dryrun \
+  --min-cost 0.5 --kinds volume,snapshot \
+  --output ./private-reports/ebs/plan.json
+```
+
+生成する出力ファイル（上記の `plan.json` を基準に命名）：
+
+| 出力 | 内容 |
+|---|---|
+| `plan.json` | schema_version=2、候補、ARN、費用、根拠、name_state、Nameキーの有無・生値 |
+| `plan.report.csv` | 調査結果一覧、Nameの状態・キー存在・生値を独立表示 |
+| `plan.review.csv` | Name状態を含むレビュー入力用、承認列は初期状態で空 |
+| `plan.result.csv` | Name状態を含むdryrun未変更結果 |
+| `plan.selected.csv` / `plan.audit.jsonl` / `plan.audit.csv` | `Y`で選択した候補・レビュー監査のみ、**AWS書き込みなし** |
+
+## 重要な制約
+
+- Nameのプレフィックス自体が誤っている可能性や、共有リソースが複数プロダクトで使われる可能性は残ります。提案は製品帰属の証明ではありません。
+- `write_name()` / `apply` は意図的に使用不可です。原子的な「Name未存在時のみタグ追加」が各サービスで保証できる書き込み設計は**未承認・未実装**です。
+- 配布ZIP作成時点では指定依存環境による検証が未実施でした。GitHubでは `uv.lock` を追加し、固定依存環境での実行をCIで検証します。`test_results.txt` と `uv_lock_attempt.txt` は**配布ZIP作成時の履歴記録**であり、GitHub上での現状を示すものではありません。
+- 2026-10-21の提出dryrunレポート（高額90件＋EBS28件）は `ABSENT` 58件・`NONEMPTY` 60件・`EMPTY` 0件でした。**提出データの整合性確認であり、AWSへの独立再接続・CloudTrail検証ではありません。**
+- v3.4/v3.5の既存レポートはv3.6へ自動変換しません。特に従来の承認候補・候補IDは流用しないでください。
+
+## GitHub Actions（Safety Hold CI）
+
+`.github/workflows/ci.yml` は `master`、`feature/**` へのpush、Pull Request、手動実行で起動します。AWS認証情報や実AWSへの接続は不要で、**すべてモック／ローカルのテスト**です。
+
+1. Python 3.12 と uv を準備し、`uv sync --locked` で依存関係を固定してインストール。
+2. Boto3 `1.43.116` とAWS CRTをimportして依存バージョンを確認。
+3. `SHA256_MANIFEST.json` に記載されたファイルのSHA-256とサイズを確認（`uv.lock` とCI workflowも含む）。
+4. `uv run --locked --no-build python -m unittest -q test_name_tag_approval test_name_tag_review test_name_tag_scope test_name_tag_ledger test_name_tag_execution test_name_tag_adapters test_name_tag_controlled test_aws_cost_name_tagger_v3` と既存の直接実行で、offline承認フローとSafety Holdを検証します。テスト件数はリポジトリの更新により変わります。
+
+**CIの実行結果は[GitHub Actions Run #39702373325](https://github.com/yohi/aws-cost-name-tagger/actions/runs/39702373325)で確認済みです。** このRunでは依存関係固定、Boto3/CRT、マニフェスト11ファイル、両実行方法のテスト76/76がすべてPASSしました。依存関係の更新が必要な場合は、別変更で `uv lock` を実行して `uv.lock` とマニフェストを更新します。Safety Holdの解除やタグ書き込みは行いません。

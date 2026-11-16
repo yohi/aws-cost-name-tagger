@@ -75,7 +75,11 @@ jobs:
         run: uv run --locked --no-build python -m unittest -q test_trace_to_sonar_generic
 
       - name: Unit tests (module runner)
-        run: uv run --locked --no-build python -m unittest -q test_aws_cost_name_tagger_v3
+        run: >-
+          uv run --locked --no-build python -m unittest -q
+          test_name_tag_approval test_name_tag_review test_name_tag_scope
+          test_name_tag_ledger test_name_tag_execution test_name_tag_adapters
+          test_name_tag_controlled test_aws_cost_name_tagger_v3
 
       - name: Unit tests (direct script runner)
         run: uv run --locked --no-build python test_aws_cost_name_tagger_v3.py
@@ -92,7 +96,10 @@ jobs:
           uv run --locked --no-build python -m trace --count --missing --summary \
             --coverdir offline-line-coverage \
             --ignore-dir "$STDLIB" --ignore-dir "$SITE" \
-            --module unittest -q test_aws_cost_name_tagger_v3 \
+            --module unittest -q \
+            test_name_tag_approval test_name_tag_review test_name_tag_scope \
+            test_name_tag_ledger test_name_tag_execution test_name_tag_adapters \
+            test_name_tag_controlled test_aws_cost_name_tagger_v3 \
             2>&1 | tee trace-summary.txt
 
       - name: Generate Sonar generic coverage evidence (offline only)
