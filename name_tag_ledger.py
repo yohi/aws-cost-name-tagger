@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import stat
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -504,9 +505,14 @@ class IntentLedger:
 
     def _connection(self) -> _CloseableConnection:
         conn = sqlite3.connect(str(self._path), timeout=10.0)
-        conn.execute("PRAGMA synchronous = FULL")
-        conn.execute("PRAGMA journal_mode = DELETE")
-        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute("PRAGMA journal_mode = DELETE")
+            conn.execute("PRAGMA foreign_keys = ON")
+        except sqlite3.Error as exc:
+            with suppress(sqlite3.Error):
+                conn.close()
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
         return _CloseableConnection(conn)
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
@@ -1370,60 +1376,63 @@ def open_ledger(
     if needs_init:
         file_path.touch(mode=0o600)
 
-    conn = sqlite3.connect(str(file_path), timeout=10.0)
+    ledger = IntentLedger(
+        path=file_path,
+        trusted_host=trusted_host,
+        trust=trust,
+        host_binding=host_binding,
+        execution_id=uuid.uuid4().hex,
+        _constructor_token=_LEDGER_CONSTRUCTOR_SENTINEL,
+    )
     try:
+        ledger._lock()
+        conn = sqlite3.connect(str(file_path), timeout=10.0)
         try:
-            conn.execute("PRAGMA synchronous = FULL")
-            conn.execute("PRAGMA journal_mode = DELETE")
-            conn.execute("PRAGMA foreign_keys = ON")
-        except sqlite3.DatabaseError as exc:
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+            try:
+                conn.execute("PRAGMA synchronous = FULL")
+                conn.execute("PRAGMA journal_mode = DELETE")
+                conn.execute("PRAGMA foreign_keys = ON")
+            except sqlite3.DatabaseError as exc:
+                raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
 
-        # Integrity check.
-        try:
-            integrity = conn.execute("PRAGMA integrity_check").fetchone()
-            if integrity is None or integrity[0] != "ok":
+            # Integrity check.
+            try:
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()
+                if integrity is None or integrity[0] != "ok":
+                    raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+            except sqlite3.DatabaseError as exc:
+                raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+
+            # Probe whether this is a brand-new empty DB before schema creation.
+            cursor = conn.execute("SELECT COUNT(*) FROM sqlite_master")
+            db_is_empty = cursor.fetchone()[0] == 0
+            ledger._ensure_schema(conn)
+
+            meta = conn.execute(
+                "SELECT value FROM ledger_meta WHERE key = 'host_binding'"
+            ).fetchone()
+            if meta is None:
+                # Only mint a new host binding for a genuinely empty database.
+                if not db_is_empty:
+                    raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                conn.execute(
+                    "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
+                    ("host_binding", host_binding),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
+                    ("schema_version", "1"),
+                )
+                conn.commit()
+            elif meta[0] != host_binding:
                 raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-        except sqlite3.DatabaseError as exc:
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
 
-        # Probe whether this is a brand-new empty DB before schema creation.
-        cursor = conn.execute("SELECT COUNT(*) FROM sqlite_master")
-        db_is_empty = cursor.fetchone()[0] == 0
-
-        ledger = IntentLedger(
-            path=file_path,
-            trusted_host=trusted_host,
-            trust=trust,
-            host_binding=host_binding,
-            execution_id=uuid.uuid4().hex,
-            _constructor_token=_LEDGER_CONSTRUCTOR_SENTINEL,
-        )
-        ledger._ensure_schema(conn)
-
-        meta = conn.execute(
-            "SELECT value FROM ledger_meta WHERE key = 'host_binding'"
-        ).fetchone()
-        if meta is None:
-            # Only mint a new host binding for a genuinely empty database.
-            if not db_is_empty:
-                raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-            conn.execute(
-                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
-                ("host_binding", host_binding),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
-                ("schema_version", "1"),
-            )
-            conn.commit()
-        elif meta[0] != host_binding:
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-
-        ledger._validate_ledger_state(conn)
-        return ledger
+            ledger._validate_ledger_state(conn)
+            return ledger
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        ledger.close()
 
 
 

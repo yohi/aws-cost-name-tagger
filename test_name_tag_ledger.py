@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from unittest.mock import patch
 
 from name_tag_approval import (
     EnrolledOwner,
@@ -402,6 +404,49 @@ class ScopeVerificationTests(LedgerTestBase):
     def test_open_ledger_receives_owner_trust(self):
         ledger = self._open_ledger()
         self.assertIs(ledger._trust, self.trust)
+
+    def test_connection_closes_and_normalizes_sqlite_pragma_failure(self):
+        ledger = self._open_ledger()
+
+        class FailingConnection:
+            closed = False
+
+            def execute(self, sql):
+                raise sqlite3.DatabaseError("invalid database")
+
+            def close(self):
+                self.closed = True
+
+        connection = FailingConnection()
+        with patch("name_tag_ledger.sqlite3.connect", return_value=connection):
+            with self.assertRaises(LedgerError) as ctx:
+                ledger._connection()
+
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        self.assertTrue(connection.closed)
+
+    def test_open_ledger_acquires_process_lock_before_sqlite_connection(self):
+        db = self.root / "lock-order.db"
+        lock_acquired = False
+        real_flock = fcntl.flock
+        real_connect = sqlite3.connect
+
+        def observe_flock(fd, operation):
+            nonlocal lock_acquired
+            if operation == fcntl.LOCK_EX:
+                lock_acquired = True
+            return real_flock(fd, operation)
+
+        def require_lock_before_connect(*args, **kwargs):
+            self.assertTrue(lock_acquired)
+            return real_connect(*args, **kwargs)
+
+        with patch("name_tag_ledger.fcntl.flock", side_effect=observe_flock):
+            with patch("name_tag_ledger.sqlite3.connect", side_effect=require_lock_before_connect):
+                ledger = self._open_ledger(db)
+
+        self.assertTrue(lock_acquired)
+        ledger.close()
 
     def test_release_unknown_scope_persists_scope_evidence(self):
         ledger = self._open_ledger()
