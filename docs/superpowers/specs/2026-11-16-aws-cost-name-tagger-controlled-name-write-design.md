@@ -282,7 +282,7 @@ PROPOSED -> NAME_APPROVED -> EXEC_AUTHORIZED
 - **F001 HOLD:** Owner署名方式は採用候補として固定したが、Trust Anchorの本人確認・登録・失効・保護は未承認。署名検証が成立しない間、AWS変更API呼出は0件。
 - **F002 HOLD:** 旧`INV-N09`に基づくNameタグの認可/イベント/自動化への影響確認が未完了の対象には書かない。writer統制と副作用確認の両方を必須とする。
 - **F004 HOLD:** Readback不一致は競合確定と扱わず、writer統制異常の兆候として同一統制範囲をHOLD。解除は統制の再確認とOwner判断が必要。
-- **実装計画との整合:** 今回の差分にはImplementation Planが存在しないため、**計画書との仕様・用語・型/インターフェース・エラー処理・試験・非機能要件の比較は未評価（NOT_APPLICABLE_FOR_THIS_CHANGE）**。将来の計画では本Designを入力条件とし、実装計画を今回新規作成しない。
+- **実装計画との整合（F007）:** Implementation Planは `docs/superpowers/plans/2026-11-16-aws-cost-name-tagger-controlled-name-write.md` に存在する。現行PlanのTask 4（Owner署名に基づくscope初期登録・HOLD解除、耐久台帳）、Task 5（RuntimeContext型、オフラインstubとGuarded Executor）、Task 8（認証済みRuntime Policy、FirstSendPermitと実SDK Adapter境界）を、本Design §6〜§10の承認Payload、scope/ARN集合・証拠、Intent消費、HOLD/解除、エラー分類、クラッシュ復旧試験、環境保護・永続化・実AWS書込み禁止の非機能条件との整合確認対象とする。Planの存在・訂正・整合確認は**Design採択、Trust Anchor登録、規範変更、実装着手またはAWS実行の承認を意味しない**。
 - 実装はAWS資格情報なしのmock/stubで先行できる。実AWSへのread-only接続も別の明示的な許可なしに開始しない。
 
 ## 10. エラー・テスト・受入条件
