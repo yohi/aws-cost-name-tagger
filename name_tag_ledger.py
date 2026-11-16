@@ -598,7 +598,7 @@ class IntentLedger:
             ).fetchone()
         except sqlite3.DatabaseError as exc:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
-        if result is not None and result[0] != self._host_binding:
+        if result is None or result[0] != self._host_binding:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
         try:
@@ -781,12 +781,20 @@ class IntentLedger:
                     raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
                 # Detect aliased/fixed target scopes: any existing scope or HOLD covering any ARN.
-                for arn in decision.target_arns:
-                    alias = conn.execute(
-                        "SELECT 1 FROM scopes WHERE target_arns LIKE ? LIMIT 1",
-                        (f"%{arn}%",),
-                    ).fetchone()
-                    if alias is not None:
+                existing_target_sets = conn.execute(
+                    "SELECT target_arns FROM scopes WHERE target_arns IS NOT NULL"
+                ).fetchall()
+                for (stored_arns,) in existing_target_sets:
+                    try:
+                        decoded_arns = json.loads(stored_arns)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+                    if (
+                        not isinstance(decoded_arns, list)
+                        or any(not isinstance(arn, str) for arn in decoded_arns)
+                    ):
+                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                    if set(decoded_arns).intersection(decision.target_arns):
                         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
                 timestamp = self._iso(now)
@@ -888,8 +896,22 @@ class IntentLedger:
 
                 timestamp = self._iso(now)
                 conn.execute(
-                    "UPDATE scopes SET state = ?, decision_id = ?, reason = ?, updated_at_utc = ? WHERE scope_id = ?",
-                    ("CLEARED", decision.decision_id, decision.reason, timestamp, decision.scope_id),
+                    """
+                    UPDATE scopes SET
+                        state = ?, account = ?, partition = ?, region = ?, target_arns = ?,
+                        writer_evidence_digest = ?, side_effect_evidence_digest = ?,
+                        host_binding = ?, owner_principal_id = ?, decision_id = ?,
+                        issued_at_utc = ?, expires_at_utc = ?, reason = ?, updated_at_utc = ?
+                    WHERE scope_id = ?
+                    """,
+                    (
+                        "CLEARED", scope.account, scope.partition, scope.region,
+                        json.dumps(sorted(decision.target_arns), separators=(",", ":")),
+                        decision.writer_evidence_digest, decision.side_effect_evidence_digest,
+                        decision.host_binding, decision.owner_principal_id, decision.decision_id,
+                        self._iso(decision.issued_at_utc), self._iso(decision.expires_at_utc),
+                        decision.reason, timestamp, decision.scope_id,
+                    ),
                 )
                 self._record_decision_use(conn, decision)
                 conn.execute(
@@ -1327,7 +1349,9 @@ def _check_ledger_path(path: Path) -> None:
         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
 
-def open_ledger(path: Path | str, *, trusted_host: bool) -> IntentLedger:
+def open_ledger(
+    path: Path | str, *, trusted_host: bool, trust: OwnerTrust
+) -> IntentLedger:
     """Open or create a host-bound Intent ledger.
 
     Rejects symlinks, unsafe owner/mode, unexpected hosts, missing historical
@@ -1370,7 +1394,7 @@ def open_ledger(path: Path | str, *, trusted_host: bool) -> IntentLedger:
         ledger = IntentLedger(
             path=file_path,
             trusted_host=trusted_host,
-            trust=None,
+            trust=trust,
             host_binding=host_binding,
             execution_id=uuid.uuid4().hex,
             _constructor_token=_LEDGER_CONSTRUCTOR_SENTINEL,

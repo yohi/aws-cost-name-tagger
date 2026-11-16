@@ -296,9 +296,8 @@ class LedgerTestBase(unittest.TestCase):
     def _open_ledger(self, path: Path | None = None) -> Any:
         if path is None:
             path = self.root / "ledger.db"
-        ledger = open_ledger(path, trusted_host=True)
+        ledger = open_ledger(path, trusted_host=True, trust=self.trust)
         self.addCleanup(ledger.close)
-        object.__setattr__(ledger, "_trust", self.trust)
         ledger._now = lambda: NOW
         return ledger
 
@@ -400,6 +399,62 @@ class BasicLedgerTests(LedgerTestBase):
 
 
 class ScopeVerificationTests(LedgerTestBase):
+    def test_open_ledger_receives_owner_trust(self):
+        ledger = self._open_ledger()
+        self.assertIs(ledger._trust, self.trust)
+
+    def test_release_unknown_scope_persists_scope_evidence(self):
+        ledger = self._open_ledger()
+        hold_scope(ledger, "scope-1", reason="operator-hold")
+        scope = self._scope_evidence(scope_id="scope-1")
+        side_effects = [self._side_effect(ARN)]
+        release_scope(
+            ledger,
+            self._scope_envelope("RELEASE", ledger=ledger, scope_id="scope-1"),
+            action="RELEASE",
+            scope=scope,
+            side_effects=side_effects,
+        )
+        authorization = self._verified_execution()
+        create_intent(ledger, authorization, scope_id="scope-1")
+
+    def test_initialize_allows_arn_that_is_only_a_substring_match(self):
+        ledger = self._open_ledger()
+        existing_arn = "arn:aws:ec2:us-east-1:123456789012:instance/i-1"
+        distinct_arn = "arn:aws:ec2:us-east-1:123456789012:instance/i-10"
+        existing_scope = self._scope_evidence(
+            scope_id="scope-1", target_arns=frozenset({existing_arn})
+        )
+        initialize_scope(
+            ledger,
+            self._scope_envelope(
+                "INITIALIZE", ledger=ledger, scope_id="scope-1", target_arns=[existing_arn]
+            ),
+            action="INITIALIZE",
+            scope=existing_scope,
+            side_effects=[self._side_effect(existing_arn)],
+        )
+        distinct_scope = self._scope_evidence(
+            scope_id="scope-2", target_arns=frozenset({distinct_arn})
+        )
+        initialize_scope(
+            ledger,
+            self._scope_envelope(
+                "INITIALIZE", ledger=ledger, scope_id="scope-2", target_arns=[distinct_arn]
+            ),
+            action="INITIALIZE",
+            scope=distinct_scope,
+            side_effects=[self._side_effect(distinct_arn)],
+        )
+
+    def test_missing_host_binding_metadata_is_rejected(self):
+        ledger = self._open_ledger()
+        with closing(sqlite3.connect(str(ledger._path))) as conn, conn:
+            conn.execute("DELETE FROM ledger_meta WHERE key = 'host_binding'")
+        with self.assertRaises(LedgerError) as ctx:
+            effective_scope_state(ledger, "scope-1")
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
     def test_initial_scope_missing_is_unknown(self):
         ledger = self._open_ledger()
         self.assertEqual(effective_scope_state(ledger, "never-seen"), "UNKNOWN")
@@ -472,7 +527,7 @@ class ScopeVerificationTests(LedgerTestBase):
         # A production open must reject any ledger containing fixture-only rows.
         ledger._lock_fd and os.close(ledger._lock_fd)
         with self.assertRaises(LedgerError) as ctx:
-            open_ledger(db, trusted_host=True)
+            open_ledger(db, trusted_host=True, trust=self.trust)
         self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
 
 # ---------------------------------------------------------------------------
@@ -531,8 +586,7 @@ trust = OwnerTrust.from_allowed_signers(
     enrolled={{"owner-1": {{fp: EnrolledOwner(fp, "scope-owner")}}}},
     expected_uid=os.getuid(),
 )
-ledger = open_ledger(db, trusted_host=True)
-object.__setattr__(ledger, "_trust", trust)
+ledger = open_ledger(db, trusted_host=True, trust=trust)
 ledger._now = lambda: NOW
 
 NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
