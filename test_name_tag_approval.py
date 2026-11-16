@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from name_tag_approval import (
     ApprovalRejected,
@@ -409,6 +410,48 @@ class ApprovalContractTests(unittest.TestCase):
                 )
         finally:
             self.allowed.chmod(0o600)
+
+    def test_signer_fingerprint_ignores_ascii_and_non_ascii_comments(self):
+        from name_tag_approval import _fingerprint_for_key_line
+
+        raw = self._envelope()
+        public_line = self.key.with_suffix(".pub").read_text().split()
+        for comment in ("owner key", "鍵のコメント"):
+            with self.subTest(comment=comment):
+                line = f"{self.owner} {public_line[0]} {public_line[1]} {comment}"
+                self.assertEqual(_fingerprint_for_key_line(line), self.fingerprint)
+
+        self.allowed.write_text(
+            f'{self.owner} namespaces="{NAMESPACES["name"]},{NAMESPACES["execution"]}" '
+            f"{public_line[0]} {public_line[1]} 鍵のコメント\n"
+        )
+        self.allowed.chmod(0o600)
+        self.trust = OwnerTrust.from_allowed_signers(
+            self.allowed,
+            pinned_sha256=hashlib.sha256(self.allowed.read_bytes()).hexdigest(),
+            enrolled={self.owner: {self.fingerprint: EnrolledOwner(self.fingerprint, self.role)}},
+            expected_uid=os.getuid(),
+        )
+        verified = verify_envelope(
+            raw,
+            kind="name",
+            trust=self.trust,
+            now_utc=datetime.now(timezone.utc),
+        )
+        self.assertEqual(verified.owner_principal_id, self.owner)
+
+    def test_tampered_trust_file_is_rejected_before_fingerprint_process(self):
+        raw = self._envelope()
+        self.allowed.write_text("owner-1 ssh-ed25519 " + "A" * 40 + "\n")
+        with patch("name_tag_approval.subprocess.run") as run:
+            with self.assertRaises(ApprovalRejected):
+                verify_envelope(
+                    raw,
+                    kind="name",
+                    trust=self.trust,
+                    now_utc=datetime.now(timezone.utc),
+                )
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

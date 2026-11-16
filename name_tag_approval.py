@@ -209,10 +209,12 @@ class OwnerTrust:
         }))
         return instance
 
-    def _check_file(self) -> None:
+    def _check_file(self) -> bytes:
         try:
-            info = self._path.stat(follow_symlinks=False)
-            data = self._path.read_bytes()
+            fd = os.open(self._path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as trust_file:
+                info = os.fstat(trust_file.fileno())
+                data = trust_file.read()
         except OSError:
             raise ApprovalRejected("BLOCKED_OWNER_AUTHN") from None
         if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
@@ -221,6 +223,7 @@ class OwnerTrust:
             raise ApprovalRejected("BLOCKED_OWNER_AUTHN")
         if hashlib.sha256(data).hexdigest() != self._data_hash:
             raise ApprovalRejected("BLOCKED_OWNER_AUTHN")
+        return data
 
 
 def _reject_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -353,13 +356,23 @@ class VerifiedEnvelope:
 
 
 def _fingerprint_for_key_line(key_line: str) -> str | None:
-    """Return SHA256 fingerprint for a single OpenSSH public key line."""
+    """Return SHA256 fingerprint for the public key in an allowed_signers line."""
     parts = key_line.split()
-    if len(parts) < 2:
+    key_index = next(
+        (idx for idx, part in enumerate(parts[1:], start=1)
+         if part.startswith(("ssh-", "ecdsa-", "sk-"))),
+        None,
+    )
+    if key_index is None or key_index + 1 >= len(parts):
+        return None
+    key_data = " ".join(parts[key_index:key_index + 2]) + "\n"
+    try:
+        key_bytes = key_data.encode("ascii")
+    except UnicodeEncodeError:
         return None
     with tempfile.TemporaryDirectory() as directory:
         key_path = Path(directory) / "key.pub"
-        key_path.write_text(" ".join(parts[-2:]) + "\n", encoding="ascii")
+        key_path.write_bytes(key_bytes)
         result = subprocess.run(
             ["ssh-keygen", "-lf", str(key_path), "-E", "sha256"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
@@ -370,12 +383,12 @@ def _fingerprint_for_key_line(key_line: str) -> str | None:
 
 
 def _select_signer_lines(
-    trust: OwnerTrust, owner_id: str, eligible_fingerprints: set[str]
+    trust_data: bytes, owner_id: str, eligible_fingerprints: set[str]
 ) -> list[str]:
     """Return allowed_signers lines matching owner and enrolled fingerprints."""
     try:
-        lines = trust._path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        lines = trust_data.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError:
         raise ApprovalRejected("BLOCKED_OWNER_AUTHN") from None
 
     selected: list[str] = []
@@ -434,11 +447,9 @@ def _verify_signature(
     message: bytes,
     owner_id: str,
     namespace: str,
-    trust: OwnerTrust,
     candidate_lines: list[str],
 ) -> str:
     """Try candidate signer lines one at a time; return the verifying fingerprint."""
-    trust._check_file()
     if not candidate_lines:
         raise ApprovalRejected("BLOCKED_OWNER_AUTHN")
 
@@ -516,9 +527,10 @@ def verify_envelope(
     if not entries:
         raise ApprovalRejected("BLOCKED_OWNER_AUTHN")
 
-    candidate_lines = _select_signer_lines(trust, owner_id, set(entries))
+    trust_data = trust._check_file()
+    candidate_lines = _select_signer_lines(trust_data, owner_id, set(entries))
     verifying_fingerprint = _verify_signature(
-        signature, canonical, owner_id, namespace, trust, candidate_lines,
+        signature, canonical, owner_id, namespace, candidate_lines,
     )
 
     entry = entries.get(verifying_fingerprint)
