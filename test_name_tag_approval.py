@@ -190,18 +190,20 @@ class ApprovalContractTests(unittest.TestCase):
             b'{"account":"123456789012","approval_namespace":"aws-cost-name-tagger-name-approval-v1",'
             b'"approved_name":"web-prod","confidence":"high","decision":"APPROVED",'
             b'"decision_nonce":"nonce-1","edit_reason":"","evidence_digest":"' + b"b" * 64 + b'",'
-            b'"issued_at_utc":"2026-11-16T00:00:00+00:00","kind":"volume","locator":"vol-123",'
-            b'"name_state_at_plan":"ABSENT","owner_decision_reference":"ref-1",'
-            b'"owner_key_fingerprint":"SHA256:' + b"c" * 43 + b'","owner_principal_id":"owner-1",'
-            b'"partition":"aws","plan_sha256":"' + b"a" * 64 + b'","region":"us-east-1",'
-            b'"resource_arn":"arn:aws:ec2:us-east-1:123456789012:volume/vol-123","schema_version":1,"suggested_name":"web-prod"}'
+            b'"expires_at_utc":"2026-11-17T00:00:00+00:00","issued_at_utc":"2026-11-16T00:00:00+00:00",'
+            b'"kind":"volume","locator":"vol-123","name_state_at_plan":"ABSENT",'
+            b'"owner_decision_reference":"ref-1","owner_key_fingerprint":"SHA256:' + b"c" * 43 + b'",'
+            b'"owner_principal_id":"owner-1","partition":"aws","plan_sha256":"' + b"a" * 64 + b'",'
+            b'"region":"us-east-1","resource_arn":"arn:aws:ec2:us-east-1:123456789012:volume/vol-123",'
+            b'"schema_version":1,"suggested_name":"web-prod"}'
         )
+        self.assertEqual(canonical, expected)
         # Reorder payload keys to test that canonicalization sorts deterministically.
         reordered = {k: payload[k] for k in reversed(list(payload.keys()))}
         self.assertEqual(canonical_payload(reordered, kind="name"), canonical)
         digest = approval_digest(canonical)
         self.assertRegex(digest, r"^[0-9a-f]{64}$")
-        self.assertEqual(digest, hashlib.sha256(canonical).hexdigest())
+        self.assertEqual(digest, hashlib.sha256(expected).hexdigest())
         for forbidden in ("approval_id", "signature_ref"):
             with self.subTest(forbidden=forbidden), self.assertRaises(ApprovalRejected):
                 canonical_payload({**payload, forbidden: "external"}, kind="name")
@@ -292,17 +294,32 @@ class ApprovalContractTests(unittest.TestCase):
             )
 
     def test_duplicate_json_keys_rejected_before_mapping(self):
-        raw = b'{"payload":{"schema_version":1},"approval_id":"x","approval_id":"x","signature_ref":"x"}'
+        # Build a valid envelope, then inject a duplicate top-level key.
+        raw = self._envelope()
+        parsed = json.loads(raw)
+        # Inject duplicate "approval_id" with the same value.
+        text = raw.decode("utf-8")
+        insert = text.find("," "signature_ref")
+        duplicate = ',"approval_id":"' + parsed["approval_id"] + '"'
+        injected = text[:insert] + duplicate + text[insert:]
+        # Without duplicate-key rejection this would still be structurally valid and
+        # the ID would match, so rejection proves the hook is active.
         with self.assertRaises(ApprovalRejected):
             verify_envelope(
-                raw, kind="name", trust=self.trust, now_utc=datetime.now(timezone.utc)
+                injected.encode(), kind="name", trust=self.trust, now_utc=datetime.now(timezone.utc)
             )
 
     def test_nested_duplicate_json_keys_rejected(self):
-        raw = b'{"payload":{"schema_version":1,"schema_version":1},"approval_id":"x","signature_ref":"x"}'
+        # Build a valid envelope with a duplicate key inside payload.
+        raw = self._envelope()
+        text = raw.decode("utf-8")
+        # Insert a duplicate "approved_name" inside payload (same value).
+        payload_start = text.find('"payload":{') + len('"payload":{')
+        duplicate = '"approved_name":"web-prod",'
+        injected = text[:payload_start] + duplicate + text[payload_start:]
         with self.assertRaises(ApprovalRejected):
             verify_envelope(
-                raw, kind="name", trust=self.trust, now_utc=datetime.now(timezone.utc)
+                injected.encode(), kind="name", trust=self.trust, now_utc=datetime.now(timezone.utc)
             )
 
     def test_verified_payload_is_immutable_snapshot(self):
