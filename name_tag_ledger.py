@@ -695,6 +695,27 @@ class IntentLedger:
         if computed_digest != decision.side_effect_evidence_digest:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
+    def _verify_scope_transition(
+        self,
+        envelope: Mapping[str, object],
+        action: ScopeAction,
+        scope: ScopeEvidence,
+        side_effects: Sequence[SideEffectEvidence],
+    ) -> tuple[VerifiedScopeDecision, datetime]:
+        if not self._trusted_host:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        trust = self._trust
+        if not isinstance(trust, OwnerTrust):
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        now = self._now()
+        decision = verify_scope_decision(
+            envelope, trust=trust, action=action, now_utc=now
+        )
+        self._assert_decision_matches_evidence(decision, scope, side_effects, now)
+        if decision.expires_at_utc <= now:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        return decision, now
+
     def _check_decision_replay(
         self, conn: sqlite3.Connection, decision: VerifiedScopeDecision
     ) -> None:
@@ -731,20 +752,9 @@ class IntentLedger:
         """
         if action != "INITIALIZE":
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-        if not self._trusted_host:
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-
-        now = self._now()
-        trust = self._trust
-        if not isinstance(trust, OwnerTrust):
-            raise LedgerError("BLOCKED_OWNER_AUTHN")
-        decision = verify_scope_decision(
-            envelope, trust=trust, action=action, now_utc=now
+        decision, now = self._verify_scope_transition(
+            envelope, action, scope, side_effects
         )
-        self._assert_decision_matches_evidence(decision, scope, side_effects, now)
-
-        if decision.expires_at_utc <= now:
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
         self._lock()
         try:
@@ -850,20 +860,9 @@ class IntentLedger:
         """
         if action != "RELEASE":
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-        if not self._trusted_host:
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-
-        now = self._now()
-        trust = self._trust
-        if not isinstance(trust, OwnerTrust):
-            raise LedgerError("BLOCKED_OWNER_AUTHN")
-        decision = verify_scope_decision(
-            envelope, trust=trust, action=action, now_utc=now
+        decision, now = self._verify_scope_transition(
+            envelope, action, scope, side_effects
         )
-        self._assert_decision_matches_evidence(decision, scope, side_effects, now)
-
-        if decision.expires_at_utc <= now:
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
         self._lock()
         try:
