@@ -7,7 +7,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import ClassVar, Final, Literal, Protocol, TypeGuard, assert_never
+from typing import ClassVar, Final, Literal, NoReturn, Protocol, TypeGuard
+
+try:
+    from typing import assert_never
+except ImportError:
+    def assert_never(arg: NoReturn, /) -> NoReturn:
+        raise AssertionError(f"Unexpected execution result code: {arg!r}")
 
 from name_tag_approval import (
     ApprovalRejected,
