@@ -442,7 +442,6 @@ def _verify_signature(
     if not candidate_lines:
         raise ApprovalRejected("BLOCKED_OWNER_AUTHN")
 
-    last_error: ApprovalRejected | None = None
     for line in candidate_lines:
         fp = _fingerprint_for_key_line(line)
         if fp is None:
