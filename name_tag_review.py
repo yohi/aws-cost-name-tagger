@@ -38,25 +38,32 @@ def _validate_resource_arn(
         "opensearch": "domain/", "log_group": "log-group:",
     }
     if kind in resource_prefixes:
-        prefix = resource_prefixes[kind]
-        if not resource.startswith(prefix) or resource.removeprefix(prefix) != locator:
-            _reject()
+        _require_prefix_locator(resource, locator, resource_prefixes[kind])
     elif kind == "rds_cluster":
         _validate_rds_cluster(resource, locator, arn, evidence)
-    elif kind == "elbv2":
-        if not resource.startswith("loadbalancer/") or arn != locator:
-            _reject()
     elif kind == "apigw_stage":
         _validate_apigw_stage(resource, locator, arn)
-    elif kind == "cloudfront":
-        if not resource.startswith("distribution/") or arn != locator:
-            _reject()
-    elif kind in {"athena_workgroup", "lambda", "wafv2"}:
-        expected_prefix = {"athena_workgroup": "workgroup/", "lambda": "function:"}.get(kind)
-        if (expected_prefix is not None and not resource.startswith(expected_prefix)) or arn != locator:
-            _reject()
-        if kind == "wafv2" and re.fullmatch(r"(?:global|regional)/webacl/[^/]+/[^/]+", resource) is None:
-            _reject()
+    else:
+        _validate_direct_arn_resource(kind, resource, arn, locator)
+
+
+def _require_prefix_locator(resource: str, locator: str, prefix: str) -> None:
+    if not resource.startswith(prefix) or resource.removeprefix(prefix) != locator:
+        _reject()
+
+
+def _validate_direct_arn_resource(kind: str, resource: str, arn: str, locator: str) -> None:
+    expected_prefixes = {
+        "elbv2": "loadbalancer/", "cloudfront": "distribution/",
+        "athena_workgroup": "workgroup/", "lambda": "function:",
+    }
+    prefix = expected_prefixes.get(kind)
+    if prefix is not None and not resource.startswith(prefix):
+        _reject()
+    if arn != locator:
+        _reject()
+    if kind == "wafv2" and re.fullmatch(r"(?:global|regional)/webacl/[^/]+/[^/]+", resource) is None:
+        _reject()
 
 
 def _validate_rds_cluster(resource: str, locator: str, arn: str, evidence: str) -> None:
@@ -125,16 +132,14 @@ def _canonical_arn(
             _reject()
         if arn_region and arn_region != region:
             _reject()
-        return partition
-
-    _validate_arn_scope(
-        kind=kind, region=region, account=account, arn_region=arn_region,
-        arn_account=arn_account, resource=resource,
-    )
-
-    _validate_resource_arn(
-        kind=kind, resource=resource, arn=arn, locator=locator, evidence=evidence,
-    )
+    else:
+        _validate_arn_scope(
+            kind=kind, region=region, account=account, arn_region=arn_region,
+            arn_account=arn_account, resource=resource,
+        )
+        _validate_resource_arn(
+            kind=kind, resource=resource, arn=arn, locator=locator, evidence=evidence,
+        )
     return partition
 
 
@@ -159,12 +164,12 @@ def _plan_record(plan_bytes: bytes, record: Mapping[str, object], plan_digest: s
                and _mapping(candidate).get("proposal_id") == proposal_id]
     if len(matches) != 1:
         _reject()
-    plan_record = matches[0]
+    selected_record = matches[0]
     for key in ("kind", "region", "locator", "resource_arn", "status", "confidence",
                 "name_state", "proposed_name", "evidence"):
-        if record.get(key) != plan_record.get(key):
+        if record.get(key) != selected_record.get(key):
             _reject()
-    return plan_record
+    return selected_record
 
 
 def _validate_review_state(record: Mapping[str, object], evidence: str) -> tuple[str, str, str]:
@@ -213,7 +218,6 @@ def prepare_name_payload(
     partition = _canonical_arn(
         arn, account=account, region=region, kind=kind, locator=locator, evidence=evidence,
     )
-    confidence = _text(record, "confidence")
     name_state, confidence, evidence_digest = _validate_review_state(record, evidence)
     suggested_name = _text(record, "proposed_name")
     if not approved_name.strip():
