@@ -11,8 +11,8 @@ from typing import NoReturn
 from name_tag_approval import ApprovalRejected, NAMESPACES, canonical_payload
 
 
-def _reject() -> NoReturn:
-    raise ApprovalRejected("BLOCKED_NAME_REVIEW")
+def _reject(code: str = "BLOCKED_NAME_REVIEW") -> NoReturn:
+    raise ApprovalRejected(code)
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -28,19 +28,78 @@ def _text(record: Mapping[str, object], key: str) -> str:
     return value
 
 
-def _canonical_arn(arn: str, *, account: str, region: str, kind: str) -> None:
+def _canonical_arn(
+    arn: str, *, account: str, region: str, kind: str, locator: str,
+) -> str:
+    services = {
+        "instance": "ec2", "volume": "ec2", "snapshot": "ec2", "eni": "ec2",
+        "eip": "ec2", "nat": "ec2", "endpoint": "ec2",
+        "rds_instance": "rds", "rds_cluster": "rds", "opensearch": "es",
+        "elbv2": "elasticloadbalancing", "apigw_stage": "apigateway",
+        "cloudfront": "cloudfront", "athena_workgroup": "athena",
+        "log_group": "logs", "lambda": "lambda", "wafv2": "wafv2",
+        "s3_bucket": "s3",
+    }
+    service = services.get(kind)
+    if service is None:
+        _reject("UNSUPPORTED_KIND_FOR_REVIEW")
     parts = arn.split(":", 5)
     if len(parts) != 6 or parts[0] != "arn" or not parts[1] or not parts[2] or not parts[5]:
         _reject()
-    _, partition, service, arn_region, arn_account, resource = parts
-    if service == "s3":
-        if kind != "s3_bucket" or arn_region or arn_account or ":" in resource or not resource:
+    _, partition, arn_service, arn_region, arn_account, resource = parts
+    if partition not in {"aws", "aws-cn", "aws-us-gov"} or arn_service != service:
+        _reject()
+
+    if kind == "s3_bucket":
+        if arn_account or "/" in resource or ":" in resource or not resource or resource != locator:
             _reject()
-        return
-    if arn_account != account or arn_region != region:
+        if arn_region and arn_region != region:
+            _reject()
+        return partition
+
+    if kind == "apigw_stage":
+        if arn_account:
+            _reject()
+    elif arn_account != account:
         _reject()
-    if partition not in {"aws", "aws-cn", "aws-us-gov"}:
+    global_region = kind == "cloudfront" or (kind == "wafv2" and resource.startswith("global/"))
+    if global_region:
+        if region != "us-east-1" or arn_region not in {"", "us-east-1"}:
+            _reject()
+    elif arn_region != region:
         _reject()
+
+    resource_ids = {
+        "instance": ("instance/",), "volume": ("volume/",),
+        "snapshot": ("snapshot/",), "eni": ("network-interface/",),
+        "eip": ("elastic-ip/",), "nat": ("natgateway/",),
+        "endpoint": ("vpc-endpoint/",),
+        "rds_instance": ("db:",), "rds_cluster": ("cluster:",),
+        "opensearch": ("domain/",), "log_group": ("log-group:",),
+    }
+    if kind in resource_ids:
+        prefix = resource_ids[kind][0]
+        if not resource.startswith(prefix) or resource[len(prefix):] != locator:
+            _reject()
+    elif kind == "elbv2":
+        if not resource.startswith("loadbalancer/") or arn != locator:
+            _reject()
+    elif kind == "apigw_stage":
+        match = re.fullmatch(r"/restapis/([^/]+)/stages/([^/]+)", resource)
+        locator_parts = locator.split("|")
+        if (match is None or len(locator_parts) != 3 or locator_parts[2] != arn
+                or locator_parts[0] != match.group(1) or locator_parts[1] != match.group(2)):
+            _reject()
+    elif kind == "cloudfront":
+        if not resource.startswith("distribution/") or arn != locator:
+            _reject()
+    elif kind in {"athena_workgroup", "lambda", "wafv2"}:
+        expected_prefix = {"athena_workgroup": "workgroup/", "lambda": "function:"}.get(kind)
+        if (expected_prefix is not None and not resource.startswith(expected_prefix)) or arn != locator:
+            _reject()
+        if kind == "wafv2" and re.fullmatch(r"(?:global|regional)/webacl/[^/]+/[^/]+", resource) is None:
+            _reject()
+    return partition
 
 
 def prepare_name_payload(
@@ -90,7 +149,7 @@ def prepare_name_payload(
     region = _text(record, "region")
     arn = _text(record, "resource_arn")
     locator = _text(record, "locator")
-    _canonical_arn(arn, account=account, region=region, kind=kind)
+    partition = _canonical_arn(arn, account=account, region=region, kind=kind, locator=locator)
     if record.get("status") != "proposed":
         _reject()
     confidence = _text(record, "confidence")
@@ -99,7 +158,9 @@ def prepare_name_payload(
     name_state = record.get("name_state")
     if name_state not in {"ABSENT", "EMPTY"}:
         _reject()
-    if name_state == "ABSENT" and record.get("name_key_present") is True:
+    if name_state == "ABSENT" and (
+        record.get("name_key_present") is not False or record.get("name_raw_value") is not None
+    ):
         _reject()
     if name_state == "EMPTY" and (record.get("name_key_present") is not True or record.get("name_raw_value") != ""):
         _reject()
@@ -108,7 +169,7 @@ def prepare_name_payload(
     if record.get("evidence_digest") != evidence_digest:
         _reject()
     suggested_name = _text(record, "proposed_name")
-    if not approved_name:
+    if not approved_name.strip():
         _reject()
     if approved_name != suggested_name and not edit_reason.strip():
         _reject()
@@ -118,7 +179,7 @@ def prepare_name_payload(
         "approval_namespace": NAMESPACES["name"],
         "plan_sha256": plan_digest,
         "account": account,
-        "partition": arn.split(":", 2)[1],
+        "partition": partition,
         "region": region,
         "kind": kind,
         "resource_arn": arn,
@@ -129,8 +190,8 @@ def prepare_name_payload(
         "suggested_name": suggested_name,
         "approved_name": approved_name,
         "edit_reason": edit_reason,
-        "decision": "approve",
-        "owner_decision_reference": proposal_id,
+        "decision": "APPROVED",
+        "owner_decision_reference": "",
         "owner_principal_id": owner_principal_id,
         "owner_key_fingerprint": owner_key_fingerprint,
         "issued_at_utc": issued_at_utc,

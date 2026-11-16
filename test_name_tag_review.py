@@ -14,21 +14,26 @@ class NameReviewTests(unittest.TestCase):
     def setUp(self):
         self.record = {
             "account": "123456789012",
-            "resource_arn": "arn:aws:ec2:us-east-1:123456789012:instance/i-0123456789abcdef0",
-            "kind": "ec2_instance",
+            "resource_arn": "arn:aws:ec2:us-east-1:123456789012:volume/vol-0123456789abcdef0",
+            "kind": "volume",
             "region": "us-east-1",
-            "locator": "i-0123456789abcdef0",
+            "locator": "vol-0123456789abcdef0",
             "status": "proposed",
             "confidence": "High",
             "name_state": "ABSENT",
+            "name_key_present": False,
+            "name_raw_value": None,
             "proposed_name": "web-prd-ec2",
-            "evidence": "DescribeInstances: instance i-0123456789abcdef0",
+            "evidence": "DescribeVolumes: volume vol-0123456789abcdef0",
             "proposal_id": "review-only-id",
         }
         self.record["evidence_digest"] = hashlib.sha256(
-            "DescribeInstances: instance i-0123456789abcdef0".encode()
+            "DescribeVolumes: volume vol-0123456789abcdef0".encode()
         ).hexdigest()
-        plan_record = {key: value for key, value in self.record.items() if key != "plan_sha256"}
+        plan_record = {
+            key: value for key, value in self.record.items()
+            if key not in {"account", "evidence_digest", "plan_sha256"}
+        }
         self.plan_bytes = json.dumps({
             "schema_version": 2,
             "account": self.record["account"],
@@ -47,9 +52,12 @@ class NameReviewTests(unittest.TestCase):
 
     def refresh_plan(self):
         self.record["evidence_digest"] = hashlib.sha256(
-            "DescribeInstances: instance i-0123456789abcdef0".encode()
+            "DescribeVolumes: volume vol-0123456789abcdef0".encode()
         ).hexdigest()
-        plan_record = {key: value for key, value in self.record.items() if key != "plan_sha256"}
+        plan_record = {
+            key: value for key, value in self.record.items()
+            if key not in {"account", "evidence_digest", "plan_sha256"}
+        }
         self.plan_bytes = json.dumps({
             "schema_version": 2,
             "account": self.record["account"],
@@ -67,6 +75,8 @@ class NameReviewTests(unittest.TestCase):
             self.payload(approved_name="changed-name")
         edited = self.payload(approved_name="changed-name", edit_reason="Owner reviewed naming correction")
         self.assertEqual(edited["approved_name"], "changed-name")
+        self.assertEqual(edited["decision"], "APPROVED")
+        self.assertEqual(edited["owner_decision_reference"], "")
         self.assertNotEqual(approval_digest(canonical_payload(previous, kind="name")),
                             approval_digest(canonical_payload(edited, kind="name")))
 
@@ -81,12 +91,45 @@ class NameReviewTests(unittest.TestCase):
                     payload = self.payload()
                     self.assertEqual(payload["name_state_at_plan"], state)
 
+    def test_absent_state_requires_explicit_missing_name(self):
+        for key_present, raw_value in ((None, None), (False, ""), (True, None)):
+            with self.subTest(key_present=key_present, raw_value=raw_value):
+                self.record["name_state"] = "ABSENT"
+                self.record["name_key_present"] = key_present
+                self.record["name_raw_value"] = raw_value
+                with self.assertRaises(ApprovalRejected):
+                    self.payload()
+
     def test_nonempty_unknown_rejected(self):
         for state in ("NONEMPTY", "UNKNOWN"):
             with self.subTest(state=state):
                 self.record["name_state"] = state
                 with self.assertRaises(ApprovalRejected):
                     self.payload()
+
+    def test_cloudfront_global_arn_uses_us_east_1_plan_region(self):
+        arn = "arn:aws:cloudfront::123456789012:distribution/EDFDVBD6EXAMPLE"
+        self.record.update(kind="cloudfront", resource_arn=arn, locator=arn, region="us-east-1")
+        payload = self.payload()
+        self.assertEqual(payload["resource_arn"], arn)
+        self.assertEqual(payload["region"], "us-east-1")
+
+    def test_api_gateway_arn_without_account_field_binds_components(self):
+        arn = "arn:aws:apigateway:us-east-1::/restapis/api123/stages/prod"
+        self.record.update(
+            kind="apigw_stage",
+            resource_arn=arn,
+            locator=f"api123|prod|{arn}",
+        )
+        self.assertEqual(self.payload()["resource_arn"], arn)
+
+    def test_non_s3_arn_kind_and_locator_must_match(self):
+        self.record["resource_arn"] = "arn:aws:ec2:us-east-1:123456789012:volume/vol-fffffffffffffffff"
+        with self.assertRaises(ApprovalRejected):
+            self.payload()
+        self.record.update(kind="rds_instance", resource_arn="arn:aws:rds:us-east-1:123456789012:db/vol-0123456789abcdef0")
+        with self.assertRaises(ApprovalRejected):
+            self.payload()
 
     def test_s3_candidate_can_be_reviewed_without_write_permission(self):
         self.record.update(
@@ -100,11 +143,51 @@ class NameReviewTests(unittest.TestCase):
         self.assertEqual(set(payload), NAME_PAYLOAD_FIELDS)
         self.assertEqual(payload["approval_namespace"], NAMESPACES["name"])
 
+    def test_s3_arn_partition_resource_and_locator_are_bound(self):
+        cases = (
+            ("arn:evil:s3:::example-bucket", "example-bucket"),
+            ("arn:aws:s3:::example-bucket/object", "example-bucket"),
+            ("arn:aws:s3:::another-bucket", "example-bucket"),
+        )
+        for arn, locator in cases:
+            with self.subTest(arn=arn):
+                self.record.update(kind="s3_bucket", resource_arn=arn, locator=locator)
+                with self.assertRaises(ApprovalRejected):
+                    self.payload()
+
+    def test_s3_region_may_be_empty_or_match_plan_region(self):
+        self.record.update(kind="s3_bucket", resource_arn="arn:aws:s3:::example-bucket", locator="example-bucket")
+        self.assertEqual(self.payload()["kind"], "s3_bucket")
+        self.record["resource_arn"] = "arn:aws:s3:us-east-1::example-bucket"
+        self.assertEqual(self.payload()["kind"], "s3_bucket")
+        self.record["resource_arn"] = "arn:aws:s3:us-west-2::example-bucket"
+        with self.assertRaises(ApprovalRejected):
+            self.payload()
+
+    def test_unknown_kind_is_rejected_explicitly(self):
+        self.record["kind"] = "unlisted_kind"
+        with self.assertRaises(ApprovalRejected) as caught:
+            self.payload()
+        self.assertEqual(caught.exception.code, "UNSUPPORTED_KIND_FOR_REVIEW")
+
     def test_edited_name_invalidates_old_signature(self):
         original = self.payload()
         edited = self.payload(approved_name="web-prd-api", edit_reason="Corrected service description")
         self.assertNotEqual(approval_digest(canonical_payload(original, kind="name")),
                             approval_digest(canonical_payload(edited, kind="name")))
+
+    def test_precomputed_plan_and_evidence_digests_are_accepted(self):
+        self.refresh_plan()
+        self.assertEqual(self.record["plan_sha256"], hashlib.sha256(self.plan_bytes).hexdigest())
+        self.assertEqual(
+            self.record["evidence_digest"],
+            hashlib.sha256(str(self.record["evidence"]).encode()).hexdigest(),
+        )
+        self.assertEqual(self.payload()["evidence_digest"], self.record["evidence_digest"])
+
+    def test_whitespace_only_approved_name_rejected(self):
+        with self.assertRaises(ApprovalRejected):
+            self.payload(approved_name="   ")
 
     def test_foreign_account_or_stale_evidence_rejected(self):
         self.record["account"] = "999999999999"
