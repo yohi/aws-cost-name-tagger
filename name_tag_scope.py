@@ -109,7 +109,7 @@ def _valid_window(start: datetime, end: datetime, now: datetime) -> bool:
         return False
 
 
-def _verified_name_approval(approval: VerifiedEnvelope) -> bool:
+def _verified_name_approval(approval: VerifiedEnvelope, now_utc: datetime) -> bool:
     """Recompute content identity and ownership from the immutable envelope."""
     if type(approval) is not VerifiedEnvelope or approval.kind != "name":
         return False
@@ -119,11 +119,24 @@ def _verified_name_approval(approval: VerifiedEnvelope) -> bool:
         canonical = canonical_payload(approval.payload, kind="name")
     except (ApprovalRejected, TypeError, ValueError):
         return False
-    return (
+    if not (
         canonical == approval.canonical_payload_bytes
         and approval_digest(canonical) == approval.content_id
         and approval.payload.get("owner_principal_id") == approval.owner_principal_id
-    )
+    ):
+        return False
+    expires_at = approval.payload.get("expires_at_utc")
+    if not isinstance(expires_at, str):
+        return False
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        return (
+            expiry.tzinfo is not None
+            and now_utc.tzinfo is not None
+            and expiry.astimezone(timezone.utc) > now_utc.astimezone(timezone.utc)
+        )
+    except (OverflowError, ValueError):
+        return False
 
 
 def check_target_safety(
@@ -137,7 +150,9 @@ def check_target_safety(
     if type(scope) is not ScopeEvidence:
         return SafetyDecision(False, "BLOCKED_WRITER_UNKNOWN", None)
     scope_id = scope.writer_control_scope_id
-    if not _verified_name_approval(approval):
+    if not _verified_name_approval(approval, now_utc):
+        return SafetyDecision(False, "BLOCKED_OWNER_AUTHN", scope_id)
+    if approval.payload.get("decision") != "APPROVED":
         return SafetyDecision(False, "BLOCKED_OWNER_AUTHN", scope_id)
     if type(side_effects) is not SideEffectEvidence:
         return SafetyDecision(False, "BLOCKED_SIDE_EFFECT_UNASSESSED", scope_id)

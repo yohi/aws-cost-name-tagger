@@ -73,11 +73,19 @@ def _validate_rds_cluster(resource: str, locator: str, arn: str, evidence: str) 
     arn_identifier = resource.removeprefix(prefix)
     if arn_identifier == locator:
         return
-    resource_id = re.search(r"DbClusterResourceId=([A-Za-z0-9-]+)", evidence)
     valid_locator = re.fullmatch(r"cluster-[a-z0-9]{14,}", locator, re.IGNORECASE)
-    if (valid_locator is None or resource_id is None
-            or resource_id.group(1).casefold() != locator.casefold()
-            or f"ARN={arn}" not in evidence):
+    resource_id = re.search(
+        r"(?<![A-Za-z0-9_])DbClusterResourceId=([A-Za-z0-9-]+)(?![A-Za-z0-9-])",
+        evidence,
+    )
+    evidence_arn = re.search(r"(?<![A-Za-z0-9_])ARN=(arn:[^\s,;]+)", evidence)
+    if (
+        valid_locator is None
+        or resource_id is None
+        or resource_id.group(1).casefold() != locator.casefold()
+        or evidence_arn is None
+        or evidence_arn.group(1) != arn
+    ):
         _reject()
 
 

@@ -32,7 +32,7 @@ def make_approval(*, kind: Kind = "name", account: str = "123456789012", resourc
         "suggested_name": "example",
         "approved_name": "example",
         "edit_reason": "",
-        "decision": "approve",
+        "decision": "APPROVED",
         "owner_decision_reference": "owner-ref",
         "owner_principal_id": "owner@example",
         "owner_key_fingerprint": "SHA256:test",
@@ -79,6 +79,49 @@ def make_side_effects(*, iam: str = "PASS", iac: str = "PASS", event: str = "PAS
 
 
 class ScopeGuardTests(unittest.TestCase):
+    def test_expired_name_approval_blocks(self) -> None:
+        approval = make_approval()
+        expired_payload = MappingProxyType({
+            **approval.payload,
+            "expires_at_utc": (NOW - timedelta(seconds=1)).isoformat(),
+        })
+        canonical = canonical_payload(expired_payload, kind="name")
+        expired_approval = replace(
+            approval,
+            canonical_payload_bytes=canonical,
+            content_id=approval_digest(canonical),
+            payload=expired_payload,
+        )
+
+        result = check_target_safety(
+            approval=expired_approval,
+            scope=make_scope(),
+            side_effects=make_side_effects(),
+            now_utc=NOW,
+        )
+
+        self.assertEqual((result.allowed, result.code), (False, "BLOCKED_OWNER_AUTHN"))
+
+    def test_non_approved_name_decision_blocks(self) -> None:
+        approval = make_approval()
+        rejected_payload = MappingProxyType({**approval.payload, "decision": "REJECTED"})
+        canonical = canonical_payload(rejected_payload, kind="name")
+        rejected_approval = replace(
+            approval,
+            canonical_payload_bytes=canonical,
+            content_id=approval_digest(canonical),
+            payload=rejected_payload,
+        )
+
+        result = check_target_safety(
+            approval=rejected_approval,
+            scope=make_scope(),
+            side_effects=make_side_effects(),
+            now_utc=NOW,
+        )
+
+        self.assertEqual((result.allowed, result.code), (False, "BLOCKED_OWNER_AUTHN"))
+
     def test_tampered_envelope_blocks_without_leaking_exception(self) -> None:
         approval = make_approval()
         tampered = replace(

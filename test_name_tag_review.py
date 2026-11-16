@@ -132,6 +132,21 @@ class NameReviewTests(unittest.TestCase):
         with self.assertRaises(ApprovalRejected):
             self.payload()
 
+    def test_rds_cluster_evidence_requires_exact_arn_value(self):
+        resource_id = "cluster-cqhvo5ft5f3wzyaymbnmh4lnu"
+        arn = "arn:aws:rds:us-east-1:123456789012:cluster:scs2-prd-db-cluster"
+        self.record.update(
+            kind="rds_cluster",
+            resource_arn=arn,
+            locator=resource_id,
+            evidence=(
+                f"DbClusterResourceId={resource_id} "
+                f"ARN={arn}extra"
+            ),
+        )
+        with self.assertRaises(ApprovalRejected):
+            self.payload()
+
     def test_non_s3_arn_kind_and_locator_must_match(self):
         self.record["resource_arn"] = "arn:aws:ec2:us-east-1:123456789012:volume/vol-fffffffffffffffff"
         with self.assertRaises(ApprovalRejected):
