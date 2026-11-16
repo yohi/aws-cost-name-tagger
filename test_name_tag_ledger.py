@@ -463,6 +463,59 @@ class ScopeVerificationTests(LedgerTestBase):
         authorization = self._verified_execution()
         create_intent(ledger, authorization, scope_id="scope-1")
 
+    def test_release_unknown_hold_rejects_arn_owned_by_another_scope(self):
+        ledger = self._open_ledger()
+        self._initialize_scope(ledger, scope_id="scope-1")
+        hold_scope(ledger, "scope-2", reason="operator-hold")
+        scope = self._scope_evidence(scope_id="scope-2")
+        envelope = self._scope_envelope(
+            "RELEASE", ledger=ledger, scope_id="scope-2", target_arns=[ARN]
+        )
+
+        with self.assertRaises(LedgerError) as ctx:
+            release_scope(
+                ledger,
+                envelope,
+                action="RELEASE",
+                scope=scope,
+                side_effects=[self._side_effect(ARN)],
+            )
+
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_release_expanding_hold_rejects_arn_owned_by_another_scope(self):
+        ledger = self._open_ledger()
+        self._initialize_scope(ledger, scope_id="scope-1")
+        scope_2 = self._scope_evidence(
+            scope_id="scope-2", target_arns=frozenset({OTHER_ARN})
+        )
+        initialize_scope(
+            ledger,
+            self._scope_envelope(
+                "INITIALIZE", ledger=ledger, scope_id="scope-2", target_arns=[OTHER_ARN]
+            ),
+            action="INITIALIZE",
+            scope=scope_2,
+            side_effects=[self._side_effect(OTHER_ARN)],
+        )
+        hold_scope(ledger, "scope-1", reason="operator-hold")
+        expanded_arns = frozenset({ARN, OTHER_ARN})
+        scope_1 = self._scope_evidence(scope_id="scope-1", target_arns=expanded_arns)
+        envelope = self._scope_envelope(
+            "RELEASE", ledger=ledger, scope_id="scope-1", target_arns=sorted(expanded_arns)
+        )
+
+        with self.assertRaises(LedgerError) as ctx:
+            release_scope(
+                ledger,
+                envelope,
+                action="RELEASE",
+                scope=scope_1,
+                side_effects=[self._side_effect(arn) for arn in expanded_arns],
+            )
+
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
     def test_initialize_allows_arn_that_is_only_a_substring_match(self):
         ledger = self._open_ledger()
         existing_arn = "arn:aws:ec2:us-east-1:123456789012:instance/i-1"

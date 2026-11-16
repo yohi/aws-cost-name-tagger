@@ -900,6 +900,27 @@ class IntentLedger:
                 if incomplete is not None:
                     raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
+                # A released scope must not alias another scope's target ARNs.
+                existing_target_sets = conn.execute(
+                    """
+                    SELECT target_arns FROM scopes
+                    WHERE target_arns IS NOT NULL AND scope_id != ?
+                    """,
+                    (decision.scope_id,),
+                ).fetchall()
+                for (stored_arns,) in existing_target_sets:
+                    try:
+                        decoded_arns = json.loads(stored_arns)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+                    if (
+                        not isinstance(decoded_arns, list)
+                        or any(not isinstance(arn, str) for arn in decoded_arns)
+                    ):
+                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                    if set(decoded_arns).intersection(decision.target_arns):
+                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+
                 timestamp = self._iso(now)
                 conn.execute(
                     """
