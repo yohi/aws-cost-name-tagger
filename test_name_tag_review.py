@@ -27,19 +27,6 @@ class NameReviewTests(unittest.TestCase):
             "evidence": "DescribeVolumes: volume vol-0123456789abcdef0",
             "proposal_id": "review-only-id",
         }
-        self.record["evidence_digest"] = hashlib.sha256(
-            str(self.record["evidence"]).encode()
-        ).hexdigest()
-        plan_record = {
-            key: value for key, value in self.record.items()
-            if key not in {"account", "evidence_digest", "plan_sha256"}
-        }
-        self.plan_bytes = json.dumps({
-            "schema_version": 2,
-            "account": self.record["account"],
-            "records": [plan_record],
-        }, separators=(",", ":")).encode()
-        self.record["plan_sha256"] = hashlib.sha256(self.plan_bytes).hexdigest()
         self.kwargs = {
             "approved_name": "web-prd-ec2",
             "edit_reason": "",
@@ -49,6 +36,7 @@ class NameReviewTests(unittest.TestCase):
             "expires_at_utc": "2026-11-17T00:00:00Z",
             "decision_nonce": "nonce-1",
         }
+        self.refresh_plan()
 
     def refresh_plan(self):
         self.record["evidence_digest"] = hashlib.sha256(

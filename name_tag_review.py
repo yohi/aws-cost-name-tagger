@@ -143,7 +143,7 @@ def _canonical_arn(
     return partition
 
 
-def _plan_record(plan_bytes: bytes, record: Mapping[str, object], plan_digest: str) -> dict[str, object]:
+def _validate_plan_record(plan_bytes: bytes, record: Mapping[str, object], plan_digest: str) -> None:
     if record.get("plan_sha256") != plan_digest:
         _reject()
     try:
@@ -169,7 +169,6 @@ def _plan_record(plan_bytes: bytes, record: Mapping[str, object], plan_digest: s
                 "name_state", "proposed_name", "evidence"):
         if record.get(key) != selected_record.get(key):
             _reject()
-    return selected_record
 
 
 def _validate_review_state(record: Mapping[str, object], evidence: str) -> tuple[str, str, str]:
@@ -208,7 +207,7 @@ def prepare_name_payload(
     """Build the unsigned Name payload for an Owner to sign out of band."""
     plan_digest = hashlib.sha256(plan_bytes).hexdigest()
     account = _text(record, "account")
-    plan_record = _plan_record(plan_bytes, record, plan_digest)
+    _validate_plan_record(plan_bytes, record, plan_digest)
 
     kind = _text(record, "kind")
     region = _text(record, "region")
