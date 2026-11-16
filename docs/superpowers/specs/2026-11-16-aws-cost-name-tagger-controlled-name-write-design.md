@@ -264,6 +264,8 @@ PROPOSED -> NAME_APPROVED -> EXEC_AUTHORIZED
 | `HOLD` | Readback不一致・想定外のName変化または統制喪失が検出され、影響対象群への送信を禁止する状態。実行をまたいで保持 |
 | `UNKNOWN` | 未登録・台帳欠落・破損・不整合・読取不能・排他失敗・永続化不能等。**Fail-Closed**であり、黙って`CLEARED`を生成しない |
 
+**Scope初期登録とHOLD解除の状態遷移（ACT-RG-F004限定明確化）:** `INITIALIZE → CLEARED`は、権威ある単一ホスト台帳・Intent履歴・scope対応が完全かつ健全で、対象`writer_control_scope_id`が**一度も登録されていないことを検証可能**であり、そのscopeに過去の未完了IntentもHOLD履歴もない場合にのみ、独立したOwnerの有効な`INITIALIZE`判断と必要証拠の照合・耐久記録を条件として許可する。`UNKNOWN`は初期化許可を意味せず、台帳欠落・破損・読取不能、履歴/対応の不整合、過去のscope登録・Intent・HOLDが否定できない場合は初期化を拒否してFail-Closedとする。既存の`HOLD`、未完了Intentのあるscope、既登録scopeの再初期化は、別のscope_idを使った付替えを含め`INITIALIZE`で解除できない。`HOLD → CLEARED`および未完了Intentの影響解消は、既定の独立したOwner判断・統制証拠・対象範囲照合・耐久監査を伴う`RELEASE`経路に限り、旧Intent・nonce・`authorization_id`を復活させない。拒否時はscope状態・Intent履歴・送信権を変更せず、AWS変更API呼出0件とする。
+
 **送信前チェックと解除手順:** 各実行は署名済み`writer_control_scope_id`と台帳上の固定対象対応を一致確認する。初回の実行開始時および各AWS変更API送信の直前に、単一writerの排他境界内で**最新の耐久状態**を読み、`CLEARED`以外なら送信ゼロとする。異常観測後は`HOLD`の永続化を完了してから当該実行を終了する。異常時に`HOLD`を記録できなければホストの台帳自体を`UNKNOWN`として全送信禁止にする。`HOLD → CLEARED`は、原因とwriter統制健全性の再確認を示す証拠とHuman Ownerの**独立した明示判断**を揃え、台帳に解除根拠・承認者・時刻を耐久記録した場合だけ許可する。解除は旧Name承認・実行承認・nonceの再利用を意味しない。無関係スコープの別実行でも同じ権威台帳を照合し、範囲の独立性を立証できない場合は送信しない。
 
 **未完了Intentを含む実効scope状態の判定（ACT-RG-F004限定訂正）:** 権威ある台帳は、scope状態だけでなく、同一ホストで実行をまたいで保持されるIntentの存在・対応scope・未完了/終端状態も管理する。スコープ状態とIntent履歴が**両方とも完全に検証可能**であることを送信許可の前提とし、Intent履歴の欠落・破損・読取不能を「未完了Intentなし」と推定しない。初回起動・再起動・新たな実行開始時と**各AWS変更API送信直前**に、単一writer排他下で最新の永続状態を検証する。 **新規Intentの登録前は未完了0件を要求し、登録後の初回送信判定では§7.4で定義した`CURRENT_EXECUTION_INTENT`1件のみを例外として扱う。** `ALLOW_FIRST_SEND`は永続scope状態ではなく、同一排他実行内だけの一時的判定である。`SEND_ATTEMPT_CONSUMED`は永続的な送信権消費を表し、初回呼出し済みの一時的所有コンテキストは再使用不可。起動・再起動後には永続ID等からCURRENTを復元せず、未完了IntentはすべてPRIORとして扱う。
