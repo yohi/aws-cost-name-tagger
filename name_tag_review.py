@@ -29,7 +29,7 @@ def _text(record: Mapping[str, object], key: str) -> str:
 
 
 def _canonical_arn(
-    arn: str, *, account: str, region: str, kind: str, locator: str,
+    arn: str, *, account: str, region: str, kind: str, locator: str, evidence: str,
 ) -> str:
     services = {
         "instance": "ec2", "volume": "ec2", "snapshot": "ec2", "eni": "ec2",
@@ -74,13 +74,25 @@ def _canonical_arn(
         "snapshot": ("snapshot/",), "eni": ("network-interface/",),
         "eip": ("elastic-ip/",), "nat": ("natgateway/",),
         "endpoint": ("vpc-endpoint/",),
-        "rds_instance": ("db:",), "rds_cluster": ("cluster:",),
+        "rds_instance": ("db:",),
         "opensearch": ("domain/",), "log_group": ("log-group:",),
     }
     if kind in resource_ids:
         prefix = resource_ids[kind][0]
         if not resource.startswith(prefix) or resource[len(prefix):] != locator:
             _reject()
+    elif kind == "rds_cluster":
+        prefix = "cluster:"
+        if not resource.startswith(prefix):
+            _reject()
+        arn_identifier = resource[len(prefix):]
+        if arn_identifier != locator:
+            if re.fullmatch(r"cluster-[a-z0-9]{14,}", locator, re.IGNORECASE) is None:
+                _reject()
+            resource_id = re.search(r"DbClusterResourceId=([A-Za-z0-9-]+)", evidence)
+            if (resource_id is None or resource_id.group(1).casefold() != locator.casefold()
+                    or f"ARN={arn}" not in evidence):
+                _reject()
     elif kind == "elbv2":
         if not resource.startswith("loadbalancer/") or arn != locator:
             _reject()
@@ -149,7 +161,10 @@ def prepare_name_payload(
     region = _text(record, "region")
     arn = _text(record, "resource_arn")
     locator = _text(record, "locator")
-    partition = _canonical_arn(arn, account=account, region=region, kind=kind, locator=locator)
+    evidence = _text(record, "evidence")
+    partition = _canonical_arn(
+        arn, account=account, region=region, kind=kind, locator=locator, evidence=evidence,
+    )
     if record.get("status") != "proposed":
         _reject()
     confidence = _text(record, "confidence")
@@ -164,7 +179,6 @@ def prepare_name_payload(
         _reject()
     if name_state == "EMPTY" and (record.get("name_key_present") is not True or record.get("name_raw_value") != ""):
         _reject()
-    evidence = _text(record, "evidence")
     evidence_digest = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
     if record.get("evidence_digest") != evidence_digest:
         _reject()

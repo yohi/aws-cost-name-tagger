@@ -28,7 +28,7 @@ class NameReviewTests(unittest.TestCase):
             "proposal_id": "review-only-id",
         }
         self.record["evidence_digest"] = hashlib.sha256(
-            "DescribeVolumes: volume vol-0123456789abcdef0".encode()
+            str(self.record["evidence"]).encode()
         ).hexdigest()
         plan_record = {
             key: value for key, value in self.record.items()
@@ -52,7 +52,7 @@ class NameReviewTests(unittest.TestCase):
 
     def refresh_plan(self):
         self.record["evidence_digest"] = hashlib.sha256(
-            "DescribeVolumes: volume vol-0123456789abcdef0".encode()
+            str(self.record["evidence"]).encode()
         ).hexdigest()
         plan_record = {
             key: value for key, value in self.record.items()
@@ -123,11 +123,39 @@ class NameReviewTests(unittest.TestCase):
         )
         self.assertEqual(self.payload()["resource_arn"], arn)
 
+    def test_rds_cluster_resource_id_locator_matches_cluster_arn_via_evidence(self):
+        resource_id = "cluster-cqhvo5ft5f3wzyaymbnmh4lnu"
+        cluster_identifier = "scs2-prd-db-cluster"
+        arn = f"arn:aws:rds:us-east-1:123456789012:cluster:{cluster_identifier}"
+        self.record.update(
+            kind="rds_cluster",
+            resource_arn=arn,
+            locator=resource_id,
+            evidence=(
+                f"CUR cluster {resource_id} -> DescribeDBClusters {cluster_identifier} "
+                f"/ DbClusterResourceId=CLUSTER-CQHVO5FT5F3WZYAYMBNMH4LNU / ARN={arn}"
+            ),
+        )
+        payload = self.payload()
+        self.assertEqual(payload["kind"], "rds_cluster")
+        self.assertEqual(payload["locator"], resource_id)
+        self.assertEqual(payload["resource_arn"], arn)
+        self.record["locator"] = "cluster-aaaaaaaaaaaaaaaaaaaaaaaaaa"
+        with self.assertRaises(ApprovalRejected):
+            self.payload()
+
     def test_non_s3_arn_kind_and_locator_must_match(self):
         self.record["resource_arn"] = "arn:aws:ec2:us-east-1:123456789012:volume/vol-fffffffffffffffff"
         with self.assertRaises(ApprovalRejected):
             self.payload()
-        self.record.update(kind="rds_instance", resource_arn="arn:aws:rds:us-east-1:123456789012:db/vol-0123456789abcdef0")
+        self.record.update(kind="rds_instance", resource_arn="arn:aws:rds:us-east-1:123456789012:db:db-0123456789")
+        with self.assertRaises(ApprovalRejected):
+            self.payload()
+        self.record.update(
+            kind="volume",
+            resource_arn="arn:aws:ec2:us-east-1:123456789012:snapshot/snap-0123456789abcdef0",
+            locator="snap-0123456789abcdef0",
+        )
         with self.assertRaises(ApprovalRejected):
             self.payload()
 
