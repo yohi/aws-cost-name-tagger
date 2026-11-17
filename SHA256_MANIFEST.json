@@ -5,8 +5,8 @@
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "1b5861f1062a73e6f34e81b490680984082e2ed2cabcf73c821ec68c53bf2523",
-      "bytes": 6989
+      "sha256": "78bc262bdb5b92cdb78e580502741353a3800a6485c1a8f6205bfa583cae326a",
+      "bytes": 7388
     },
     {
       "path": ".gitignore",
@@ -30,8 +30,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "d80b3aa4ab094486d5bcc5f8f0b80b1ccf313d655c28f8da5823f660155e8044",
-      "bytes": 25420
+      "sha256": "4cf48ecf7580409000d4a136917250e39186e01b7e3b038be6af2cb9e02636bb",
+      "bytes": 4142
     },
     {
       "path": "SAFETY_REVIEW_RESULT.md",
@@ -82,6 +82,81 @@
       "path": "test_g2_collector_contract.py",
       "sha256": "64e4022b5ab536b3f8952f1ce11ac58e4dc681e8d57f5ae52200840d9a4cd15a",
       "bytes": 17490
+    },
+    {
+      "path": "README.ja.md",
+      "sha256": "25bfcd73d689e206ff0b32339730dc81a4e2688370c126426f0a546cc4b5c043",
+      "bytes": 28170
+    },
+    {
+      "path": "name_tag_approval.py",
+      "sha256": "674751f3b9c909073c1b7ca506e7aa34a499e54a9889bf42b13ddbf284d82d3a",
+      "bytes": 19522
+    },
+    {
+      "path": "test_name_tag_approval.py",
+      "sha256": "6800cd95f6acba1039750fd8c9383cc207d33b6f0aa146a13ff8f5a6c9690774",
+      "bytes": 19264
+    },
+    {
+      "path": "name_tag_review.py",
+      "sha256": "7066281ba91bba13f7e5d60c5ac44ec668adfb6c283c99c34fcac362ee4fadb5",
+      "bytes": 9521
+    },
+    {
+      "path": "test_name_tag_review.py",
+      "sha256": "f9a0d1453b159f015d8dc2c674d65feefc628fef9df4c528d621ae8f22a33800",
+      "bytes": 10505
+    },
+    {
+      "path": "name_tag_scope.py",
+      "sha256": "48f305e02d8af85c0eabf159b5ac177ba1607c797bed6dff82e80a915445c725",
+      "bytes": 7763
+    },
+    {
+      "path": "test_name_tag_scope.py",
+      "sha256": "6bc31ad23593ed043dc4e20e1ae294d5eb4b9a690a1739af9d0eb5f5978b425c",
+      "bytes": 9026
+    },
+    {
+      "path": "name_tag_ledger.py",
+      "sha256": "f7eb971471f89335b2b3cadc0d59d8ea97534cf528510cd540707aac89927fcf",
+      "bytes": 58412
+    },
+    {
+      "path": "test_name_tag_ledger.py",
+      "sha256": "c2328149078ddbcef78c79dc7f7352119f074f910b88d89b1bec1cb15974a9c9",
+      "bytes": 56087
+    },
+    {
+      "path": "name_tag_execution.py",
+      "sha256": "c4267ce69eeaa9dfbbaa2d1a2ca94ba8ca87b9d1ae3bdd84763baa7fba111db5",
+      "bytes": 15845
+    },
+    {
+      "path": "test_name_tag_execution.py",
+      "sha256": "3a2b44b27750a25851bf6559de44f9ee534bf89ab9ae7f09582684ef01fca7a6",
+      "bytes": 23186
+    },
+    {
+      "path": "name_tag_adapters.py",
+      "sha256": "b24eea519fb5634d47769445f392b4bde0cff4a4b15c5fdbc96703cfd54b9b38",
+      "bytes": 5270
+    },
+    {
+      "path": "test_name_tag_adapters.py",
+      "sha256": "4677507ada899db721c4773b1fc61478a25d8218f7ad9dc5ff3838baad2164fa",
+      "bytes": 6989
+    },
+    {
+      "path": "name_tag_controlled.py",
+      "sha256": "4b4bc35ad6a504722a5d7ce6c440ec9b3623181d626fc55309aa0569dd8b5b13",
+      "bytes": 19266
+    },
+    {
+      "path": "test_name_tag_controlled.py",
+      "sha256": "ad20098228ac64ee3090df717bbf51992435811bdc8be7a3bf97df6feec6df64",
+      "bytes": 11738
     }
   ],
   "repository_note": "GitHub feature branch: includes committed uv.lock and Safety Hold CI; test_results.txt and uv_lock_attempt.txt retain historical ZIP-era results."
