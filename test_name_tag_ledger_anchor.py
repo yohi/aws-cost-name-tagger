@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import importlib
 import importlib.util
 import json
@@ -155,6 +157,47 @@ class LedgerAnchorTests(unittest.TestCase):
             with self.assertRaises(LedgerError) as context:
                 module.validate_anchor_directory()
         self.assertEqual(context.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_anchor_file_descriptor_is_closed_when_fchown_fails(self) -> None:
+        module = self._anchor_module()
+        ledger = self.root / "ledger.db"
+        ledger.write_bytes(b"ledger")
+        ledger.chmod(0o600)
+        opened_anchor_fds: list[int] = []
+        real_open = os.open
+
+        def track_open(
+            path: str | os.PathLike[str],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            if dir_fd is not None:
+                opened_anchor_fds.append(fd)
+            return fd
+
+        with (
+            patch.object(module, "LEDGER_ANCHOR_DIRECTORY", self.anchor_directory),
+            patch.object(module, "_ANCHOR_OWNER_UID", os.geteuid()),
+            patch.object(module, "require_root"),
+            patch.object(module, "validate_anchor_directory"),
+            patch.object(module.os, "open", side_effect=track_open),
+            patch.object(module.os, "fchown", side_effect=PermissionError),
+            self.assertRaises(LedgerError),
+        ):
+            module.write_ledger_anchor(
+                ledger,
+                f"host-a:{ledger.resolve()}",
+                self.instance_id,
+                os.getegid(),
+            )
+
+        self.assertEqual(len(opened_anchor_fds), 1)
+        with self.assertRaises(OSError) as context:
+            fcntl.fcntl(opened_anchor_fds[0], fcntl.F_GETFD)
+        self.assertEqual(context.exception.errno, errno.EBADF)
 
 
 if __name__ == "__main__":

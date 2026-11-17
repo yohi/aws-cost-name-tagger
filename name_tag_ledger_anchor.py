@@ -199,6 +199,7 @@ def write_ledger_anchor(
         str(LEDGER_ANCHOR_DIRECTORY),
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
+    fd: int | None = None
     try:
         fd = os.open(
             anchor_path.name,
@@ -208,7 +209,9 @@ def write_ledger_anchor(
         )
         os.fchown(fd, _ANCHOR_OWNER_UID, runtime_gid)
         os.fchmod(fd, 0o640)
-        with os.fdopen(fd, "wb") as stream:
+        stream = os.fdopen(fd, "wb")
+        fd = None
+        with stream:
             _ = stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -216,5 +219,7 @@ def write_ledger_anchor(
     except OSError as exc:
         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
     finally:
+        if fd is not None:
+            os.close(fd)
         os.close(directory_fd)
     return anchor_path
