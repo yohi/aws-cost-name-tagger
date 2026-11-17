@@ -120,7 +120,9 @@ class NameTagExecutionTests(unittest.TestCase):
             pinned_sha256=hashlib.sha256(self.allowed_signers.read_bytes()).hexdigest(),
             enrolled={OWNER: {self.fingerprint: EnrolledOwner(self.fingerprint, ROLE)}},
         )
-        self.ledger = open_ledger(self.root / "ledger.db", trusted_host=True)
+        self.ledger = open_ledger(
+            self.root / "ledger.db", trusted_host=True, trust=self.trust
+        )
         self.addCleanup(self.ledger.close)
         object.__setattr__(self.ledger, "_trust", self.trust)
         self.side_effect = self._side_effect()

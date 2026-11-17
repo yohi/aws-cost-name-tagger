@@ -90,43 +90,43 @@
     },
     {
       "path": "name_tag_approval.py",
-      "sha256": "7427fa270334015af3c008965efe0609364e26ffb4d166fdaf8bbb3c25ff5329",
-      "bytes": 19081
+      "sha256": "674751f3b9c909073c1b7ca506e7aa34a499e54a9889bf42b13ddbf284d82d3a",
+      "bytes": 19522
     },
     {
       "path": "test_name_tag_approval.py",
-      "sha256": "d2d1806c3c2938d34306f0272447e2e98e2a5b90f951f0b1db396f6e40434058",
-      "bytes": 17399
+      "sha256": "6800cd95f6acba1039750fd8c9383cc207d33b6f0aa146a13ff8f5a6c9690774",
+      "bytes": 19264
     },
     {
       "path": "name_tag_review.py",
-      "sha256": "976bc3c1d257acf1cf5d6da7723bf04eede0981511ba5cd1797d5844b298f48c",
-      "bytes": 8202
+      "sha256": "7066281ba91bba13f7e5d60c5ac44ec668adfb6c283c99c34fcac362ee4fadb5",
+      "bytes": 9521
     },
     {
       "path": "test_name_tag_review.py",
-      "sha256": "a2c46a17f39c53d50bc8b349e3fcfd90328aaf2990809e5ca847b7f14bf289f4",
-      "bytes": 10514
+      "sha256": "f9a0d1453b159f015d8dc2c674d65feefc628fef9df4c528d621ae8f22a33800",
+      "bytes": 10505
     },
     {
       "path": "name_tag_scope.py",
-      "sha256": "eff5cf3d82fa1bd05c4aac3e9b235123bcf59dba08a79437724f9111c5b38546",
-      "bytes": 7135
+      "sha256": "48f305e02d8af85c0eabf159b5ac177ba1607c797bed6dff82e80a915445c725",
+      "bytes": 7763
     },
     {
       "path": "test_name_tag_scope.py",
-      "sha256": "6882cbe3b9290c472b78cc0d6115e54c6079f627495926595a71152e6d1978cf",
-      "bytes": 7478
+      "sha256": "6bc31ad23593ed043dc4e20e1ae294d5eb4b9a690a1739af9d0eb5f5978b425c",
+      "bytes": 9026
     },
     {
       "path": "name_tag_ledger.py",
-      "sha256": "6a635ac20b363f33279bd1488163d0a563b614e220405a49d0bafd188b79d8e2",
-      "bytes": 59096
+      "sha256": "f7eb971471f89335b2b3cadc0d59d8ea97534cf528510cd540707aac89927fcf",
+      "bytes": 58412
     },
     {
       "path": "test_name_tag_ledger.py",
-      "sha256": "de976434a53f99b1858b21fa84f9e1e04291052fe6a0ed7c5a53b451ca1e0d59",
-      "bytes": 48548
+      "sha256": "c2328149078ddbcef78c79dc7f7352119f074f910b88d89b1bec1cb15974a9c9",
+      "bytes": 56087
     },
     {
       "path": "name_tag_execution.py",
@@ -135,8 +135,8 @@
     },
     {
       "path": "test_name_tag_execution.py",
-      "sha256": "04482f4ac7b9626bb0a9fc9202f7ad0548b8b710ff3449bc8b566b7244bb6ea6",
-      "bytes": 23146
+      "sha256": "3a2b44b27750a25851bf6559de44f9ee534bf89ab9ae7f09582684ef01fca7a6",
+      "bytes": 23186
     },
     {
       "path": "name_tag_adapters.py",
