@@ -33,6 +33,8 @@ from name_tag_approval import (
     NAMESPACES,
 )
 from name_tag_scope import ScopeEvidence, SideEffectEvidence
+import name_tag_ledger_anchor as ledger_anchor
+import name_tag_ledger_provision as ledger_provision
 from name_tag_ledger import (
     LedgerError,
     _side_effect_digest,
@@ -60,6 +62,17 @@ class LedgerTestBase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.anchor_directory = self.root / "anchors"
+        self.anchor_directory.mkdir(mode=0o700)
+        for target, name, value in (
+            (ledger_anchor, "LEDGER_ANCHOR_DIRECTORY", self.anchor_directory),
+            (ledger_anchor, "_ANCHOR_OWNER_UID", os.geteuid()),
+            (ledger_anchor, "require_root", lambda: None),
+            (ledger_provision, "_require_root", lambda: None),
+        ):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.key = self.root / "owner"
         subprocess.run(
             ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.key)],
@@ -307,6 +320,8 @@ class LedgerTestBase(unittest.TestCase):
     def _open_ledger(self, path: Path | None = None) -> Any:
         if path is None:
             path = self.root / "ledger.db"
+        if not path.exists():
+            ledger_provision.initialize_ledger(path, runtime_uid=os.geteuid())
         ledger = open_ledger(path, trusted_host=True, trust=self.trust)
         self.addCleanup(ledger.close)
         ledger._now = lambda: NOW
@@ -436,6 +451,7 @@ class ScopeVerificationTests(LedgerTestBase):
 
     def test_open_ledger_acquires_process_lock_before_sqlite_connection(self):
         db = self.root / "lock-order.db"
+        ledger_provision.initialize_ledger(db, runtime_uid=os.geteuid())
         lock_acquired = False
         real_flock = fcntl.flock
         real_connect = sqlite3.connect
@@ -744,6 +760,10 @@ from name_tag_ledger import (
     consume_first_send, create_intent, hold_scope,
     open_ledger, record_readback,
 )
+import name_tag_ledger_anchor as ledger_anchor
+
+ledger_anchor.LEDGER_ANCHOR_DIRECTORY = Path({json.dumps(str(self.anchor_directory))})
+ledger_anchor._ANCHOR_OWNER_UID = os.getuid()
 
 db = Path({json.dumps(str(db))})
 ready = Path({json.dumps(str(ready))})

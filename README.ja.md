@@ -12,6 +12,9 @@
 
 `name_tag_controlled.py` は、既存planに根拠を結び付けた未署名Name payloadの作成と、別個のName承認・実行認可envelopeの検証に対応します。Owner署名はツール外で行い、Owner秘密鍵は保存しません。
 
+`initialize-ledger` は、管理者が新規の永続台帳をローカルで初期化する
+コマンドです。AWSには接続しません。
+
 ```bash
 uv run --locked python name_tag_controlled.py prepare-name \
   --plan ./private-reports/plan.json --proposal-id proposal-1 \
@@ -20,6 +23,31 @@ uv run --locked python name_tag_controlled.py prepare-name \
   --issued-at-utc 2026-11-16T12:00:00Z --expires-at-utc 2026-11-17T12:00:00Z \
   --decision-nonce nonce-1 --output ./private-reports/name-payload.json
 ```
+
+### 永続台帳の初期化
+
+初回利用前に、管理者がroot所有のアンカーディレクトリと、実行UID所有の
+非公開な台帳用ディレクトリを用意します。`1001` と台帳のpathは、サービス
+で使うUIDと保存先に置き換えてください。
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/aws-cost-name-tagger/ledger-anchors
+sudo install -d -o 1001 -g 1001 -m 0700 /var/lib/aws-cost-name-tagger
+sudo uv run --locked --no-build --no-sync python \
+  name_tag_controlled.py initialize-ledger \
+  --path /var/lib/aws-cost-name-tagger/ledger.db --runtime-uid 1001
+```
+
+このコマンドはroot権限を必要とし、指定UID用のDBと別個のroot所有アンカーを
+作成します。AWS APIやAWS認証情報は使わず、Safety Holdも変更しません。
+`open_ledger` はDB欠落、既存の空DB・アンカー未登録DB、またはDBとアンカーの
+不一致を `BLOCKED_SCOPE_STATE_UNKNOWN` で拒否します。
+
+既存のDBやアンカーは採用・上書きしません。このアンカー要件より前に作成
+された台帳はfail-closedで拒否されるため、自動修復として削除・再初期化
+しないでください。初期化の途中でDBまたはアンカーの片方だけが残った場合、
+コマンドは自動復旧しません。状態を確認し、部分作成を個別に解決してから
+再実行してください。
 
 未署名payloadファイルは末尾改行を含まない正規UTF-8 bytesです。OwnerはName namespaceでこのbytesを署名し、そのSHA-256を`approval_id`として、分離署名をenvelopeに格納します。署名・envelope作成はCLI外で行い、秘密鍵を保存しません。`verify-name` と `verify-execution` は、envelope内の署名を検証します。検証には `/etc/aws-cost-name-tagger/owner-trust.json` と `/etc/aws-cost-name-tagger/allowed_signers` の事前登録済みroot管理Trust Anchorが必要です。前者は後者のSHA-256とOwner ID・fingerprint・role対応を持ち、両ファイルはroot管理とします。CLIはTrust Anchorの作成・変更をしません。このPhase A変更ではTrust Anchorを登録しないため、Ownerによる別途の決定がない状態では `BLOCKED_OWNER_AUTHN` で停止します。CLIには公開鍵指定、Safety Hold解除、production stubの迂回オプションはありません。
 
@@ -189,6 +217,8 @@ uv run --locked python aws_cost_name_tagger_v3.py run \
 1. Python 3.12 と uv を準備し、`uv sync --locked` で依存関係を固定してインストール。
 2. Boto3 `1.43.116` とAWS CRTをimportして依存バージョンを確認。
 3. `SHA256_MANIFEST.json` に記載されたファイルのSHA-256とサイズを確認（`uv.lock` とCI workflowも含む）。
-4. `uv run --locked --no-build python -m unittest -q test_name_tag_approval test_name_tag_review test_name_tag_scope test_name_tag_ledger test_name_tag_execution test_name_tag_adapters test_name_tag_controlled test_aws_cost_name_tagger_v3` と既存の直接実行で、offline承認フローとSafety Holdを検証します。テスト件数はリポジトリの更新により変わります。
+4. オフラインテストで承認フロー、台帳アンカー、Safety Holdを検証します。
+   実行コマンドは英語版 `README.md` のDevelopmentを参照してください。
+   テスト件数はリポジトリの更新により変わります。
 
 **CIの実行結果は[GitHub Actions Run #39702373325](https://github.com/yohi/aws-cost-name-tagger/actions/runs/39702373325)で確認済みです。** このRunでは依存関係固定、Boto3/CRT、マニフェスト11ファイル、両実行方法のテスト76/76がすべてPASSしました。依存関係の更新が必要な場合は、別変更で `uv lock` を実行して `uv.lock` とマニフェストを更新します。Safety Holdの解除やタグ書き込みは行いません。

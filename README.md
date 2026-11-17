@@ -29,6 +29,8 @@ The separate `name_tag_controlled.py` CLI supports these offline commands:
 - `verify-name`: verify a detached Owner signature packaged in an approval envelope.
 - `prepare-execution`: prepare a separate, single-ARN execution authorization payload.
 - `verify-execution`: verify the separate execution envelope.
+- `initialize-ledger`: provision a new durable ledger locally as an administrator;
+  it does not contact AWS.
 - `simulate`: blocked unless invoked by an in-process test harness with the exact fake adapter.
 - `execute-approved`: always returns `AWS_WRITE_BLOCKED` in Phase A.
 
@@ -47,6 +49,33 @@ The output file contains the exact canonical UTF-8 payload bytes, without a trai
 
 The trust config is a version-1 JSON object with exactly `schema_version`, `allowed_signers_sha256`, and `owners`. Each owner maps a fingerprint to `{"role":"...","revoked":false}` (the `revoked` member may be omitted). The allowed-signers file must contain matching Owner IDs, namespaces, and public keys. The CLI accepts no config path or key override.
 
+### Provision the durable ledger
+
+Before first use, an administrator must create the root-owned anchor directory
+and a private ledger parent owned by the runtime UID. Replace `1001` and the
+ledger path with the account and location used by the service:
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/aws-cost-name-tagger/ledger-anchors
+sudo install -d -o 1001 -g 1001 -m 0700 /var/lib/aws-cost-name-tagger
+sudo uv run --locked --no-build --no-sync python \
+  name_tag_controlled.py initialize-ledger \
+  --path /var/lib/aws-cost-name-tagger/ledger.db --runtime-uid 1001
+```
+
+The command requires root and creates the database for the specified runtime UID
+plus a separate root-owned anchor. It is local-only: it makes no AWS API calls,
+does not access AWS credentials, and does not change the Safety Hold.
+`open_ledger` rejects a missing database, an existing empty or unanchored
+database, or a mismatch between the database and its anchor with
+`BLOCKED_SCOPE_STATE_UNKNOWN`.
+
+The command refuses to adopt or overwrite an existing database or anchor. A
+ledger created before this anchor requirement is enabled will fail closed; do
+not delete or reprovision it as an automatic repair. If provisioning fails
+after creating only one part, inspect the files and resolve the partial setup
+deliberately before retrying; the command does not recover it automatically.
+
 Phase A performs no AWS mutation, IAM change, Safety Hold removal, or credential lookup from `execute-approved`. Passing offline tests is not approval for Phase B or a real AWS write.
 
 ## Development
@@ -55,7 +84,8 @@ Phase A performs no AWS mutation, IAM change, Safety Hold removal, or credential
 uv run --locked --no-build python -m unittest -q \
   test_name_tag_approval test_name_tag_review test_name_tag_scope \
   test_name_tag_ledger test_name_tag_execution test_name_tag_adapters \
-  test_name_tag_controlled test_aws_cost_name_tagger_v3
+  test_name_tag_controlled test_name_tag_ledger_anchor test_name_tag_ledger_provision \
+  test_name_tag_ledger_open test_name_tag_ledger_cli test_aws_cost_name_tagger_v3
 ```
 
 The test suite is offline and uses temporary OpenSSH keys, a local SQLite ledger, and fake adapters.

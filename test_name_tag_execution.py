@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -37,6 +38,8 @@ from name_tag_ledger import (
     initialize_scope,
     open_ledger,
 )
+import name_tag_ledger_anchor as ledger_anchor
+import name_tag_ledger_provision as ledger_provision
 from name_tag_scope import ScopeEvidence, SideEffectEvidence
 from name_tag_execution import (
     AuthorizedAwsRuntimeContext,
@@ -96,6 +99,8 @@ class NameTagExecutionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.anchor_directory = self.root / "anchors"
+        self.anchor_directory.mkdir(mode=0o700)
         self.key = self.root / "owner_key"
         _ = subprocess.run(
             ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.key)],
@@ -120,9 +125,20 @@ class NameTagExecutionTests(unittest.TestCase):
             pinned_sha256=hashlib.sha256(self.allowed_signers.read_bytes()).hexdigest(),
             enrolled={OWNER: {self.fingerprint: EnrolledOwner(self.fingerprint, ROLE)}},
         )
-        self.ledger = open_ledger(
-            self.root / "ledger.db", trusted_host=True, trust=self.trust
-        )
+        with (
+            patch.object(
+                ledger_anchor, "LEDGER_ANCHOR_DIRECTORY", self.anchor_directory
+            ),
+            patch.object(ledger_anchor, "_ANCHOR_OWNER_UID", os.geteuid()),
+            patch.object(ledger_anchor, "require_root", lambda: None),
+            patch.object(ledger_provision, "_require_root", lambda: None),
+        ):
+            ledger_provision.initialize_ledger(
+                self.root / "ledger.db", runtime_uid=os.geteuid()
+            )
+            self.ledger = open_ledger(
+                self.root / "ledger.db", trusted_host=True, trust=self.trust
+            )
         self.addCleanup(self.ledger.close)
         object.__setattr__(self.ledger, "_trust", self.trust)
         self.side_effect = self._side_effect()

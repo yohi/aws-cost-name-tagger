@@ -34,6 +34,7 @@ from name_tag_approval import (
 )
 from name_tag_execution import FakeNameTagAdapter, OfflineRuntimeContext, execute_once
 from name_tag_ledger import IntentLedger
+from name_tag_ledger_cli import initialize_ledger_cli
 from name_tag_review import prepare_name_payload
 from name_tag_scope import ScopeEvidence, SideEffectEvidence
 
@@ -435,6 +436,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify_execution_parser = subparsers.add_parser("verify-execution")
     verify_execution_parser.add_argument("--envelope", required=True)
 
+    initialize_ledger_parser = subparsers.add_parser("initialize-ledger")
+    initialize_ledger_parser.add_argument("--path", required=True, type=Path)
+    initialize_ledger_parser.add_argument("--runtime-uid", required=True, type=int)
+
     subparsers.add_parser("simulate")
     subparsers.add_parser("execute-approved")
     return parser
@@ -449,6 +454,7 @@ CLI_HANDLERS: Final[dict[str, CLIHandler]] = {
     "verify-name": verify_name,
     "prepare-execution": prepare_execution,
     "verify-execution": verify_execution,
+    "initialize-ledger": initialize_ledger_cli,
     "simulate": simulate,
     "execute-approved": execute_approved,
 }
