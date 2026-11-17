@@ -115,7 +115,9 @@ def initialize_ledger(path: Path | str, *, runtime_uid: int) -> None:
             create_ledger_database(
                 canonical_path, host_binding, ledger_instance_id
             )
-        _ = write_ledger_anchor(canonical_path, host_binding, ledger_instance_id)
+        _ = write_ledger_anchor(
+            canonical_path, host_binding, ledger_instance_id, runtime_gid
+        )
         _validate_provisioned_pair(
             canonical_path, runtime_uid, runtime_gid, host_binding
         )

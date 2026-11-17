@@ -167,10 +167,14 @@ def read_ledger_anchor(path: Path, host_binding: str) -> LedgerAnchorIdentity:
 
 
 def write_ledger_anchor(
-    path: Path, host_binding: str, ledger_instance_id: str
+    path: Path, host_binding: str, ledger_instance_id: str, runtime_gid: int
 ) -> Path:
     require_root()
-    if re.fullmatch(r"[0-9a-f]{32}", ledger_instance_id) is None:
+    if (
+        type(runtime_gid) is not int
+        or runtime_gid < 0
+        or re.fullmatch(r"[0-9a-f]{32}", ledger_instance_id) is None
+    ):
         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
     anchor_path = ledger_anchor_path(path, host_binding)
     validate_anchor_directory()
@@ -199,10 +203,11 @@ def write_ledger_anchor(
         fd = os.open(
             anchor_path.name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o644,
+            0o640,
             dir_fd=directory_fd,
         )
-        _ = os.fchmod(fd, 0o644)
+        os.fchown(fd, _ANCHOR_OWNER_UID, runtime_gid)
+        os.fchmod(fd, 0o640)
         with os.fdopen(fd, "wb") as stream:
             _ = stream.write(payload)
             stream.flush()

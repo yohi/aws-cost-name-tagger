@@ -30,8 +30,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "e44419ccc1677122b92fe19a21fbfc6f67dbc4dc238fd740ac6a392b59a84ba7",
-      "bytes": 6072
+      "sha256": "035fc04bf92bb3f28757a7a4eeda70a34952591013d56779ec77bc20c0d480f6",
+      "bytes": 6184
     },
     {
       "path": "SAFETY_REVIEW_RESULT.md",
@@ -85,8 +85,8 @@
     },
     {
       "path": "README.ja.md",
-      "sha256": "ee323aec4792229f6a6993c345170129d8a96cc124c3f7ea2d528cd8245d1c57",
-      "bytes": 30009
+      "sha256": "5b5ab8d2f03fca35f75eef95168eff9a899863e03f91893373128b2ddd47a569",
+      "bytes": 30182
     },
     {
       "path": "name_tag_approval.py",
@@ -120,13 +120,13 @@
     },
     {
       "path": "name_tag_ledger.py",
-      "sha256": "47cc0cffe0e8147545f30d73dcaaf34f634181332a5ef6cada05bedbc739b984",
-      "bytes": 65060
+      "sha256": "d1a5cb4491639ba537dd3b1f22bee0c8583a350165d8f0204cb56b45b86c4fb2",
+      "bytes": 65056
     },
     {
       "path": "name_tag_ledger_anchor.py",
-      "sha256": "3e026dc1b8b9dcee8037ef9458d5189c6fe0c4eeb2ca4ddd219184497055d202",
-      "bytes": 7013
+      "sha256": "5b071a2f626ea4ce4f1cd2c96bd568467ec40ec14d9d8be428ec66ab2ac6c238",
+      "bytes": 7164
     },
     {
       "path": "name_tag_ledger_cli.py",
@@ -140,8 +140,8 @@
     },
     {
       "path": "name_tag_ledger_provision.py",
-      "sha256": "829a5d470a9005a9dcaa41b89d66ae5c3ee84fe80b41e64af16c5d1157eed955",
-      "bytes": 4224
+      "sha256": "cfb544bd1d87a9cd926387cdab6729f5bd21d2b4a629629761a5247014c96bef",
+      "bytes": 4259
     },
     {
       "path": "test_name_tag_ledger.py",
@@ -165,8 +165,8 @@
     },
     {
       "path": "test_name_tag_ledger_provision.py",
-      "sha256": "6237ecb5812c5df21c2143f9b2a970fb29215f8b9f3adb4dba0d7c9c4b89223c",
-      "bytes": 6105
+      "sha256": "37bb0224bd192d7d893a778383787533afa72feaf3207b6f64ed0d441008a6c9",
+      "bytes": 6366
     },
     {
       "path": "name_tag_execution.py",

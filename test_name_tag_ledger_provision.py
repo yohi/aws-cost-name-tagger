@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+import pwd
 import sqlite3
 import tempfile
 import unittest
@@ -56,6 +57,10 @@ class LedgerProvisionTests(unittest.TestCase):
         self.assertEqual(path.stat().st_uid, os.geteuid())
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         host_binding = ledger.ledger_host_binding(path)
+        anchor_path = anchor.ledger_anchor_path(path, host_binding)
+        anchor_info = anchor_path.stat()
+        self.assertEqual(anchor_info.st_mode & 0o777, 0o640)
+        self.assertEqual(anchor_info.st_gid, pwd.getpwuid(os.geteuid()).pw_gid)
         instance_id = anchor.read_ledger_anchor(path, host_binding).ledger_instance_id
         with sqlite3.connect(path) as connection:
             metadata = dict(connection.execute("SELECT key, value FROM ledger_meta"))

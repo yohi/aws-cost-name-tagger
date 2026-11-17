@@ -40,6 +40,8 @@ sudo uv run --locked --no-build --no-sync python \
 
 このコマンドはroot権限を必要とし、指定UID用のDBと別個のroot所有アンカーを
 作成します。AWS APIやAWS認証情報は使わず、Safety Holdも変更しません。
+アンカーファイルはroot所有・`0640`で作成し、指定UIDの主グループから読み取り
+可能にします。otherユーザーには公開しません。
 `open_ledger` はDB欠落、既存の空DB・アンカー未登録DB、またはDBとアンカーの
 不一致を `BLOCKED_SCOPE_STATE_UNKNOWN` で拒否します。DBのdevice/inodeが
 root所有アンカーと異なる場合も拒否します。DBのコピーを復元・移動しても

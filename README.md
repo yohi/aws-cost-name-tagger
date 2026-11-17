@@ -66,6 +66,8 @@ sudo uv run --locked --no-build --no-sync python \
 The command requires root and creates the database for the specified runtime UID
 plus a separate root-owned anchor. It is local-only: it makes no AWS API calls,
 does not access AWS credentials, and does not change the Safety Hold.
+The anchor file is mode `0640` and group-readable by the runtime UID's primary
+group; it is not world-readable.
 `open_ledger` rejects a missing database, an existing empty or unanchored
 database, a database file whose device/inode differs from its anchor, or a
 mismatch between the database and its anchor with

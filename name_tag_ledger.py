@@ -1496,7 +1496,7 @@ def create_ledger_database(
             connection.commit()
         file_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
-            _ = os.fchmod(file_fd, 0o600)
+            os.fchmod(file_fd, 0o600)
             os.fsync(file_fd)
         finally:
             os.close(file_fd)
