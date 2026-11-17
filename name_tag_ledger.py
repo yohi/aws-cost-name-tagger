@@ -544,6 +544,7 @@ class IntentLedger:
         conn = sqlite3.connect(
             self._path.as_uri() + "?mode=rw", timeout=10.0, uri=True
         )
+        connection_ready = False
         try:
             _ = conn.execute("PRAGMA synchronous = FULL")
             journal_mode = conn.execute("PRAGMA journal_mode").fetchone()
@@ -555,10 +556,13 @@ class IntentLedger:
             ):
                 raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
             _ = conn.execute("PRAGMA foreign_keys = ON")
+            connection_ready = True
         except sqlite3.Error as exc:
-            with suppress(sqlite3.Error):
-                conn.close()
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+        finally:
+            if not connection_ready:
+                with suppress(sqlite3.Error):
+                    conn.close()
         return _CloseableConnection(conn)
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:

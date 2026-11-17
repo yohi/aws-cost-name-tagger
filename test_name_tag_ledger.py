@@ -449,6 +449,29 @@ class ScopeVerificationTests(LedgerTestBase):
         self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
         self.assertTrue(connection.closed)
 
+    def test_connection_closes_when_journal_mode_is_not_delete(self):
+        ledger = self._open_ledger()
+
+        class UnexpectedJournalModeConnection:
+            closed = False
+
+            def execute(self, sql):
+                return self
+
+            def fetchone(self):
+                return ("wal",)
+
+            def close(self):
+                self.closed = True
+
+        connection = UnexpectedJournalModeConnection()
+        with patch("name_tag_ledger.sqlite3.connect", return_value=connection):
+            with self.assertRaises(LedgerError) as ctx:
+                ledger._connection()
+
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        self.assertTrue(connection.closed)
+
     def test_open_ledger_acquires_process_lock_before_sqlite_connection(self):
         db = self.root / "lock-order.db"
         ledger_provision.initialize_ledger(db, runtime_uid=os.geteuid())
