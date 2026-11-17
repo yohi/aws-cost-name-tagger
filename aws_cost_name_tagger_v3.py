@@ -1670,39 +1670,41 @@ def publish_staged_reports(pairs: list[tuple[Path, Path]]):
     source_dir = next(iter(sources))
     dest_dir = next(iter(destinations))
     published = []
-    with _private_directory_fd(source_dir, create=False) as src_fd:
-        with _private_directory_fd(dest_dir, create=False) as dst_fd:
-            _require_private_publish_directory(src_fd, "staging")
-            _require_private_publish_directory(dst_fd, "destination")
-            # Pre-validate all sources while the private source directory is
-            # anchored. os.link(follow_symlinks=False) alone accepts symlinks.
-            for src, _ in pairs:
-                source_meta = os.stat(
-                    Path(src).name, dir_fd=src_fd, follow_symlinks=False
-                )
-                if not stat.S_ISREG(source_meta.st_mode):
-                    raise ValueError(f"Refusing non-regular staged report: {Path(src).name}")
-            try:
-                for src, dst in pairs:
-                    os.link(Path(src).name, Path(dst).name,
-                            src_dir_fd=src_fd, dst_dir_fd=dst_fd, follow_symlinks=False)
-                    published.append(Path(dst).name)
-                os.fsync(dst_fd)
-            except BaseException as primary:
-                cleanup_errors = []
-                possibly_remaining = []
-                # Continue independent cleanup attempts even if one fails.
-                for name in reversed(published):
-                    try:
-                        os.unlink(name, dir_fd=dst_fd)
-                    except OSError as cleanup_error:
-                        cleanup_errors.append((name, cleanup_error))
-                        possibly_remaining.append(str(dest_dir / name))
-                if cleanup_errors:
-                    raise ReportPublishCleanupError(
-                        primary, cleanup_errors, possibly_remaining
-                    ) from primary
-                raise
+    with (
+        _private_directory_fd(source_dir, create=False) as src_fd,
+        _private_directory_fd(dest_dir, create=False) as dst_fd,
+    ):
+        _require_private_publish_directory(src_fd, "staging")
+        _require_private_publish_directory(dst_fd, "destination")
+        # Pre-validate all sources while the private source directory is
+        # anchored. os.link(follow_symlinks=False) alone accepts symlinks.
+        for src, _ in pairs:
+            source_meta = os.stat(
+                Path(src).name, dir_fd=src_fd, follow_symlinks=False
+            )
+            if not stat.S_ISREG(source_meta.st_mode):
+                raise ValueError(f"Refusing non-regular staged report: {Path(src).name}")
+        try:
+            for src, dst in pairs:
+                os.link(Path(src).name, Path(dst).name,
+                        src_dir_fd=src_fd, dst_dir_fd=dst_fd, follow_symlinks=False)
+                published.append(Path(dst).name)
+            os.fsync(dst_fd)
+        except BaseException as primary:
+            cleanup_errors = []
+            possibly_remaining = []
+            # Continue independent cleanup attempts even if one fails.
+            for name in reversed(published):
+                try:
+                    os.unlink(name, dir_fd=dst_fd)
+                except OSError as cleanup_error:
+                    cleanup_errors.append((name, cleanup_error))
+                    possibly_remaining.append(str(dest_dir / name))
+            if cleanup_errors:
+                raise ReportPublishCleanupError(
+                    primary, cleanup_errors, possibly_remaining
+                ) from primary
+            raise
 
 
 def write_review_csv(path: Path, records: list[dict]):

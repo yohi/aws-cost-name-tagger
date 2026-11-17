@@ -15,8 +15,8 @@
     },
     {
       "path": "aws_cost_name_tagger_v3.py",
-      "sha256": "2fbf561fb983975e377bffec77463341a18f87fff92877b49ca2ea68a09dc2e8",
-      "bytes": 96729
+      "sha256": "40e62cd64420e0c0ad1633ec0cf354c7fe9ccc64d4afce78b129caeb47eb917b",
+      "bytes": 96617
     },
     {
       "path": "example_report_FORMAT_ONLY.csv",
@@ -40,8 +40,8 @@
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
-      "sha256": "120e14eeb1210dde34c611dcd6728d60b0a37e18d1666a3afc14f46491c1d036",
-      "bytes": 190792
+      "sha256": "e69c21b400a1e64c7fdf32211af2b10cc373e29672dbb31e0548cc5178401284",
+      "bytes": 193119
     },
     {
       "path": "test_results.txt",
