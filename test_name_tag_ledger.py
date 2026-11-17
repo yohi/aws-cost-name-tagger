@@ -448,6 +448,52 @@ class ScopeVerificationTests(LedgerTestBase):
         self.assertTrue(lock_acquired)
         ledger.close()
 
+    def test_scope_operation_closes_lock_file_descriptor(self):
+        ledger = self._open_ledger()
+        opened_fds = []
+        real_open = os.open
+
+        def track_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened_fds.append(fd)
+            return fd
+
+        with patch("name_tag_ledger.os.open", side_effect=track_open):
+            hold_scope(ledger, "scope-1", reason="operator-hold")
+
+        self.assertIsNone(ledger._lock_fd)
+        with self.assertRaises(OSError):
+            os.fstat(opened_fds[0])
+
+    def test_failed_lock_acquisition_closes_lock_file_descriptor(self):
+        ledger = self._open_ledger()
+        opened_fds = []
+        real_open = os.open
+
+        def track_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened_fds.append(fd)
+            return fd
+
+        with patch("name_tag_ledger.fcntl.flock", side_effect=OSError("lock failed")):
+            with patch("name_tag_ledger.os.open", side_effect=track_open):
+                with self.assertRaises(OSError):
+                    ledger._lock()
+
+        self.assertIsNone(ledger._lock_fd)
+        with self.assertRaises(OSError):
+            os.fstat(opened_fds[0])
+
+    def test_missing_scopes_table_maps_database_error_to_ledger_error(self):
+        ledger = self._open_ledger()
+        with closing(sqlite3.connect(str(ledger._path))) as conn, conn:
+            conn.execute("DROP TABLE scopes")
+
+        with self.assertRaises(LedgerError) as ctx:
+            effective_scope_state(ledger, "scope-1")
+
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
     def test_release_unknown_scope_persists_scope_evidence(self):
         ledger = self._open_ledger()
         hold_scope(ledger, "scope-1", reason="operator-hold")
@@ -623,7 +669,6 @@ class ScopeVerificationTests(LedgerTestBase):
         ledger = self._open_ledger(db)
         self._fixture_only_seed_cleared_scope(ledger)
         # A production open must reject any ledger containing fixture-only rows.
-        ledger._lock_fd and os.close(ledger._lock_fd)
         with self.assertRaises(LedgerError) as ctx:
             open_ledger(db, trusted_host=True, trust=self.trust)
         self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")

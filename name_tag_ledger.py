@@ -336,12 +336,9 @@ def verify_scope_decision(
         candidate_lines = _select_signer_lines(trust_data, owner_id, set(entries))
     except ApprovalRejected:
         raise LedgerError("BLOCKED_OWNER_AUTHN") from None
-    try:
-        verifying_fingerprint = _verify_owner_signature(
-            signature, canonical, owner_id, SCOPE_DECISION_NAMESPACE, trust, candidate_lines
-        )
-    except ApprovalRejected:
-        raise LedgerError("BLOCKED_OWNER_AUTHN") from None
+    verifying_fingerprint = _verify_owner_signature(
+        signature, canonical, owner_id, SCOPE_DECISION_NAMESPACE, trust, candidate_lines
+    )
 
     entry = entries.get(verifying_fingerprint)
     if entry is None or entry.revoked or entry.role != allowed_role:
@@ -506,22 +503,30 @@ class IntentLedger:
         """Acquire a cross-process advisory lock on the ledger file."""
         if self._lock_fd is None:
             self._lock_fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+        except OSError:
+            lock_fd = self._lock_fd
+            self._lock_fd = None
+            if lock_fd is not None:
+                with suppress(OSError):
+                    os.close(lock_fd)
+            raise
 
     def _unlock(self) -> None:
-        if self._lock_fd is not None:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        lock_fd = self._lock_fd
+        if lock_fd is None:
+            return
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            self._lock_fd = None
+            with suppress(OSError):
+                os.close(lock_fd)
 
     def close(self) -> None:
         """Release the advisory lock and close the lock file descriptor."""
         self._unlock()
-        lock_fd = self._lock_fd
-        if lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            self._lock_fd = None
 
     # ------------------------------------------------------------------
     # Schema / integrity
@@ -638,8 +643,12 @@ class IntentLedger:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
 
         # Reject any fixture-only scope in a production ledger.
-        cursor = conn.execute("SELECT 1 FROM scopes WHERE fixture_only != 0 LIMIT 1")
-        if cursor.fetchone() is not None:
+        try:
+            cursor = conn.execute("SELECT 1 FROM scopes WHERE fixture_only != 0 LIMIT 1")
+            fixture_scope = cursor.fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from exc
+        if fixture_scope is not None:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
     def _now(self) -> datetime:
