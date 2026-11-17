@@ -122,6 +122,7 @@ class LedgerTestBase(unittest.TestCase):
         expires_at: datetime | None = None,
         allowed_role: str | None = None,
         reason: str = "owner-scope-decision",
+        hold_generation_id: str | None = None,
     ) -> dict:
         if target_arns is None:
             target_arns = [ARN]
@@ -152,6 +153,7 @@ class LedgerTestBase(unittest.TestCase):
             "expires_at_utc": expires_at.isoformat(),
             "decision_nonce": f"nonce-scope-{action}-{scope_id}",
             "reason": reason,
+            "hold_generation_id": hold_generation_id,
         }
 
     def _side_effect(self, arn: str = ARN) -> SideEffectEvidence:
@@ -215,6 +217,13 @@ class LedgerTestBase(unittest.TestCase):
         if payload is None:
             if ledger is not None and "host_binding" not in kwargs:
                 kwargs["host_binding"] = ledger._host_binding
+            if action == "RELEASE" and ledger is not None:
+                with closing(sqlite3.connect(str(ledger._path))) as conn:
+                    row = conn.execute(
+                        "SELECT id FROM scope_history WHERE scope_id = ? AND state = 'HOLD' ORDER BY id DESC LIMIT 1",
+                        (kwargs.get("scope_id", "scope-1"),),
+                    ).fetchone()
+                kwargs["hold_generation_id"] = str(row[0]) if row else None
             payload = self._scope_payload(action, **kwargs)
         from name_tag_ledger import _canonical_scope_payload
         data = _canonical_scope_payload(payload)
@@ -509,6 +518,22 @@ class ScopeVerificationTests(LedgerTestBase):
         authorization = self._verified_execution()
         create_intent(ledger, authorization, scope_id="scope-1")
 
+    def test_release_rejects_stale_hold_generation(self):
+        ledger = self._open_ledger()
+        self._initialize_scope(ledger)
+        hold_scope(ledger, "scope-1", reason="first-hold")
+        stale_release = self._scope_envelope("RELEASE", ledger=ledger)
+        hold_scope(ledger, "scope-1", reason="newer-hold")
+        with self.assertRaises(LedgerError) as ctx:
+            release_scope(
+                ledger,
+                stale_release,
+                action="RELEASE",
+                scope=self._scope_evidence(),
+                side_effects=[self._side_effect()],
+            )
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
     def test_release_unknown_hold_rejects_arn_owned_by_another_scope(self):
         ledger = self._open_ledger()
         self._initialize_scope(ledger, scope_id="scope-1")
@@ -597,6 +622,13 @@ class ScopeVerificationTests(LedgerTestBase):
             conn.execute("DELETE FROM ledger_meta WHERE key = 'host_binding'")
         with self.assertRaises(LedgerError) as ctx:
             effective_scope_state(ledger, "scope-1")
+        self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_existing_empty_file_is_not_initialized_as_new_ledger(self):
+        db = self.root / "preexisting-empty.db"
+        db.touch(mode=0o600)
+        with self.assertRaises(LedgerError) as ctx:
+            self._open_ledger(db)
         self.assertEqual(ctx.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
 
     def test_initial_scope_missing_is_unknown(self):
@@ -769,16 +801,23 @@ except Exception as exc:
                 f"{error.read_text() if error.exists() else ''} {err.decode()}"
             )
             raise AssertionError(msg)
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
-        try:
-            proc.stderr.close()
-        except Exception:
-            pass
+        if not ready.exists():
+            proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                "subprocess did not reach ready before timeout: "
+                f"{error.read_text() if error.exists() else ''} "
+                f"stdout={out.decode(errors='replace')} "
+                f"stderr={err.decode(errors='replace')}"
+            )
         proc.send_signal(signal.SIGKILL)
-        proc.wait()
+        proc.communicate()
+
+    def test_crash_helper_fails_if_child_never_reaches_ready(self):
+        db = self.root / "never-ready.db"
+        self._open_ledger(db)
+        with self.assertRaisesRegex(AssertionError, "did not reach ready"):
+            self._run_crash_subprocess(db, "time.sleep(30)", timeout=0.1)
     def test_t_f004_01_crash_after_intent_before_send(self):
         db = self.root / "t-f004-01.db"
         ledger = self._open_ledger(db)
@@ -802,7 +841,7 @@ except Exception as exc:
         ledger2 = self._open_ledger(db)
         self.assertEqual(effective_scope_state(ledger2, "scope-1"), "HOLD")
 
-    def test_t_f004_03_crash_after_readback_mismatch_before_hold_fsync(self):
+    def test_t_f004_03_crash_after_atomic_hold_and_terminal_commit(self):
         db = self.root / "t-f004-03.db"
         ledger = self._open_ledger(db)
         self._initialize_scope(ledger)
@@ -810,25 +849,13 @@ except Exception as exc:
             db,
             "handle = create_intent(ledger, auth, scope_id='scope-1'); "
             "consume_first_send(ledger, handle); "
-            "record_readback(ledger, handle, name_after='other-name', outcome='FAILED_READBACK'); "
-            "hold_scope(ledger, 'scope-1', reason='readback-mismatch')",
+            "record_readback(ledger, handle, name_after='other-name', outcome='FAILED_READBACK')",
         )
         ledger2 = self._open_ledger(db)
         self.assertEqual(effective_scope_state(ledger2, "scope-1"), "HOLD")
-
-    def test_t_f004_04_crash_after_hold_before_intent_terminal(self):
-        db = self.root / "t-f004-04.db"
-        ledger = self._open_ledger(db)
-        self._initialize_scope(ledger)
-        self._run_crash_subprocess(
-            db,
-            "handle = create_intent(ledger, auth, scope_id='scope-1'); "
-            "consume_first_send(ledger, handle); "
-            "record_readback(ledger, handle, name_after='other-name', outcome='FAILED_READBACK'); "
-            "hold_scope(ledger, 'scope-1', reason='readback-mismatch')",
-        )
-        ledger2 = self._open_ledger(db)
-        self.assertEqual(effective_scope_state(ledger2, "scope-1"), "HOLD")
+        with closing(sqlite3.connect(str(db))) as conn:
+            row = conn.execute("SELECT state FROM intents LIMIT 1").fetchone()
+        self.assertEqual(row[0], "TERMINAL")
 
     def test_t_f004_05_missing_or_corrupt_ledger_is_unknown(self):
         db = self.root / "t-f004-05.db"
@@ -900,6 +927,34 @@ except Exception as exc:
         self.assertEqual(effective_scope_state(ledger, "scope-1"), "CLEARED")
         with self.assertRaises(LedgerError) as ctx:
             create_intent(ledger, auth, scope_id="scope-1")
+        self.assertEqual(ctx.exception.code, "BLOCKED_AUTH_REPLAY")
+
+    def test_create_intent_rejects_reused_execution_nonce(self):
+        ledger = self._open_ledger()
+        self._initialize_scope(ledger)
+        first = create_intent(ledger, self._verified_execution(), scope_id="scope-1")
+        consume_first_send(ledger, first)
+        record_readback(ledger, first, name_after="web-prod", outcome="APPLIED_VERIFIED")
+        payload = self._execution_payload()
+        payload["risk_acknowledgement"] = "distinct-authorization"
+        data = canonical_payload(payload, kind="execution")
+        second = verify_envelope(
+            json.dumps(
+                {
+                    "payload": payload,
+                    "authorization_id": approval_digest(data),
+                    "signature_ref": base64.b64encode(
+                        self._sign(data, NAMESPACES["execution"])
+                    ).decode(),
+                },
+                separators=(",", ":"),
+            ).encode(),
+            kind="execution",
+            trust=self.trust,
+            now_utc=NOW,
+        )
+        with self.assertRaises(LedgerError) as ctx:
+            create_intent(ledger, second, scope_id="scope-1")
         self.assertEqual(ctx.exception.code, "BLOCKED_AUTH_REPLAY")
 
     def test_t_f004_10_healthy_cleared_no_incomplete_intent_first_send_once(self):

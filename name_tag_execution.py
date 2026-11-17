@@ -266,7 +266,10 @@ def execute_once(
         return ExecutionResult("BLOCKED_NAME_UNKNOWN", fresh_execution.content_id, arn, approved_name)
 
     try:
-        handle = create_intent(ledger, fresh_execution, scope_id=scope_id)
+        handle = create_intent(
+            ledger, fresh_execution, scope_id=scope_id,
+            scope=scope, side_effects=[side_effects],
+        )
         if handle.authorization_id != fresh_execution.content_id:
             raise LedgerError("BLOCKED_INTENT_REPLAY")
         permit = consume_first_send(ledger, handle)

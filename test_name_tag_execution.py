@@ -264,6 +264,7 @@ class NameTagExecutionTests(unittest.TestCase):
             "expires_at_utc": (now + timedelta(hours=1)).isoformat(),
             "decision_nonce": "scope-nonce-1",
             "reason": "offline execution fixture",
+            "hold_generation_id": None,
         }
         canonical = _canonical_scope_payload(payload)
         envelope = {
@@ -297,6 +298,8 @@ class NameTagExecutionTests(unittest.TestCase):
         name_approval: VerifiedEnvelope | None = None,
         authorization: VerifiedEnvelope | None = None,
         *,
+        scope: ScopeEvidence | None = None,
+        side_effects: SideEffectEvidence | None = None,
         adapter: NameTagAdapter | None = None,
         runtime: RuntimeContext | None = None,
     ) -> ExecutionResult:
@@ -314,12 +317,37 @@ class NameTagExecutionTests(unittest.TestCase):
         return execute_once(
             name_approval,
             authorization,
-            scope=self.scope,
-            side_effects=self.side_effect,
+            scope=scope or self.scope,
+            side_effects=side_effects or self.side_effect,
             ledger=self.ledger,
             adapter=actual_adapter,
             runtime=actual_runtime,
         )
+
+    def test_writer_evidence_digest_mismatch_blocks_before_write(self):
+        adapter = FakeNameTagAdapter()
+        result = self._run(
+            scope=replace(self.scope, writer_evidence_digest="e" * 64),
+            adapter=adapter,
+            runtime=self._offline(adapter),
+        )
+        self.assertEqual(result.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        self.assertEqual(adapter.write_calls, 0)
+        self.assertEqual(self._intent_count(), 0)
+
+    def test_side_effect_digest_mismatch_blocks_before_write(self):
+        adapter = FakeNameTagAdapter()
+        effects = replace(
+            self.side_effect, not_after_utc=self.side_effect.not_after_utc + timedelta(minutes=1)
+        )
+        result = self._run(
+            side_effects=effects,
+            adapter=adapter,
+            runtime=self._offline(adapter),
+        )
+        self.assertEqual(result.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        self.assertEqual(adapter.write_calls, 0)
+        self.assertEqual(self._intent_count(), 0)
 
     def _intent_count(self) -> int:
         with closing(sqlite3.connect(str(self.ledger._path))) as conn, conn:
