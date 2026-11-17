@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -53,7 +54,10 @@ class LedgerOpenAnchorTests(unittest.TestCase):
                     "SELECT value FROM ledger_meta WHERE key = 'ledger_instance_id'"
                 ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(row[0], anchor.read_ledger_anchor(path, ledger_host_binding(path)))
+        self.assertEqual(
+            row[0],
+            anchor.read_ledger_anchor(path, ledger_host_binding(path)).ledger_instance_id,
+        )
 
     def test_open_does_not_recreate_a_deleted_provisioned_database(self) -> None:
         path = self._provision()
@@ -127,6 +131,20 @@ class LedgerOpenAnchorTests(unittest.TestCase):
                 ("f" * 32,),
             )
             connection.commit()
+
+        with self.assertRaises(LedgerError) as context:
+            open_ledger(path, trusted_host=True, trust=None)
+
+        self.assertEqual(context.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_open_rejects_a_restored_snapshot_with_a_new_file_identity(self) -> None:
+        path = self._provision()
+        original_inode = path.stat().st_ino
+        backup = self.root / "ledger-backup.db"
+        shutil.copy2(path, backup)
+        path.unlink()
+        backup.replace(path)
+        self.assertNotEqual(path.stat().st_ino, original_inode)
 
         with self.assertRaises(LedgerError) as context:
             open_ledger(path, trusted_host=True, trust=None)

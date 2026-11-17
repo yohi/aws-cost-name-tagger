@@ -1532,7 +1532,7 @@ def open_ledger(
         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
     host_binding = ledger_host_binding(file_path)
-    anchor_instance_id = read_ledger_anchor(file_path, host_binding)
+    anchor_identity = read_ledger_anchor(file_path, host_binding)
     ledger = IntentLedger(
         path=file_path,
         trusted_host=trusted_host,
@@ -1553,6 +1553,8 @@ def open_ledger(
             not stat.S_ISREG(path_file.st_mode)
             or locked_file.st_dev != path_file.st_dev
             or locked_file.st_ino != path_file.st_ino
+            or path_file.st_dev != anchor_identity.ledger_device
+            or path_file.st_ino != anchor_identity.ledger_inode
         ):
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
 
@@ -1582,7 +1584,10 @@ def open_ledger(
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
         if _ledger_metadata_value(connection, "schema_version") != "1":
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-        if _ledger_metadata_value(connection, "ledger_instance_id") != anchor_instance_id:
+        if (
+            _ledger_metadata_value(connection, "ledger_instance_id")
+            != anchor_identity.ledger_instance_id
+        ):
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
         ledger._validate_ledger_state(connection)
         return ledger

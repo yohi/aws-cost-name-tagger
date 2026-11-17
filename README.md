@@ -67,8 +67,12 @@ The command requires root and creates the database for the specified runtime UID
 plus a separate root-owned anchor. It is local-only: it makes no AWS API calls,
 does not access AWS credentials, and does not change the Safety Hold.
 `open_ledger` rejects a missing database, an existing empty or unanchored
-database, or a mismatch between the database and its anchor with
-`BLOCKED_SCOPE_STATE_UNKNOWN`.
+database, a database file whose device/inode differs from its anchor, or a
+mismatch between the database and its anchor with
+`BLOCKED_SCOPE_STATE_UNKNOWN`. Restoring or moving a copied database to a new
+file is not an automatic recovery path; it requires an explicit administrator
+decision and new provisioning. The anchor does not detect in-place database
+rewrites by the trusted runtime UID or rollback of the entire host storage.
 
 The command refuses to adopt or overwrite an existing database or anchor. A
 ledger created before this anchor requirement is enabled will fail closed; do

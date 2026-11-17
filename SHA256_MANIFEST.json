@@ -30,8 +30,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "5bea74031a48d76d0c95f527975af383c9b61f6b075cc3fb36bcbcc0c51b4329",
-      "bytes": 5735
+      "sha256": "e44419ccc1677122b92fe19a21fbfc6f67dbc4dc238fd740ac6a392b59a84ba7",
+      "bytes": 6072
     },
     {
       "path": "SAFETY_REVIEW_RESULT.md",
@@ -85,8 +85,8 @@
     },
     {
       "path": "README.ja.md",
-      "sha256": "26e4751e4b8f78e57787062953186b8eaaef5765a789b6d03f41ac6e8416f18e",
-      "bytes": 29620
+      "sha256": "ee323aec4792229f6a6993c345170129d8a96cc124c3f7ea2d528cd8245d1c57",
+      "bytes": 30009
     },
     {
       "path": "name_tag_approval.py",
@@ -120,13 +120,13 @@
     },
     {
       "path": "name_tag_ledger.py",
-      "sha256": "39ff9159fd5a69c8e46668e6be60671d67336b22494efa49b48ad96a79e7a04a",
-      "bytes": 64882
+      "sha256": "47cc0cffe0e8147545f30d73dcaaf34f634181332a5ef6cada05bedbc739b984",
+      "bytes": 65060
     },
     {
       "path": "name_tag_ledger_anchor.py",
-      "sha256": "f6c78a15b181efb4837523c97192843d13dd62d8a01625562d773086eca3b343",
-      "bytes": 6027
+      "sha256": "3e026dc1b8b9dcee8037ef9458d5189c6fe0c4eeb2ca4ddd219184497055d202",
+      "bytes": 7013
     },
     {
       "path": "name_tag_ledger_cli.py",
@@ -150,8 +150,8 @@
     },
     {
       "path": "test_name_tag_ledger_anchor.py",
-      "sha256": "c6a76de8b6b4f7d161f9469e2c0d98b1b69d4b29816caa058b16fd03799543bd",
-      "bytes": 6821
+      "sha256": "458d506cc7a6b68b4fb09838587f8e4ffdde3738154dd59537a27c43cc7b710f",
+      "bytes": 6967
     },
     {
       "path": "test_name_tag_ledger_cli.py",
@@ -160,13 +160,13 @@
     },
     {
       "path": "test_name_tag_ledger_open.py",
-      "sha256": "c8f8e493ddbbe2ddd4ab08e18c684c12756ab60164a5e62840739403c18aeb2b",
-      "bytes": 5278
+      "sha256": "67bab86655bba9432fc6444662f55dbbd6c31954cf790e06b0a05d95b4cff6f4",
+      "bytes": 5907
     },
     {
       "path": "test_name_tag_ledger_provision.py",
-      "sha256": "9ddd5b9517c07036ea769e1fc7318b393a91d3caaad2e2249ab7590fa17e3be4",
-      "bytes": 6086
+      "sha256": "6237ecb5812c5df21c2143f9b2a970fb29215f8b9f3adb4dba0d7c9c4b89223c",
+      "bytes": 6105
     },
     {
       "path": "name_tag_execution.py",

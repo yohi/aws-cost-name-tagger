@@ -56,7 +56,7 @@ class LedgerProvisionTests(unittest.TestCase):
         self.assertEqual(path.stat().st_uid, os.geteuid())
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         host_binding = ledger.ledger_host_binding(path)
-        instance_id = anchor.read_ledger_anchor(path, host_binding)
+        instance_id = anchor.read_ledger_anchor(path, host_binding).ledger_instance_id
         with sqlite3.connect(path) as connection:
             metadata = dict(connection.execute("SELECT key, value FROM ledger_meta"))
         self.assertEqual(metadata["host_binding"], host_binding)

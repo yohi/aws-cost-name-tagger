@@ -35,6 +35,8 @@ class LedgerAnchorTests(unittest.TestCase):
             "ledger_path": str(self.ledger_path.resolve(strict=False)),
             "host_binding": self.host_binding,
             "ledger_instance_id": self.instance_id,
+            "ledger_device": 2049,
+            "ledger_inode": 12345,
         }
 
     def _write_anchor(self, raw: bytes) -> Path:
@@ -66,14 +68,15 @@ class LedgerAnchorTests(unittest.TestCase):
 
     def test_valid_anchor_returns_ledger_instance_id(self) -> None:
         self._write_anchor(json.dumps(self._document()).encode("utf-8"))
-        self.assertEqual(self._read_anchor(), self.instance_id)
+        self.assertEqual(self._read_anchor().ledger_instance_id, self.instance_id)
 
     def test_duplicate_json_key_is_rejected(self) -> None:
         duplicate = (
             '{"schema_version":1,"schema_version":1,'
             f'"ledger_path":"{self.ledger_path.resolve()}",'
             f'"host_binding":"{self.host_binding}",'
-            f'"ledger_instance_id":"{self.instance_id}"'
+            f'"ledger_instance_id":"{self.instance_id}",'
+            '"ledger_device":2049,"ledger_inode":12345'
             '}'
         )
         self._write_anchor(duplicate.encode("utf-8"))
