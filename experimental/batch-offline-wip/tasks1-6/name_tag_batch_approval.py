@@ -30,7 +30,7 @@ def _canonical(v):
         return json.dumps(v,ensure_ascii=False,separators=(',',':'))
     if type(v) in (list,tuple):return '['+','.join(_canonical(x) for x in v)+']'
     if type(v) is dict:
-        if any(type(k) is not str or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*',k,flags=re.ASCII) for k in v):
+        if any(type(k) is not str or not re.fullmatch(r'[A-Za-z]\w*',k,flags=re.ASCII) for k in v):
             raise BatchAuthRejected()
         return '{'+','.join(_canonical(k)+':'+_canonical(v[k]) for k in sorted(v))+'}'
     raise BatchAuthRejected()
@@ -148,14 +148,14 @@ def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope
         now=now_utc.astimezone(timezone.utc)
         if not _timestamp(payload['issued_at_utc'])<=now<_timestamp(payload['expires_at_utc']):raise BatchAuthRejected()
         entries=trust._owners.get(payload['owner_principal_id'],{})
-        allowed={fp for fp,owner in entries.items() if not owner.revoked and owner.role=='batch-approver'}
+        allowed=set(fp for fp,owner in entries.items() if not owner.revoked and owner.role=='batch-approver')
         if payload['owner_key_fingerprint'] not in allowed:raise BatchAuthRejected()
         lines=_select_signer_lines(trust._check_file(),payload['owner_principal_id'],allowed)
         signature=base64.b64decode(envelope['signature_ref'],validate=True)
         actual=_verify_signature(signature,can,payload['owner_principal_id'],BATCH_NAMESPACE,lines)
         if actual!=payload['owner_key_fingerprint']:raise BatchAuthRejected()
         return VerifiedBatchApproval(bytes(signed_batch_envelope),can,envelope['batch_id'],MappingProxyType(dict(payload)),bytes(plan_bytes),bytes(csv_bytes),draft.approved_rows,payload['owner_principal_id'],envelope['signature_ref'])
-    except (BatchAuthRejected,BatchValidationError,ValueError,TypeError,KeyError,ImportError,OSError,AttributeError,FileNotFoundError) as e:
+    except (ValueError,TypeError,KeyError,ImportError,OSError,AttributeError) as e:
         raise BatchAuthRejected() from e
 
 

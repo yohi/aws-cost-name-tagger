@@ -22,26 +22,47 @@ def validated_cur_population(p):
         raise ReportBlocked('Wrong CUR population schema')
     recognised=('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')
     lines=('unattributable_cur','outside_requested_kinds','unsupported_kind')
-    for k in recognised:
-        row=c[k]
-        if type(row) is not dict or set(row)!={'count','cost_usd'} or type(row['count']) is not int or row['count']<0:
-            raise ReportBlocked('Malformed resource population')
-        _cost(row['cost_usd'])
-    for k in lines:
-        row=c[k]
-        if type(row) is not dict or set(row)!={'known','billing_rows','cost_usd'} or type(row['known']) is not bool:
-            raise ReportBlocked('Malformed billing population')
-        if row['known']:
-            if type(row['billing_rows']) is not int or row['billing_rows']<0:raise ReportBlocked('Bad billing row count')
-            _cost(row['cost_usd'])
-        elif row['billing_rows'] is not None or row['cost_usd'] is not None:raise ReportBlocked('Unknown must use null')
-    def resource_eq(a,b,c0):
-        return c[a]['count']==c[b]['count']+c[c0]['count'] and _cost(c[a]['cost_usd'])==_sum_exact(_cost(c[b]['cost_usd']),_cost(c[c0]['cost_usd']))
-    if not resource_eq('cur_recognized','below_min_cost','above_min_cost') or not resource_eq('above_min_cost','lookup_selected','max_resources_not_inspected'):
+    _validate_resource_population(c,recognised)
+    _validate_billing_population(c,lines)
+    if not _population_totals_match(c):
         raise ReportBlocked('CUR exact cost or count mismatch')
     if type(p.get('count')) is not int or p['count']!=len(p.get('records',[])) or p['count']!=c['lookup_selected']['count']:
         raise ReportBlocked('Selected Plan records mismatch')
     return c
+
+
+def _validate_resource_population(population,names):
+    for name in names:
+        row=population[name]
+        if type(row) is not dict or set(row)!={'count','cost_usd'} or type(row['count']) is not int or row['count']<0:
+            raise ReportBlocked('Malformed resource population')
+        _cost(row['cost_usd'])
+
+
+def _validate_billing_population(population,names):
+    for name in names:
+        row=population[name]
+        if type(row) is not dict or set(row)!={'known','billing_rows','cost_usd'} or type(row['known']) is not bool:
+            raise ReportBlocked('Malformed billing population')
+        _validate_billing_row(row)
+
+
+def _validate_billing_row(row):
+    if row['known']:
+        if type(row['billing_rows']) is not int or row['billing_rows']<0:raise ReportBlocked('Bad billing row count')
+        _cost(row['cost_usd'])
+    elif row['billing_rows'] is not None or row['cost_usd'] is not None:
+        raise ReportBlocked('Unknown must use null')
+
+
+def _resource_totals_match(population,total,first,second):
+    return (population[total]['count']==population[first]['count']+population[second]['count']
+            and _cost(population[total]['cost_usd'])==_sum_exact(_cost(population[first]['cost_usd']),_cost(population[second]['cost_usd'])))
+
+
+def _population_totals_match(population):
+    return (_resource_totals_match(population,'cur_recognized','below_min_cost','above_min_cost')
+            and _resource_totals_match(population,'above_min_cost','lookup_selected','max_resources_not_inspected'))
 
 
 def _cost(s):
@@ -66,13 +87,13 @@ def _report(draft,authentication_state):
             'cur_population':c}
 
 
-def build_batch_dry_run(plan_bytes:bytes,csv_bytes:bytes,*,report=None):
+def build_batch_dry_run(plan_bytes:bytes,csv_bytes:bytes):
     # Unsigned preview: no ledger, trust, STS, credentials or SDK imports.
     try:return _report(validate_batch_draft(plan_bytes,csv_bytes),'UNSIGNED_PREVIEW')
     except (BatchValidationError,ReportBlocked) as e:raise ReportBlocked(str(e)) from e
 
 
-def make_authenticated_batch_report(batch:VerifiedBatchApproval,*,plan_bytes:bytes,csv_bytes:bytes,report=None,trust=None,now_utc:datetime|None=None):
+def make_authenticated_batch_report(batch:VerifiedBatchApproval,*,plan_bytes:bytes,csv_bytes:bytes,trust=None,now_utc:datetime|None=None):
     if type(batch) is not VerifiedBatchApproval or plan_bytes!=batch.plan_bytes or csv_bytes!=batch.csv_bytes:
         raise ReportBlocked('Foreign Plan/CSV bytes')
     if batch.payload.get('plan_sha256')!=sha256(plan_bytes).hexdigest() or batch.payload.get('csv_sha256')!=sha256(csv_bytes).hexdigest():

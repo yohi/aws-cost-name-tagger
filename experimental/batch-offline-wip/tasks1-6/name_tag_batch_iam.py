@@ -35,19 +35,7 @@ def build_subset_session_policy(batch:VerifiedBatchApproval,row_indexes:tuple[in
         raise IAMPolicyBlocked('Subset indexes must be sorted, unique and approved')
     write_actions=set();read_actions=set();arns=set()
     for i in row_indexes:
-        row=batch.approved_rows[i]
-        kind=row.get('kind');policy=kind_registry.get(kind)
-        if not isinstance(policy,KindPolicy) or kind!='volume' or policy!=KindPolicy('ec2:CreateTags','ec2:DescribeVolumes'):
-            raise IAMPolicyBlocked('No proven Name-only policy for this service/kind')
-        account=batch.payload.get('account');partition=batch.payload.get('partition');region=row.get('region')
-        arn=row.get('resource_arn')
-        if not all(isinstance(v,str) and v for v in (account,partition,region,arn)):
-            raise IAMPolicyBlocked('Incomplete ARN scope')
-        prefix=f'arn:{partition}:ec2:{region}:{account}:volume/'
-        if not arn.startswith(prefix) or not re.fullmatch(r'vol-[A-Za-z0-9]+',arn[len(prefix):]):
-            raise IAMPolicyBlocked('Foreign or malformed volume ARN')
-        if row.get('aws_operation')!=policy.write_action or not row.get('approved_name'):
-            raise IAMPolicyBlocked('Operation/Name not authorized')
+        policy,arn=_validate_policy_row(batch,batch.approved_rows[i],kind_registry)
         write_actions.add(policy.write_action);read_actions.add(policy.read_action);arns.add(arn)
     policy={
       'Version':'2012-10-17',
@@ -59,3 +47,23 @@ def build_subset_session_policy(batch:VerifiedBatchApproval,row_indexes:tuple[in
     raw=json.dumps(policy,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
     if len(raw)>2048:raise IAMPolicyBlocked('Session-policy plaintext limit exceeded')
     return SessionPolicySpec(batch.batch_id,row_indexes,raw,sha256(raw).hexdigest(),tuple(sorted(arns)),tuple(sorted(write_actions)),tuple(sorted(read_actions)))
+
+
+def _validate_policy_row(batch,row,kind_registry):
+    kind=row.get('kind')
+    policy=kind_registry.get(kind)
+    expected=KindPolicy('ec2:CreateTags','ec2:DescribeVolumes')
+    if not isinstance(policy,KindPolicy) or kind!='volume' or policy!=expected:
+        raise IAMPolicyBlocked('No proven Name-only policy for this service/kind')
+    account=batch.payload.get('account')
+    partition=batch.payload.get('partition')
+    region=row.get('region')
+    arn=row.get('resource_arn')
+    if not all(isinstance(value,str) and value for value in (account,partition,region,arn)):
+        raise IAMPolicyBlocked('Incomplete ARN scope')
+    prefix=f'arn:{partition}:ec2:{region}:{account}:volume/'
+    if not arn.startswith(prefix) or not re.fullmatch(r'vol-[A-Za-z0-9]+',arn[len(prefix):]):
+        raise IAMPolicyBlocked('Foreign or malformed volume ARN')
+    if row.get('aws_operation')!=policy.write_action or not row.get('approved_name'):
+        raise IAMPolicyBlocked('Operation/Name not authorized')
+    return policy,arn

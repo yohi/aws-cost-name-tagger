@@ -25,27 +25,29 @@ def _canonical_decimal(value: Decimal) -> str:
 
 def exact_add(values) -> Decimal:
     """Sum finite decimal values using unbounded integer coefficients, never rounded Decimal +."""
-    items=[]
-    for value in values:
-        if isinstance(value,float):
-            raise ValueError('Float is not a valid exact monetary source')
-        try:
-            amount=Decimal(value) if isinstance(value,(str,int,Decimal)) else None
-        except InvalidOperation as e:
-            raise ValueError('Invalid CUR monetary string') from e
-        if amount is None or not amount.is_finite():
-            raise ValueError('CUR monetary amount must be finite decimal')
-        sign,digits,exp=amount.as_tuple()
-        if abs(exp)>1000 or len(digits)>1000:
-            raise CurBudgetExceeded('CUR decimal scale/precision budget exceeded')
-        n=int(''.join(map(str,digits))) if digits else 0
-        items.append((-n if sign else n,exp))
+    items=[_decimal_coefficient(value) for value in values]
     if not items:return Decimal(0)
     scale=min(exp for _,exp in items)
     total=sum(n*10**(exp-scale) for n,exp in items)
     if total==0:return Decimal(0)
     digits=tuple(int(c) for c in str(abs(total)))
     return Decimal((1 if total<0 else 0,digits,scale))
+
+
+def _decimal_coefficient(value):
+    if isinstance(value,float):
+        raise ValueError('Float is not a valid exact monetary source')
+    try:
+        amount=Decimal(value) if isinstance(value,(str,int,Decimal)) else None
+    except InvalidOperation as error:
+        raise ValueError('Invalid CUR monetary string') from error
+    if amount is None or not amount.is_finite():
+        raise ValueError('CUR monetary amount must be finite decimal')
+    sign,digits,exp=amount.as_tuple()
+    if abs(exp)>1000 or len(digits)>1000:
+        raise CurBudgetExceeded('CUR decimal scale/precision budget exceeded')
+    coefficient=int(''.join(map(str,digits))) if digits else 0
+    return (-coefficient if sign else coefficient,exp)
 
 
 def decimal_cost_of(row: Mapping[str,object]) -> Decimal:
@@ -69,6 +71,10 @@ def classify_cur_row(row,*,account,kind_filter,rid_class):
         kind,locator,arn_region=rid_class(raw)
     except (ValueError,TypeError):
         return 'UNATTRIBUTABLE_CUR','INVALID_RESOURCE_ID',None
+    return _classify_cur_identity(row,raw,kind,locator,arn_region,account,kind_filter)
+
+
+def _classify_cur_identity(row,raw,kind,locator,arn_region,account,kind_filter):
     if kind=='unsupported':
         return 'UNSUPPORTED_KIND','UNSUPPORTED_RESOURCE_KIND',None
     if kind_filter is not None and kind not in kind_filter:
@@ -127,20 +133,33 @@ def validate_signed_population(plan:dict)->dict:
         if not d.is_finite() or _canonical_decimal(d)!=value:
             raise ValueError('Noncanonical decimal cost')
         return d
-    for name in kind_counts:
-        record=c[name]
-        if type(record) is not dict or set(record)!={'count','cost_usd'} or type(record['count']) is not int or record['count']<0:
-            raise ValueError('Invalid recognized resource summary')
-        cost(record['cost_usd'])
-    for name in billing:
-        record=c[name]
-        if type(record) is not dict or set(record)!={'known','billing_rows','cost_usd'} or record['known'] is not True or type(record['billing_rows']) is not int or record['billing_rows']<0:
-            raise ValueError('Unknown/incomplete billing class')
-        cost(record['cost_usd'])
-    def eql(a,b,c0):
-        return c[a]['count']==c[b]['count']+c[c0]['count'] and cost(c[a]['cost_usd'])==exact_add((cost(c[b]['cost_usd']),cost(c[c0]['cost_usd'])))
-    if not eql('cur_recognized','below_min_cost','above_min_cost') or not eql('above_min_cost','lookup_selected','max_resources_not_inspected'):
+    _validate_resource_summaries(c,kind_counts,cost)
+    _validate_billing_summaries(c,billing,cost)
+    if not _population_is_conserved(c,cost):
         raise ValueError('Inexact CUR population conservation')
     if type(plan.get('count')) is not int or plan['count']!=len(plan.get('records',[])) or plan['count']!=c['lookup_selected']['count']:
         raise ValueError('Selected records contradict signed population')
     return c
+
+
+def _validate_resource_summaries(population,names,cost):
+    for name in names:
+        record=population[name]
+        if type(record) is not dict or set(record)!={'count','cost_usd'} or type(record['count']) is not int or record['count']<0:
+            raise ValueError('Invalid recognized resource summary')
+        cost(record['cost_usd'])
+
+
+def _validate_billing_summaries(population,names,cost):
+    for name in names:
+        record=population[name]
+        if type(record) is not dict or set(record)!={'known','billing_rows','cost_usd'} or record['known'] is not True or type(record['billing_rows']) is not int or record['billing_rows']<0:
+            raise ValueError('Unknown/incomplete billing class')
+        cost(record['cost_usd'])
+
+
+def _population_is_conserved(population,cost):
+    def matches(total,first,second):
+        return (population[total]['count']==population[first]['count']+population[second]['count']
+                and cost(population[total]['cost_usd'])==exact_add((cost(population[first]['cost_usd']),cost(population[second]['cost_usd']))))
+    return matches('cur_recognized','below_min_cost','above_min_cost') and matches('above_min_cost','lookup_selected','max_resources_not_inspected')

@@ -28,6 +28,8 @@ python -m unittest discover -v
 
 These tests validate only the included standalone modules, **not** the original repository tests or all implementation-plan acceptance criteria. Do not interpret their success as Production/Task7/AWS-Write readiness.
 
+The offline CLI resolves every input and output path against its invocation directory and rejects paths (including symlinks) that resolve outside it. Run the CLI from the private directory containing the Plan, review CSV, and intended outputs.
+
 ## Preserve the existing holds
 
 ```text

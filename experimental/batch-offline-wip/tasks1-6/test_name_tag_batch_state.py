@@ -32,8 +32,10 @@ class StateTests(unittest.TestCase):
         draft=validate_batch_draft(pb,approved)
         self.assertEqual(len(draft.approved_rows),1)
         self.assertEqual(draft.approved_rows[0]['writer_control_scope_id'],'fixed-scope')
-        with self.assertRaises(BatchValidationError):validate_batch_draft(pb,approved.replace(b'Meaningful-Name',b'Changed-Name'))
-        with self.assertRaises(BatchValidationError):validate_batch_draft(pb,approved.replace(b'YES,proposal-1',b'Y,proposal-1'))
+        altered_name=approved.replace(b'Meaningful-Name',b'Changed-Name')
+        with self.assertRaises(BatchValidationError):validate_batch_draft(pb,altered_name)
+        invalid_approval=approved.replace(b'YES,proposal-1',b'Y,proposal-1')
+        with self.assertRaises(BatchValidationError):validate_batch_draft(pb,invalid_approval)
 
 if __name__=='__main__':unittest.main()
 

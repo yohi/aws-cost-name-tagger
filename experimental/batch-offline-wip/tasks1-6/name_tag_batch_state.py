@@ -29,14 +29,23 @@ class BatchDraft:
 def classify_batch_name(tags:object)->NameObservation:
     if tags is None:return NameObservation('UNKNOWN',None,None)
     if isinstance(tags,list):
-        d={}
-        for t in tags:
-            if not isinstance(t,dict) or set(t)!={'Key','Value'} or not isinstance(t['Key'],str) or not isinstance(t['Value'],str) or t['Key'] in d:
-                return NameObservation('UNKNOWN',None,None)
-            d[t['Key']]=t['Value']
-        tags=d
+        tags=_mapping_from_tag_list(tags)
+        if tags is None:return NameObservation('UNKNOWN',None,None)
     if not isinstance(tags,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in tags.items()):
         return NameObservation('UNKNOWN',None,None)
+    return _classify_name_mapping(tags)
+
+
+def _mapping_from_tag_list(items):
+    tags={}
+    for item in items:
+        if not isinstance(item,dict) or set(item)!={'Key','Value'} or not isinstance(item['Key'],str) or not isinstance(item['Value'],str) or item['Key'] in tags:
+            return None
+        tags[item['Key']]=item['Value']
+    return tags
+
+
+def _classify_name_mapping(tags):
     if any(k.casefold()=='name' and k!='Name' for k in tags):
         return NameObservation('UNKNOWN',None,None)
     if 'Name' not in tags:return NameObservation('ABSENT',False,None)
@@ -53,28 +62,41 @@ def _parse_plan(data:bytes)->dict:
     try:
         if type(data) is not bytes: raise ValueError('not bytes')
         p=json.loads(data.decode('utf-8'),object_pairs_hook=_unique_object)
-        if type(p) is not dict or type(p.get('schema_version')) is not int or p['schema_version']!=3:raise ValueError('not Batch Plan v3')
-        if type(p.get('records')) is not list or type(p.get('count')) is not int or len(p['records'])!=p['count']:raise ValueError('bad records')
-        lim=p['execution_limits'];n=lim['max_send_attempts']
-        if type(lim) is not dict or set(lim)!={'max_send_attempts'} or type(n) is not int or not 1<=n<=20:raise ValueError('bad cap')
-        scopes=p.get('scope_declarations')
-        if type(scopes) is not list or not scopes:raise ValueError('missing scopes')
-        ids=[];members=set()
-        for s in scopes:
-            if type(s) is not dict or set(s)!={'writer_control_scope_id','account','partition','region','resource_arns'}:raise ValueError('bad scope')
-            sid=s['writer_control_scope_id'];rs=s['resource_arns']
-            if not isinstance(sid,str) or not sid or not re.fullmatch(r'\d{12}',s['account']) or s['partition'] not in ('aws','aws-cn','aws-us-gov') or not isinstance(s['region'],str) or not s['region']:raise ValueError('bad scope identity')
-            if type(rs) is not list or not rs or rs!=sorted(set(rs)) or any(not isinstance(r,str) or not r.startswith('arn:') for r in rs):raise ValueError('bad scope resources')
-            ids.append(sid)
-            for arn in rs:
-                identity=(s['account'],s['partition'],s['region'],arn)
-                if identity in members:raise ValueError('overlapping scopes')
-                members.add(identity)
-        if ids!=sorted(set(ids)):raise ValueError('unsorted/duplicate scopes')
-        from name_tag_batch_population import validate_signed_population
-        validate_signed_population(p)
+        _validate_plan_structure(p)
         return p
-    except (KeyError,TypeError,ValueError,UnicodeError,json.JSONDecodeError) as e:raise BatchValidationError('Invalid Batch Plan: '+str(e)) from e
+    except (KeyError,TypeError,ValueError) as e:raise BatchValidationError('Invalid Batch Plan: '+str(e)) from e
+
+
+def _validate_plan_structure(plan):
+    if type(plan) is not dict or type(plan.get('schema_version')) is not int or plan['schema_version']!=3:raise ValueError('not Batch Plan v3')
+    if type(plan.get('records')) is not list or type(plan.get('count')) is not int or len(plan['records'])!=plan['count']:raise ValueError('bad records')
+    limits=plan['execution_limits']
+    if type(limits) is not dict or set(limits)!={'max_send_attempts'} or type(limits['max_send_attempts']) is not int or not 1<=limits['max_send_attempts']<=20:raise ValueError('bad cap')
+    _validate_scope_declarations(plan.get('scope_declarations'))
+    from name_tag_batch_population import validate_signed_population
+    validate_signed_population(plan)
+
+
+def _validate_scope_declarations(scopes):
+    if type(scopes) is not list or not scopes:raise ValueError('missing scopes')
+    ids=[]
+    members=set()
+    for scope in scopes:
+        if type(scope) is not dict or set(scope)!={'writer_control_scope_id','account','partition','region','resource_arns'}:raise ValueError('bad scope')
+        scope_id=scope['writer_control_scope_id']
+        resources=scope['resource_arns']
+        if not isinstance(scope_id,str) or not scope_id or not re.fullmatch(r'\d{12}',scope['account']) or scope['partition'] not in ('aws','aws-cn','aws-us-gov') or not isinstance(scope['region'],str) or not scope['region']:raise ValueError('bad scope identity')
+        if type(resources) is not list or not resources or resources!=sorted(set(resources)) or any(not isinstance(resource,str) or not resource.startswith('arn:') for resource in resources):raise ValueError('bad scope resources')
+        ids.append(scope_id)
+        _add_scope_members(members,scope,resources)
+    if ids!=sorted(set(ids)):raise ValueError('unsorted/duplicate scopes')
+
+
+def _add_scope_members(members,scope,resources):
+    for arn in resources:
+        identity=(scope['account'],scope['partition'],scope['region'],arn)
+        if identity in members:raise ValueError('overlapping scopes')
+        members.add(identity)
 
 
 def _unique_object(pairs):
@@ -88,7 +110,9 @@ def _unique_object(pairs):
 def _csv_value(r,field):
     v=r.get(field)
     if field=='name_key_present':
-        return 'true' if v is True else 'false' if v is False else ''
+        if v is True:return 'true'
+        if v is False:return 'false'
+        return ''
     return '' if v is None else str(v)
 
 

@@ -2,6 +2,11 @@ test_prep_is_unsigned_and_canonical (test_name_tag_batch_approval.BatchApprovalT
 test_self_attested_claim_is_not_auth (test_name_tag_batch_approval.BatchApprovalTests.test_self_attested_claim_is_not_auth) ... ok
 test_dryrun_writes_only_explicit_report (test_name_tag_batch_cli.CliTests.test_dryrun_writes_only_explicit_report) ... BLOCKED (offline): BLOCKED_OWNER_AUTHN: protected trust/ledger integration unavailable
 ok
+test_rejects_input_path_outside_current_directory (test_name_tag_batch_cli.CliTests.test_rejects_input_path_outside_current_directory) ... ok
+test_rejects_output_path_outside_current_directory (test_name_tag_batch_cli.CliTests.test_rejects_output_path_outside_current_directory) ... ok
+test_rejects_prepare_manifest_path_outside_current_directory (test_name_tag_batch_cli.CliTests.test_rejects_prepare_manifest_path_outside_current_directory) ... ok
+test_rejects_prepare_payload_path_outside_current_directory (test_name_tag_batch_cli.CliTests.test_rejects_prepare_payload_path_outside_current_directory) ... ok
+test_rejects_symlink_target_outside_current_directory (test_name_tag_batch_cli.CliTests.test_rejects_symlink_target_outside_current_directory) ... ok
 test_presend_name_change_skips_not_consume (test_name_tag_batch_executor.ExecutorFixtureTests.test_presend_name_change_skips_not_consume) ... ok
 test_readback_unknown_prevents_second_row (test_name_tag_batch_executor.ExecutorFixtureTests.test_readback_unknown_prevents_second_row) ... ok
 test_two_rows_with_cap_one (test_name_tag_batch_executor.ExecutorFixtureTests.test_two_rows_with_cap_one) ... ok
@@ -24,6 +29,6 @@ test_csv_exact_and_approved_eligibility (test_name_tag_batch_state.StateTests.te
 test_exact_name_observations (test_name_tag_batch_state.StateTests.test_exact_name_observations) ... ok
 
 ----------------------------------------------------------------------
-Ran 23 tests in 0.162s
+Ran 28 tests in 0.043s
 
 OK

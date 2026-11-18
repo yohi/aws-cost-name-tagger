@@ -67,7 +67,7 @@ class OfflineFixtureBatchLedger:
             self.conn.execute('BEGIN IMMEDIATE')
             yield
             if self.conn.in_transaction:self.conn.execute('COMMIT')
-        except (Exception,BaseException):
+        except BaseException:
             if self.conn.in_transaction:self.conn.execute('ROLLBACK')
             raise
     def _meta(self,id):

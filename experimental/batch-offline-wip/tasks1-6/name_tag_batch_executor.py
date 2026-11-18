@@ -49,44 +49,55 @@ def simulate_untrusted_fixture(batch_id,nonce,approved_rows,*,ledger:OfflineFixt
             ledger.classify_cap(batch_id)
             outcomes.extend(['NOT_ATTEMPTED_CAP']*(len(approved_rows)-i))
             break
-        scope=row['writer_control_scope_id']
-        arn=row['resource_arn']
-        authority=f'test-fixture:{batch_id}:{i}'
-        try:
-            current=adapter.read_current(arn)
-            obs=classify_batch_name(current)
-            if obs.state=='UNKNOWN':
-                ledger.stop(batch_id,'BLOCKED_NAME_UNKNOWN')
-                outcomes.append('BLOCKED_NAME_UNKNOWN')
-                break
-            if obs.state!=row['name_state'] or obs.name_raw_value!=row['name_raw_value']:
-                ledger.presend_skip(batch_id,i,scope,authority,'SKIPPED_NAME_CHANGED')
-                outcomes.append('SKIPPED_NAME_CHANGED')
-                continue
-            ledger.admit(batch_id,i,scope,authority)
-            ledger.consume(batch_id,i)  # durable BEFORE any write callback
-            try:
-                adapter.write_once(arn,row['approved_name'])
-                actual=classify_batch_name(adapter.readback(arn))
-                outcome='APPLIED_VERIFIED' if actual.name_raw_value==row['approved_name'] else 'OUTCOME_UNKNOWN'
-            except OSError:
-                outcome='OUTCOME_UNKNOWN'
-            ledger.readback(batch_id,i,outcome)
-            outcomes.append(outcome)
-            if outcome=='OUTCOME_UNKNOWN':break
-        except (LedgerBlocked,OSError):
-            if ledger.state(batch_id)=='ACTIVE':ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
-            outcomes.append('BLOCKED_SCOPE_STATE_UNKNOWN')
-            break
-    if ledger.state(batch_id)=='ACTIVE':
-        if ledger.counter(batch_id)>=cap and ledger.dispositions(batch_id)==[] and len(outcomes)<len(approved_rows):
-            ledger.classify_cap(batch_id)
-        elif len(outcomes)==len(approved_rows):
-            ledger.complete(batch_id)
+        outcome,stop=_execute_fixture_row(batch_id,i,row,ledger,adapter)
+        outcomes.append(outcome)
+        if stop:break
+    _finish_fixture_batch(batch_id,cap,approved_rows,outcomes,ledger)
     return {'authentication_state':'SYNTHETIC_TEST_ONLY','execution_allowed':False,
             'batch_state':ledger.state(batch_id),'send_attempts_consumed':ledger.counter(batch_id),
             'outcomes':outcomes,
             'writes_complete':ledger.state(batch_id)=='COMPLETED' and len(outcomes)==len(approved_rows) and all(o=='APPLIED_VERIFIED' for o in outcomes)}
+
+
+def _execute_fixture_row(batch_id,index,row,ledger,adapter):
+    scope=row['writer_control_scope_id']
+    arn=row['resource_arn']
+    authority=f'test-fixture:{batch_id}:{index}'
+    try:
+        observation=classify_batch_name(adapter.read_current(arn))
+        if observation.state=='UNKNOWN':
+            ledger.stop(batch_id,'BLOCKED_NAME_UNKNOWN')
+            return 'BLOCKED_NAME_UNKNOWN',True
+        changed=(observation.state!=row['name_state'] or observation.name_raw_value!=row['name_raw_value'])
+        if changed:
+            ledger.presend_skip(batch_id,index,scope,authority,'SKIPPED_NAME_CHANGED')
+            return 'SKIPPED_NAME_CHANGED',False
+        ledger.admit(batch_id,index,scope,authority)
+        ledger.consume(batch_id,index)  # durable BEFORE any write callback
+        outcome=_write_and_readback(arn,row['approved_name'],adapter)
+        ledger.readback(batch_id,index,outcome)
+        return outcome,outcome=='OUTCOME_UNKNOWN'
+    except (LedgerBlocked,OSError):
+        if ledger.state(batch_id)=='ACTIVE':ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
+        return 'BLOCKED_SCOPE_STATE_UNKNOWN',True
+
+
+def _write_and_readback(arn,name,adapter):
+    try:
+        adapter.write_once(arn,name)
+        observation=classify_batch_name(adapter.readback(arn))
+    except OSError:
+        return 'OUTCOME_UNKNOWN'
+    return 'APPLIED_VERIFIED' if observation.name_raw_value==name else 'OUTCOME_UNKNOWN'
+
+
+def _finish_fixture_batch(batch_id,cap,approved_rows,outcomes,ledger):
+    if ledger.state(batch_id)!='ACTIVE':return
+    cap_exhausted=ledger.counter(batch_id)>=cap and ledger.dispositions(batch_id)==[] and len(outcomes)<len(approved_rows)
+    if cap_exhausted:
+        ledger.classify_cap(batch_id)
+    elif len(outcomes)==len(approved_rows):
+        ledger.complete(batch_id)
 
 
 def execute_batch_offline(*_args,**_kwargs):
