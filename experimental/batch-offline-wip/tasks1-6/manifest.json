@@ -1,0 +1,83 @@
+{
+  "files": {
+    "README.md": {
+      "sha256": "6317eb8d1b972f7ae959aec5672e680240191bd72665a4411133c390fdf91c61",
+      "size_bytes": 4241
+    },
+    "name_tag_batch_approval.py": {
+      "sha256": "9a80113542e9524c49e95cf39ca77d9dfb98e05825158007a4c1de92cdc40d21",
+      "size_bytes": 10073
+    },
+    "name_tag_batch_cli.py": {
+      "sha256": "cb2891d27f53fcecc403293e3cd6fe4cd87dc5b318a67268f9e9cda44a822a49",
+      "size_bytes": 3092
+    },
+    "name_tag_batch_credentials.py": {
+      "sha256": "3eff2665162b9c62ad1945d336d2893888026e22f4263b2ff0f8cf6d139c35c7",
+      "size_bytes": 1570
+    },
+    "name_tag_batch_executor.py": {
+      "sha256": "2cdb5e9f4e9ce8aafeabab13f6b7e3e02ef44c6de9f21f65de2103e11df1a049",
+      "size_bytes": 4765
+    },
+    "name_tag_batch_iam.py": {
+      "sha256": "9d83fc1a98ec08b7f4817b91fcf37adf7675d41f65933b08c6e8aab4ef1971c7",
+      "size_bytes": 3272
+    },
+    "name_tag_batch_ledger.py": {
+      "sha256": "2df24894222e04f35ef9645b2b8b5a36ff6638c069d7df8f3d2e8a71fac000da",
+      "size_bytes": 12272
+    },
+    "name_tag_batch_population.py": {
+      "sha256": "67da3f361a41a729bb715dc7d9e1cf8ec5787f0a48de02894cae0e5101a93f38",
+      "size_bytes": 7492
+    },
+    "name_tag_batch_report.py": {
+      "sha256": "bb3a0df3cd5971808eb492db16b28e4296f6e26c82d33b6a579f47389c8b2b91",
+      "size_bytes": 5072
+    },
+    "name_tag_batch_state.py": {
+      "sha256": "bd496c2fa9818731dba9465c5e3f6986385cfef8a3d7c2907f7b8baa5e3820a0",
+      "size_bytes": 9273
+    },
+    "test_helpers.py": {
+      "sha256": "7c34b27faeeed8324b817112aec129eff43f405641f40fcb78765ecde01d3598",
+      "size_bytes": 685
+    },
+    "test_name_tag_batch_approval.py": {
+      "sha256": "20b1674257359e98e06f37e6e79737023b2d7acfe132e40a729dde4c696f98f9",
+      "size_bytes": 2564
+    },
+    "test_name_tag_batch_cli.py": {
+      "sha256": "9d32b965c92eeea639cb4752e501a7678f37bdb72c2c61007bcd6eeb636b9be6",
+      "size_bytes": 2300
+    },
+    "test_name_tag_batch_executor.py": {
+      "sha256": "bae0da2dbf84c29bb5036264ed462e5107977c97d4dde8565f84c46cc520dd41",
+      "size_bytes": 2191
+    },
+    "test_name_tag_batch_iam.py": {
+      "sha256": "a9f565fcd3f82a9374225ca004999db510e64ff8cfe48df27be434e91f9d80e7",
+      "size_bytes": 2603
+    },
+    "test_name_tag_batch_ledger.py": {
+      "sha256": "9e286c58814427e1eb60f28822fed1a7441cdc2cc42a9999c62cf48170f14258",
+      "size_bytes": 3423
+    },
+    "test_name_tag_batch_population.py": {
+      "sha256": "b1e2500f50f9017b6878167be02b440daf5bd09b0888e5754c4713d65c5103b0",
+      "size_bytes": 2495
+    },
+    "test_name_tag_batch_report.py": {
+      "sha256": "333f3b3bd5b19f5d6a5e9933c2e4b17873a7d69da5a4aaac79ed46f999fd3335",
+      "size_bytes": 2594
+    },
+    "test_name_tag_batch_state.py": {
+      "sha256": "6b4932e5e0d0e28cd24e6c106de3ad01c116b39c495b78cb20c61f4d791ad61c",
+      "size_bytes": 3955
+    }
+  },
+  "reviewed_head": "23f995f1a481523b7b43f403166a234239d95c95",
+  "status": "PARTIAL_OFFLINE_WIP_ONLY",
+  "tests": "23/23 isolated tests PASS; original repository tests NOT RUN"
+}
