@@ -45,6 +45,10 @@ def _unique_pairs(pairs):
         result[k]=v
     return result
 
+
+def _reject_json_constant(value):
+    raise BatchAuthRejected()
+
 def _timestamp(s):
     if not isinstance(s,str) or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ',s):raise BatchAuthRejected()
     try:return datetime.fromisoformat(s.replace('Z','+00:00'))
@@ -136,7 +140,7 @@ def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope
         if not isinstance(trust,OwnerTrust) or type(now_utc) is not datetime or now_utc.tzinfo is None:
             raise BatchAuthRejected()
         envelope=json.loads(signed_batch_envelope.decode('utf-8'),object_pairs_hook=_unique_pairs,
-                            parse_constant=lambda _:(_ for _ in ()).throw(BatchAuthRejected()))
+                            parse_constant=_reject_json_constant)
         if type(envelope) is not dict or set(envelope)!={'payload','batch_id','signature_ref'}:raise BatchAuthRejected()
         payload=envelope['payload'];_validate_payload(payload)
         can=canonical_bytes(payload)
@@ -148,7 +152,7 @@ def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope
         now=now_utc.astimezone(timezone.utc)
         if not _timestamp(payload['issued_at_utc'])<=now<_timestamp(payload['expires_at_utc']):raise BatchAuthRejected()
         entries=trust._owners.get(payload['owner_principal_id'],{})
-        allowed=set(fp for fp,owner in entries.items() if not owner.revoked and owner.role=='batch-approver')
+        allowed={fp for fp,owner in entries.items() if not owner.revoked and owner.role=='batch-approver'}
         if payload['owner_key_fingerprint'] not in allowed:raise BatchAuthRejected()
         lines=_select_signer_lines(trust._check_file(),payload['owner_principal_id'],allowed)
         signature=base64.b64decode(envelope['signature_ref'],validate=True)
