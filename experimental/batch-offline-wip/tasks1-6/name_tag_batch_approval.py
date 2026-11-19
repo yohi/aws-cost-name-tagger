@@ -98,6 +98,7 @@ class VerifiedBatchApproval:
     plan_bytes:bytes
     csv_bytes:bytes
     approved_rows:tuple
+    approved_row_indexes:tuple[int,...]
     owner_principal_id:str
     signature_ref:str
 
@@ -158,7 +159,8 @@ def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope
         signature=base64.b64decode(envelope['signature_ref'],validate=True)
         actual=_verify_signature(signature,can,payload['owner_principal_id'],BATCH_NAMESPACE,lines)
         if actual!=payload['owner_key_fingerprint']:raise BatchAuthRejected()
-        return VerifiedBatchApproval(bytes(signed_batch_envelope),can,envelope['batch_id'],MappingProxyType(dict(payload)),bytes(plan_bytes),bytes(csv_bytes),draft.approved_rows,payload['owner_principal_id'],envelope['signature_ref'])
+        approved_tuples=_approved_tuples(draft)
+        return VerifiedBatchApproval(bytes(signed_batch_envelope),can,envelope['batch_id'],MappingProxyType(dict(payload)),bytes(plan_bytes),bytes(csv_bytes),draft.approved_rows,tuple(row[0] for row in approved_tuples),payload['owner_principal_id'],envelope['signature_ref'])
     except (ValueError,TypeError,KeyError,ImportError,OSError,AttributeError) as e:
         raise BatchAuthRejected() from e
 

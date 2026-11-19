@@ -17,7 +17,7 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(out['writes_complete'])
     def test_signed_report_refuses_foreign_bytes(self):
         import hashlib
-        b=VerifiedBatchApproval(b'fixture',b'p','a'*64,MappingProxyType({'plan_sha256':hashlib.sha256(self.pb).hexdigest(),'csv_sha256':hashlib.sha256(self.cb).hexdigest()}),self.pb,self.cb,(), 'owner','sig')
+        b=VerifiedBatchApproval(b'fixture',b'p','a'*64,MappingProxyType({'plan_sha256':hashlib.sha256(self.pb).hexdigest(),'csv_sha256':hashlib.sha256(self.cb).hexdigest()}),self.pb,self.cb,(),(), 'owner','sig')
         with self.assertRaises(ReportBlocked):make_authenticated_batch_report(b,plan_bytes=self.pb+b' ',csv_bytes=self.cb)
         with self.assertRaises(ReportBlocked):make_authenticated_batch_report(b,plan_bytes=self.pb,csv_bytes=self.cb) # missing fresh protected trust
 

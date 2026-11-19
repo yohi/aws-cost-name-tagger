@@ -31,11 +31,21 @@ class SessionPolicySpec:
 def build_subset_session_policy(batch:VerifiedBatchApproval,row_indexes:tuple[int,...],*,kind_registry:Mapping[str,KindPolicy])->SessionPolicySpec:
     if type(batch) is not VerifiedBatchApproval or type(row_indexes) is not tuple or not row_indexes:
         raise IAMPolicyBlocked('Missing verified batch/subset')
-    if len(set(row_indexes))!=len(row_indexes) or sorted(row_indexes)!=list(row_indexes) or any(type(i) is not int or i<0 or i>=len(batch.approved_rows) for i in row_indexes):
+    approved_indexes=batch.approved_row_indexes
+    if (type(approved_indexes) is not tuple
+            or len(approved_indexes)!=len(batch.approved_rows)
+            or any(type(i) is not int or i<0 for i in approved_indexes)
+            or len(set(approved_indexes))!=len(approved_indexes)
+            or sorted(approved_indexes)!=list(approved_indexes)):
+        raise IAMPolicyBlocked('Verified approved-row index mapping is invalid')
+    rows_by_csv_index=dict(zip(approved_indexes,batch.approved_rows,strict=True))
+    if (any(type(i) is not int or i not in rows_by_csv_index for i in row_indexes)
+            or len(set(row_indexes))!=len(row_indexes)
+            or sorted(row_indexes)!=list(row_indexes)):
         raise IAMPolicyBlocked('Subset indexes must be sorted, unique and approved')
     write_actions=set();read_actions=set();arns=set()
     for i in row_indexes:
-        policy,arn=_validate_policy_row(batch,batch.approved_rows[i],kind_registry)
+        policy,arn=_validate_policy_row(batch,rows_by_csv_index[i],kind_registry)
         write_actions.add(policy.write_action);read_actions.add(policy.read_action);arns.add(arn)
     policy={
       'Version':'2012-10-17',
