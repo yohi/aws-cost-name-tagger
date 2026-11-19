@@ -173,8 +173,9 @@ def revalidate_verified_batch(batch:VerifiedBatchApproval,*,trust:Any,now_utc:da
     return fresh
 
 
-def derive_batch_row_authority(batch:VerifiedBatchApproval,row_index:int)->VerifiedBatchRowAuthority:
+def derive_batch_row_authority(batch:VerifiedBatchApproval,row_index:int,*,trust:Any,now_utc:datetime)->VerifiedBatchRowAuthority:
     if type(batch) is not VerifiedBatchApproval or type(row_index) is not int:raise BatchAuthRejected()
+    batch=revalidate_verified_batch(batch,trust=trust,now_utc=now_utc)
     draft=validate_batch_draft(batch.plan_bytes,batch.csv_bytes)
     if row_index<0 or row_index>=len(draft.rows) or draft.rows[row_index]['approved']!='YES':raise BatchAuthRejected()
     row=draft.rows[row_index]

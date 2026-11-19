@@ -1,7 +1,9 @@
 from test_helpers import sample_population
 import unittest, json, hashlib
-from name_tag_batch_approval import (prepare_batch_approval, verify_batch_approval, BatchAuthRejected, BATCH_NAMESPACE)
+from datetime import datetime, timezone
+from name_tag_batch_approval import (prepare_batch_approval, verify_batch_approval, derive_batch_row_authority, VerifiedBatchApproval, BatchAuthRejected, BATCH_NAMESPACE)
 from name_tag_batch_state import build_batch_review_projection
+from types import MappingProxyType
 
 class BatchApprovalTests(unittest.TestCase):
     def setUp(self):
@@ -23,5 +25,9 @@ class BatchApprovalTests(unittest.TestCase):
         envelope=json.dumps({'payload':p.payload,'batch_id':p.batch_id,'signature_ref':'not-a-signature'}).encode()
         with self.assertRaises(BatchAuthRejected):verify_batch_approval(self.plan,self.csv,envelope,trust=None,now_utc=None)
         with self.assertRaises(BatchAuthRejected):verify_batch_approval(self.plan,self.csv,envelope,trust=object(),now_utc=None)
+    def test_forged_verified_batch_cannot_mint_row_authority(self):
+        forged=VerifiedBatchApproval(b'not-signed',b'not-canonical','fake-batch',MappingProxyType({'account':'123456789012','partition':'aws'}),self.plan,self.csv,({'fake':'row'},),(0,),'owner','fake-signature')
+        with self.assertRaises(BatchAuthRejected):
+            derive_batch_row_authority(forged,0,trust=None,now_utc=datetime(2026,11,19,tzinfo=timezone.utc))
 
 if __name__=='__main__': unittest.main()

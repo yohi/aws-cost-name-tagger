@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 from name_tag_batch_executor import InMemoryNameAdapter,simulate_untrusted_fixture
 from name_tag_batch_ledger import OfflineFixtureBatchLedger
+from name_tag_batch_ledger import LedgerBlocked
 
 class ExecutorFixtureTests(unittest.TestCase):
     def setUp(self):
@@ -16,6 +17,7 @@ class ExecutorFixtureTests(unittest.TestCase):
         result=simulate_untrusted_fixture('batch-1','nonce-1',self.rows,ledger=self.ledger,adapter=a,cap=1)
         self.assertEqual(a.write_calls,1)
         self.assertEqual(self.ledger.dispositions('batch-1'),[(1,'NOT_ATTEMPTED_CAP')])
+        self.assertEqual(result['batch_state'],'COMPLETED')
         self.assertEqual(result['authentication_state'],'SYNTHETIC_TEST_ONLY')
         self.assertFalse(result['writes_complete'])
     def test_readback_unknown_prevents_second_row(self):
@@ -34,6 +36,13 @@ class ExecutorFixtureTests(unittest.TestCase):
             result=simulate_untrusted_fixture('batch-stop','nonce-stop',self.rows,ledger=self.ledger,adapter=a,cap=2)
         self.assertEqual(result['outcomes'],['NOT_ATTEMPTED_BATCH_STOP','NOT_ATTEMPTED_BATCH_STOP'])
         self.assertEqual(a.write_calls,0)
+    def test_readback_ledger_failure_after_send_is_outcome_unknown(self):
+        a=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
+        with patch.object(self.ledger,'readback',side_effect=LedgerBlocked('fixture readback persistence failed')):
+            result=simulate_untrusted_fixture('batch-readback-failure','nonce-readback-failure',self.rows,ledger=self.ledger,adapter=a,cap=2)
+        self.assertEqual(a.write_calls,1)
+        self.assertEqual(result['outcomes'],['OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'])
+        self.assertEqual(result['batch_state'],'STOPPED')
     def test_presend_name_change_skips_not_consume(self):
         a=InMemoryNameAdapter({'volume-1':{'Name':'existing'},'volume-2':{}})
         result=simulate_untrusted_fixture('batch-3','nonce-3',self.rows,ledger=self.ledger,adapter=a,cap=2)
