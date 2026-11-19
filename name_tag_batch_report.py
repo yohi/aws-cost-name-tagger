@@ -80,87 +80,87 @@ def _cost(s):
     return x
 
 
-def _report(draft,authentication_state):
-    c=validated_cur_population(draft.plan)
-    reason_details=draft.plan.get('cur_population_reason_details',{})
-    if type(reason_details) is not dict:
+def _validated_reason_details(plan):
+    details=plan.get('cur_population_reason_details',{})
+    if type(details) is not dict:
         raise ReportBlocked('Malformed CUR classification reason details')
-    for key,value in reason_details.items():
+    for key,value in details.items():
         if (type(key) is not str or ':' not in key or type(value) is not dict
                 or set(value)!={'billing_rows','cost_usd'}
                 or type(value['billing_rows']) is not int or value['billing_rows']<0):
             raise ReportBlocked('Malformed CUR classification reason detail')
         _cost(value['cost_usd'])
+    return details
+
+
+def _report_row(row,row_index,plan):
+    arn=row.get('resource_arn')
+    expected_operation=_WRITE_OPERATIONS.get(row.get('kind'))
+    operation_supported=(expected_operation is not None
+                         and row.get('aws_operation')==expected_operation)
+    if expected_operation is None:
+        write_support='UNSUPPORTED_API'
+    elif operation_supported:
+        write_support='SUPPORTED_API'
+    else:
+        write_support='OPERATION_UNRESOLVED'
+    scope_id=None
+    scope_application='NOT_APPLIED'
+    if row.get('status')!='proposed':
+        scope_application='NOT_APPLICABLE'
+    elif operation_supported and isinstance(arn,str) and arn:
+        try:
+            scope_id=derive_declared_row_scope(plan,row)
+            scope_application='APPLIED'
+        except BatchValidationError as error:
+            if str(error)!='No unique Scope declaration':
+                raise ReportBlocked(str(error)) from error
+    evidence=row.get('evidence')
+    proposed_name=row.get('proposed_name')
+    if isinstance(proposed_name,str) and proposed_name:
+        name_generation_state='GENERATED'
+    elif (row.get('status')=='manual_review' and isinstance(evidence,str)
+          and 'Candidate lacks a structured Name namespace' in evidence):
+        name_generation_state='UNAVAILABLE'
+    elif isinstance(evidence,str) and evidence.startswith('Proposed Name collision in batch:'):
+        name_generation_state='COLLISION'
+    else:
+        name_generation_state='NOT_EVALUATED'
+    report_row={
+        'row_index':row_index,'proposal_id':row.get('proposal_id'),
+        'kind':row.get('kind'),'locator':row.get('locator'),'region':row.get('region'),
+        'resource_arn':arn,'writer_control_scope_id':scope_id,
+        'aws_operation':row.get('aws_operation'),'name_state':row.get('name_state'),
+        'name_key_present':row.get('name_key_present'),'name_raw_value':row.get('name_raw_value'),
+        'existing_name':row.get('existing_name'),'proposed_name':row.get('proposed_name'),
+        'name_generation_state':name_generation_state,'write_support':write_support,
+        'scope_application':scope_application,'approved':row.get('approved'),
+        'status':row.get('status'),'confidence':row.get('confidence'),
+        'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
+        'outcome':'NOT_ATTEMPTED_UNSIGNED_PREVIEW','execution_allowed':False,
+    }
+    unavailable=None
+    if name_generation_state=='UNAVAILABLE':
+        unavailable={
+            'proposal_id':row.get('proposal_id'),'kind':row.get('kind'),
+            'locator':row.get('locator'),'resource_arn':arn,
+            'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
+            'reason':row.get('evidence'),
+        }
+    return report_row,unavailable
+
+
+def _report(draft,authentication_state):
+    c=validated_cur_population(draft.plan)
+    reason_details=_validated_reason_details(draft.plan)
     coverage=bool(c['accounting_complete'] and c['max_resources_not_inspected']['count']==0 and all(c[k]['known'] for k in ('unattributable_cur','outside_requested_kinds','unsupported_kind')))
     rows=[]
     name_generation_unavailable=[]
     for row_index,row in enumerate(draft.rows):
-        arn=row.get('resource_arn')
-        scope_id=None
-        expected_operation=_WRITE_OPERATIONS.get(row.get('kind'))
-        operation_supported=(expected_operation is not None
-                             and row.get('aws_operation')==expected_operation)
-        if expected_operation is None:
-            write_support='UNSUPPORTED_API'
-        elif operation_supported:
-            write_support='SUPPORTED_API'
-        else:
-            write_support='OPERATION_UNRESOLVED'
-        scope_application='NOT_APPLIED'
-        if row.get('status')!='proposed':
-            scope_application='NOT_APPLICABLE'
-        elif operation_supported and isinstance(arn,str) and arn:
-            try:
-                scope_id=derive_declared_row_scope(draft.plan,row)
-                scope_application='APPLIED'
-            except BatchValidationError as error:
-                if str(error)!='No unique Scope declaration':
-                    raise ReportBlocked(str(error)) from error
-        evidence=row.get('evidence')
-        proposed_name=row.get('proposed_name')
-        if isinstance(proposed_name,str) and proposed_name:
-            name_generation_state='GENERATED'
-        elif (row.get('status')=='manual_review' and isinstance(evidence,str)
-              and 'Candidate lacks a structured Name namespace' in evidence):
-            name_generation_state='UNAVAILABLE'
-        elif isinstance(evidence,str) and evidence.startswith('Proposed Name collision in batch:'):
-            name_generation_state='COLLISION'
-        else:
-            name_generation_state='NOT_EVALUATED'
-        report_row={
-            'row_index':row_index,
-            'proposal_id':row.get('proposal_id'),
-            'kind':row.get('kind'),
-            'locator':row.get('locator'),
-            'region':row.get('region'),
-            'resource_arn':arn,
-            'writer_control_scope_id':scope_id,
-            'aws_operation':row.get('aws_operation'),
-            'name_state':row.get('name_state'),
-            'name_key_present':row.get('name_key_present'),
-            'name_raw_value':row.get('name_raw_value'),
-            'existing_name':row.get('existing_name'),
-            'proposed_name':row.get('proposed_name'),
-            'name_generation_state':name_generation_state,
-            'write_support':write_support,
-            'scope_application':scope_application,
-            'approved':row.get('approved'),
-            'status':row.get('status'),
-            'confidence':row.get('confidence'),
-            'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
-            'outcome':'NOT_ATTEMPTED_UNSIGNED_PREVIEW',
-            'execution_allowed':False,
-        }
+        report_row,unavailable=_report_row(row,row_index,draft.plan)
         rows.append(report_row)
-        if name_generation_state=='UNAVAILABLE':
-            name_generation_unavailable.append({
-                'proposal_id':row.get('proposal_id'),
-                'kind':row.get('kind'),
-                'locator':row.get('locator'),
-                'resource_arn':arn,
-                'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
-                'reason':row.get('evidence'),
-            })
+        if unavailable is not None:
+            name_generation_unavailable.append(unavailable)
     report={'authentication_state':authentication_state,
             'execution_allowed':False,
             'plan_sha256':sha256(draft.plan_bytes).hexdigest(),

@@ -29,6 +29,7 @@ CREATE TABLE intents(batch_id TEXT NOT NULL REFERENCES batch_registry(batch_id),
 CREATE TABLE batch_row_dispositions(batch_id TEXT NOT NULL REFERENCES batch_registry(batch_id),row_index INTEGER NOT NULL,row_authority_id TEXT NOT NULL UNIQUE,decision TEXT NOT NULL CHECK(decision IN ('SKIPPED_NAME_CHANGED','SKIPPED_IAM_UNSUPPORTED','NOT_ATTEMPTED_CAP')),PRIMARY KEY(batch_id,row_index));
 CREATE TABLE batch_events(event_id INTEGER PRIMARY KEY AUTOINCREMENT,batch_id TEXT NOT NULL REFERENCES batch_registry(batch_id),event TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '');
 '''
+_HOLD_SCOPE_SQL = "UPDATE scopes SET state='HOLD' WHERE scope_id=?"
 
 class OfflineFixtureBatchLedger:
     @classmethod
@@ -136,7 +137,7 @@ class OfflineFixtureBatchLedger:
             if not r or r[0]!='SEND_ATTEMPT_CONSUMED':raise LedgerBlocked('No consumed permit')
             self.conn.execute('UPDATE intents SET state=? WHERE batch_id=? AND row_index=?',(outcome,id,index))
             if outcome=='OUTCOME_UNKNOWN':
-                self.conn.execute("UPDATE scopes SET state='HOLD' WHERE scope_id=?",(r[1],))
+                self.conn.execute(_HOLD_SCOPE_SQL,(r[1],))
                 self.conn.execute("UPDATE batch_registry SET state='STOPPED',stop_reason='OUTCOME_UNKNOWN',stopped_at_utc='fixture' WHERE batch_id=?",(id,))
             self.conn.execute('INSERT INTO batch_events(batch_id,event,reason) VALUES(?,?,?)',(id,'READBACK',outcome))
     def outcome_unknown_after_readback_failure(self,id,index):
@@ -147,7 +148,7 @@ class OfflineFixtureBatchLedger:
             if batch_state!=('ACTIVE',) or not row or row[0]!='SEND_ATTEMPT_CONSUMED':
                 raise LedgerBlocked('No active consumed Intent for unknown outcome')
             self.conn.execute("UPDATE intents SET state='OUTCOME_UNKNOWN' WHERE batch_id=? AND row_index=?",(id,index))
-            self.conn.execute("UPDATE scopes SET state='HOLD' WHERE scope_id=?",(row[1],))
+            self.conn.execute(_HOLD_SCOPE_SQL,(row[1],))
             self.conn.execute("UPDATE batch_registry SET state='STOPPED',stop_reason='OUTCOME_UNKNOWN',stopped_at_utc='fixture' WHERE batch_id=?",(id,))
             self.conn.execute("INSERT INTO batch_events(batch_id,event,reason) VALUES(?,?,?)",(id,'READBACK','OUTCOME_UNKNOWN'))
     def _complete_in_tx(self,id):
@@ -187,7 +188,7 @@ class OfflineFixtureBatchLedger:
                 dangling=self.conn.execute("SELECT COUNT(*) FROM intents WHERE batch_id=? AND state IN ('ADMITTED','SEND_ATTEMPT_CONSUMED')",(id,)).fetchone()[0]
                 unresolved_scopes=self.conn.execute("SELECT DISTINCT scope_id FROM intents WHERE batch_id=? AND state='SEND_ATTEMPT_CONSUMED'",(id,)).fetchall()
                 for (scope_id,) in unresolved_scopes:
-                    self.conn.execute("UPDATE scopes SET state='HOLD' WHERE scope_id=?",(scope_id,))
+                    self.conn.execute(_HOLD_SCOPE_SQL,(scope_id,))
                 held=self.conn.execute("SELECT COUNT(*) FROM batch_scopes b JOIN scopes s USING(scope_id) WHERE b.batch_id=? AND s.state='HOLD'",(id,)).fetchone()[0]
                 if state=='ACTIVE' and (dangling or held):
                     self.conn.execute("UPDATE batch_registry SET state='STOPPED',stop_reason='CRASH_OR_SCOPE_HOLD',stopped_at_utc='fixture' WHERE batch_id=?",(id,))

@@ -92,6 +92,85 @@ def _record_cap_for_unclaimed(
     return False
 
 
+def _execute_unclaimed_row(
+    batch: VerifiedBatchApproval,
+    row_index: int,
+    ledger: IntentLedger,
+    runtime: BatchOfflineRuntime,
+    report: dict[str, JsonValue],
+) -> bool:
+    """Run one fresh row; return true when the Batch must stop."""
+    try:
+        authority = _current_authority(batch, row_index)
+    except BatchAuthRejected:
+        ledger.stop_batch(batch, reason_code="BLOCKED_OWNER_AUTHN")
+        report["authentication_state"] = "OWNER_AUTHN_REVOKED"
+        return True
+    row = authority.row
+    try:
+        evidence = _evidence_for(runtime, row)
+    except LedgerError as error:
+        ledger.stop_batch(batch, reason_code=error.code)
+        return True
+    resource_arn = row.get("resource_arn")
+    approved_name = row.get("approved_name")
+    if not isinstance(resource_arn, str) or not isinstance(approved_name, str):
+        ledger.stop_batch(batch, reason_code="BLOCKED_SCOPE_STATE_UNKNOWN")
+        return True
+    try:
+        current = classify_batch_name(runtime.adapter.read_current(resource_arn))
+    except OSError:
+        ledger.stop_batch(batch, reason_code="BLOCKED_SCOPE_STATE_UNKNOWN")
+        return True
+    if current.state == "UNKNOWN":
+        ledger.stop_batch(batch, reason_code="BLOCKED_NAME_UNKNOWN")
+        return True
+    if (current.state != row.get("name_state")
+            or current.name_key_present != row.get("name_key_present")
+            or current.name_raw_value != row.get("name_raw_value")):
+        try:
+            ledger.record_batch_presend_disposition(
+                authority, scope=evidence.scope, side_effects=evidence.side_effects,
+                decision="SKIPPED_NAME_CHANGED", reason_code="NAME_SNAPSHOT_CHANGED",
+                observed_name_sha256=_name_snapshot_hash(current),
+            )
+        except LedgerError as error:
+            ledger.stop_batch(batch, reason_code=error.code)
+            raise
+        return False
+    try:
+        subset = build_subset_session_policy(
+            batch, (row_index,), kind_registry=_VOLUME_POLICY
+        )
+        issuer = OfflineFakeIssuer()
+        issued = issuer.issue(batch, subset, kind_registry=_VOLUME_POLICY)
+        validate_issued_batch_session(batch, subset, issued)
+        handle = ledger.create_batch_intent(
+            authority, scope=evidence.scope, side_effects=evidence.side_effects
+        )
+        permit = ledger.consume_first_send(handle)
+    except (IAMPolicyBlocked, CredentialBlocked):
+        ledger.stop_batch(batch, reason_code="AWS_WRITE_BLOCKED")
+        return True
+    except LedgerError as error:
+        ledger.stop_batch(batch, reason_code=error.code)
+        raise
+    try:
+        runtime.adapter.write_once(permit.resource_arn, permit.approved_name)
+        readback = classify_batch_name(runtime.adapter.readback(permit.resource_arn))
+        outcome = (
+            "APPLIED_VERIFIED"
+            if readback.state == "NONEMPTY" and readback.name_raw_value == permit.approved_name
+            else "OUTCOME_UNKNOWN"
+        )
+        name_after = readback.name_raw_value
+    except OSError:
+        outcome = "OUTCOME_UNKNOWN"
+        name_after = None
+    ledger.record_readback(handle, name_after=name_after, outcome=outcome)
+    return outcome == "OUTCOME_UNKNOWN"
+
+
 def execute_batch_offline(
     batch: VerifiedBatchApproval,
     *,
@@ -136,77 +215,7 @@ def execute_batch_offline(
                 report["authentication_state"]="OWNER_AUTHN_REVOKED"
             break
 
-        try:
-            authority = _current_authority(batch, row_index)
-        except BatchAuthRejected:
-            ledger.stop_batch(batch,reason_code="BLOCKED_OWNER_AUTHN")
-            report["authentication_state"]="OWNER_AUTHN_REVOKED"
-            break
-        row = authority.row
-        try:
-            evidence = _evidence_for(runtime, row)
-        except LedgerError as error:
-            ledger.stop_batch(batch,reason_code=error.code)
-            break
-        resource_arn = row.get("resource_arn")
-        approved_name = row.get("approved_name")
-        if not isinstance(resource_arn, str) or not isinstance(approved_name, str):
-            ledger.stop_batch(batch, reason_code="BLOCKED_SCOPE_STATE_UNKNOWN")
-            break
-        try:
-            current = classify_batch_name(runtime.adapter.read_current(resource_arn))
-        except OSError:
-            ledger.stop_batch(batch, reason_code="BLOCKED_SCOPE_STATE_UNKNOWN")
-            break
-        if current.state == "UNKNOWN":
-            ledger.stop_batch(batch, reason_code="BLOCKED_NAME_UNKNOWN")
-            break
-        if (current.state != row.get("name_state")
-                or current.name_key_present != row.get("name_key_present")
-                or current.name_raw_value != row.get("name_raw_value")):
-            try:
-                ledger.record_batch_presend_disposition(
-                    authority, scope=evidence.scope, side_effects=evidence.side_effects,
-                    decision="SKIPPED_NAME_CHANGED", reason_code="NAME_SNAPSHOT_CHANGED",
-                    observed_name_sha256=_name_snapshot_hash(current),
-                )
-            except LedgerError as error:
-                ledger.stop_batch(batch,reason_code=error.code)
-                raise
-            continue
-
-        try:
-            subset = build_subset_session_policy(
-                batch, (row_index,), kind_registry=_VOLUME_POLICY
-            )
-            issuer = OfflineFakeIssuer()
-            issued = issuer.issue(batch, subset, kind_registry=_VOLUME_POLICY)
-            validate_issued_batch_session(batch,subset,issued)
-            handle = ledger.create_batch_intent(
-                authority, scope=evidence.scope, side_effects=evidence.side_effects
-            )
-            permit = ledger.consume_first_send(handle)
-        except (IAMPolicyBlocked, CredentialBlocked) as error:
-            ledger.stop_batch(batch, reason_code="AWS_WRITE_BLOCKED")
-            break
-        except LedgerError as error:
-            ledger.stop_batch(batch,reason_code=error.code)
-            raise
-
-        try:
-            runtime.adapter.write_once(permit.resource_arn, permit.approved_name)
-            readback = classify_batch_name(runtime.adapter.readback(permit.resource_arn))
-            outcome = (
-                "APPLIED_VERIFIED"
-                if readback.state == "NONEMPTY" and readback.name_raw_value == permit.approved_name
-                else "OUTCOME_UNKNOWN"
-            )
-            name_after = readback.name_raw_value
-        except OSError:
-            outcome = "OUTCOME_UNKNOWN"
-            name_after = None
-        ledger.record_readback(handle, name_after=name_after, outcome=outcome)
-        if outcome == "OUTCOME_UNKNOWN":
+        if _execute_unclaimed_row(batch,row_index,ledger,runtime,report):
             break
 
     state = ledger.batch_execution_state(batch)

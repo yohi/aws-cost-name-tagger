@@ -92,24 +92,14 @@ def _date(document,key):
     return result
 
 
-def parse_offline_runtime(raw:bytes)->BatchOfflineRuntime:
-    """Parse explicit offline scope evidence and fake tags; never create SDK clients."""
-    if type(raw) is not bytes or len(raw)>4*1024*1024:
-        raise ValueError('Offline runtime evidence is missing or oversized')
-    try:
-        doc=_mapping(json.loads(raw.decode('utf-8'),object_pairs_hook=_unique_object))
-    except (UnicodeDecodeError,json.JSONDecodeError,BatchValidationError) as error:
-        raise ValueError('Invalid offline runtime evidence JSON') from error
-    if set(doc)!={'scopes','side_effects','initial_tags','readback_failures'}:
-        raise ValueError('Unexpected offline runtime evidence fields')
-    scopes_value=doc['scopes'];effects_value=doc['side_effects']
-    if type(scopes_value) is not list or not scopes_value or type(effects_value) is not list:
+def _parse_scopes(scopes_value):
+    if type(scopes_value) is not list or not scopes_value:
         raise ValueError('Invalid scope/side-effect evidence lists')
     scopes={}
+    fields={'account','partition','region','writer_control_scope_id','controlled_arns',
+            'not_before_utc','not_after_utc','writer_evidence_digest','responsible_owner'}
     for item in scopes_value:
         entry=_mapping(item)
-        fields={'account','partition','region','writer_control_scope_id','controlled_arns',
-                'not_before_utc','not_after_utc','writer_evidence_digest','responsible_owner'}
         if set(entry)!=fields or type(entry['controlled_arns']) is not list:
             raise ValueError('Invalid runtime ScopeEvidence shape')
         scope_id=_text(entry,'writer_control_scope_id')
@@ -123,11 +113,17 @@ def parse_offline_runtime(raw:bytes)->BatchOfflineRuntime:
             writer_evidence_digest=_text(entry,'writer_evidence_digest'),
             responsible_owner=_text(entry,'responsible_owner'),
         )
+    return scopes
+
+
+def _parse_side_effects(effects_value,scopes):
+    if type(effects_value) is not list:
+        raise ValueError('Invalid scope/side-effect evidence lists')
     effects_by_scope={scope_id:[] for scope_id in scopes}
+    fields={'scope_id','target_arn','iam_abac_resource_tag_assessment','iac_assessment',
+            'event_automation_assessment','evidence_references','not_before_utc','not_after_utc'}
     for item in effects_value:
         entry=_mapping(item)
-        fields={'scope_id','target_arn','iam_abac_resource_tag_assessment','iac_assessment',
-                'event_automation_assessment','evidence_references','not_before_utc','not_after_utc'}
         if set(entry)!=fields or type(entry['evidence_references']) is not list:
             raise ValueError('Invalid SideEffectEvidence shape')
         scope_id=_text(entry,'scope_id')
@@ -141,6 +137,32 @@ def parse_offline_runtime(raw:bytes)->BatchOfflineRuntime:
             evidence_references=tuple(entry['evidence_references']),
             not_before_utc=_date(entry,'not_before_utc'),not_after_utc=_date(entry,'not_after_utc'),
         ))
+    return effects_by_scope
+
+
+def _parse_initial_tags(value):
+    initial_value=_mapping(value)
+    initial_tags={}
+    for arn,tags_value in initial_value.items():
+        tags=_mapping(tags_value)
+        if any(type(key) is not str or type(tag) is not str for key,tag in tags.items()):
+            raise ValueError('Fake tag map must contain string keys and values')
+        initial_tags[arn]=tags
+    return initial_tags
+
+
+def parse_offline_runtime(raw:bytes)->BatchOfflineRuntime:
+    """Parse explicit offline scope evidence and fake tags; never create SDK clients."""
+    if type(raw) is not bytes or len(raw)>4*1024*1024:
+        raise ValueError('Offline runtime evidence is missing or oversized')
+    try:
+        doc=_mapping(json.loads(raw.decode('utf-8'),object_pairs_hook=_unique_object))
+    except (UnicodeDecodeError,json.JSONDecodeError,BatchValidationError) as error:
+        raise ValueError('Invalid offline runtime evidence JSON') from error
+    if set(doc)!={'scopes','side_effects','initial_tags','readback_failures'}:
+        raise ValueError('Unexpected offline runtime evidence fields')
+    scopes=_parse_scopes(doc['scopes'])
+    effects_by_scope=_parse_side_effects(doc['side_effects'],scopes)
     evidence_by_scope={}
     for scope_id,scope in scopes.items():
         effects=tuple(effects_by_scope[scope_id])
@@ -148,13 +170,7 @@ def parse_offline_runtime(raw:bytes)->BatchOfflineRuntime:
                 or len(effects)!=len(scope.controlled_arns)):
             raise ValueError('Side-effect evidence must cover every controlled ARN once')
         evidence_by_scope[scope_id]=BatchRuntimeEvidence(scope,effects)
-    initial_value=_mapping(doc['initial_tags'])
-    initial_tags={}
-    for arn,tags_value in initial_value.items():
-        tags=_mapping(tags_value)
-        if any(type(key) is not str or type(value) is not str for key,value in tags.items()):
-            raise ValueError('Fake tag map must contain string keys and values')
-        initial_tags[arn]=tags
+    initial_tags=_parse_initial_tags(doc['initial_tags'])
     failures=doc['readback_failures']
     if type(failures) is not list or any(type(arn) is not str or arn not in initial_tags for arn in failures):
         raise ValueError('Invalid fake readback failure targets')

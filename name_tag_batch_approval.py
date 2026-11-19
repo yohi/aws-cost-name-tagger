@@ -135,12 +135,30 @@ def prepare_batch_approval(plan_bytes:bytes,csv_bytes:bytes,*,owner_principal_id
     return PreparedBatchApproval(can,payload,sha256(can).hexdigest(),BATCH_NAMESPACE,manifest)
 
 
+def _verify_batch_owner_signature(payload,canonical_payload,envelope,trust,now_utc):
+    from name_tag_approval import ApprovalRejected, OwnerTrust, _select_signer_lines, _verify_signature
+    if not isinstance(trust,OwnerTrust) or type(now_utc) is not datetime or now_utc.tzinfo is None:
+        raise BatchAuthRejected()
+    now=now_utc.astimezone(timezone.utc)
+    if not _timestamp(payload['issued_at_utc'])<=now<_timestamp(payload['expires_at_utc']):
+        raise BatchAuthRejected()
+    entries=trust._owners.get(payload['owner_principal_id'],{})
+    allowed={fp for fp,owner in entries.items() if not owner.revoked and owner.role=='batch-approver'}
+    if payload['owner_key_fingerprint'] not in allowed:
+        raise BatchAuthRejected()
+    lines=_select_signer_lines(trust._check_file(),payload['owner_principal_id'],allowed)
+    signature=base64.b64decode(envelope['signature_ref'],validate=True)
+    try:
+        actual=_verify_signature(signature,canonical_payload,payload['owner_principal_id'],BATCH_NAMESPACE,lines)
+    except ApprovalRejected as error:
+        raise BatchAuthRejected() from error
+    if actual!=payload['owner_key_fingerprint']:
+        raise BatchAuthRejected()
+
+
 def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope:bytes,*,trust:Any,now_utc:datetime)->VerifiedBatchApproval:
     """Require *real* existing protected OwnerTrust and OpenSSH verification. No fake fallback."""
     try:
-        from name_tag_approval import ApprovalRejected, OwnerTrust, _select_signer_lines, _verify_signature
-        if not isinstance(trust,OwnerTrust) or type(now_utc) is not datetime or now_utc.tzinfo is None:
-            raise BatchAuthRejected()
         envelope=json.loads(signed_batch_envelope.decode('utf-8'),object_pairs_hook=_unique_pairs,
                             parse_constant=_reject_json_constant)
         if type(envelope) is not dict or set(envelope)!={'payload','batch_id','signature_ref'}:raise BatchAuthRejected()
@@ -151,18 +169,7 @@ def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope
         draft=validate_batch_draft(plan_bytes,csv_bytes)
         if payload['approved_rows_sha256']!=sha256(canonical_bytes(_approved_tuples(draft))).hexdigest():raise BatchAuthRejected()
         if payload['account']!=draft.plan['account'] or payload['partition']!=draft.plan['partition']:raise BatchAuthRejected()
-        now=now_utc.astimezone(timezone.utc)
-        if not _timestamp(payload['issued_at_utc'])<=now<_timestamp(payload['expires_at_utc']):raise BatchAuthRejected()
-        entries=trust._owners.get(payload['owner_principal_id'],{})
-        allowed={fp for fp,owner in entries.items() if not owner.revoked and owner.role=='batch-approver'}
-        if payload['owner_key_fingerprint'] not in allowed:raise BatchAuthRejected()
-        lines=_select_signer_lines(trust._check_file(),payload['owner_principal_id'],allowed)
-        signature=base64.b64decode(envelope['signature_ref'],validate=True)
-        try:
-            actual=_verify_signature(signature,can,payload['owner_principal_id'],BATCH_NAMESPACE,lines)
-        except ApprovalRejected as e:
-            raise BatchAuthRejected() from e
-        if actual!=payload['owner_key_fingerprint']:raise BatchAuthRejected()
+        _verify_batch_owner_signature(payload,can,envelope,trust,now_utc)
         approved_tuples=_approved_tuples(draft)
         frozen_rows=tuple(MappingProxyType(dict(row)) for row in draft.approved_rows)
         return VerifiedBatchApproval(bytes(signed_batch_envelope),can,envelope['batch_id'],MappingProxyType(dict(payload)),bytes(plan_bytes),bytes(csv_bytes),frozen_rows,tuple(row[0] for row in approved_tuples),payload['owner_principal_id'],envelope['signature_ref'])

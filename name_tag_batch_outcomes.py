@@ -50,6 +50,37 @@ def _cost(value:str)->Decimal:
     return amount
 
 
+def _row_outcome(row:BatchOutcomeRow,authentication_state:str)->str:
+    outcome=row.get('outcome')
+    if outcome in _DURABLE_OUTCOMES:
+        return outcome
+    if outcome=='SKIPPED_IAM_UNSUPPORTED':
+        return 'WRITE_UNSUPPORTED'
+    if row.get('approved')=='YES' and authentication_state=='UNSIGNED_PREVIEW':
+        return 'NOT_ATTEMPTED_UNSIGNED_PREVIEW'
+    if row.get('status')=='already_named':
+        return 'ALREADY_NAMED'
+    if row.get('status')=='proposed' and row.get('write_support')=='UNSUPPORTED_API':
+        return 'WRITE_UNSUPPORTED'
+    if row.get('status')=='proposed' and row.get('write_support')=='OPERATION_UNRESOLVED':
+        return 'WRITE_OPERATION_UNRESOLVED'
+    if row.get('status')=='proposed' and row.get('scope_application')!='APPLIED':
+        return 'SCOPE_NOT_APPLIED'
+    if row.get('name_generation_state')=='UNAVAILABLE':
+        return 'NAME_GENERATION_UNAVAILABLE'
+    if row.get('name_state')=='UNKNOWN':
+        return 'NAME_STATE_UNKNOWN'
+    if row.get('status')=='api_error':
+        return 'METADATA_READ_FAILED'
+    if row.get('approved')=='YES':
+        return ('NOT_ATTEMPTED_UNSIGNED_PREVIEW'
+                if authentication_state=='UNSIGNED_PREVIEW'
+                else 'NOT_ATTEMPTED_OWNER_VERIFIED')
+    if row.get('status')=='manual_review':
+        return 'MANUAL_REVIEW'
+    return 'UNAPPROVED'
+
+
 def reconcile_batch_outcomes(
     report:BatchOutcomeReport,
     ledger_outcomes:Mapping[int,str]|None=None,
@@ -68,36 +99,7 @@ def reconcile_batch_outcomes(
 
     grouped:dict[str,list[BatchOutcomeRow]]={}
     for row in rows:
-        outcome=row.get('outcome')
-        if outcome in _DURABLE_OUTCOMES:
-            category=outcome
-        elif outcome=='SKIPPED_IAM_UNSUPPORTED':
-            category='WRITE_UNSUPPORTED'
-        elif (row.get('approved')=='YES'
-              and report.get('authentication_state')=='UNSIGNED_PREVIEW'):
-            category='NOT_ATTEMPTED_UNSIGNED_PREVIEW'
-        elif row.get('status')=='already_named':
-            category='ALREADY_NAMED'
-        elif row.get('status')=='proposed' and row.get('write_support')=='UNSUPPORTED_API':
-            category='WRITE_UNSUPPORTED'
-        elif row.get('status')=='proposed' and row.get('write_support')=='OPERATION_UNRESOLVED':
-            category='WRITE_OPERATION_UNRESOLVED'
-        elif row.get('status')=='proposed' and row.get('scope_application')!='APPLIED':
-            category='SCOPE_NOT_APPLIED'
-        elif row.get('name_generation_state')=='UNAVAILABLE':
-            category='NAME_GENERATION_UNAVAILABLE'
-        elif row.get('name_state')=='UNKNOWN':
-            category='NAME_STATE_UNKNOWN'
-        elif row.get('status')=='api_error':
-            category='METADATA_READ_FAILED'
-        elif row.get('approved')=='YES':
-            category=('NOT_ATTEMPTED_UNSIGNED_PREVIEW'
-                      if report.get('authentication_state')=='UNSIGNED_PREVIEW'
-                      else 'NOT_ATTEMPTED_OWNER_VERIFIED')
-        elif row.get('status')=='manual_review':
-            category='MANUAL_REVIEW'
-        else:
-            category='UNAPPROVED'
+        category=_row_outcome(row,report.get('authentication_state',''))
         row['outcome']=category
         grouped.setdefault(category,[]).append(row)
 

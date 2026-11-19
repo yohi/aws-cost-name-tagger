@@ -25,8 +25,10 @@ import tempfile
 import time
 from contextlib import contextmanager
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 DEFAULT_THRESHOLD = 10.0
 DEFAULT_REPORT_OUTPUT = ".aws-cost-name-tagger/name_tag_plan.json"
@@ -45,6 +47,9 @@ MAX_CUR_DISTINCT_RESOURCES = 250_000
 MAX_AWS_READ_CALLS = 500
 MAX_AWS_READ_ELAPSED_SECONDS = 120
 MAX_RDS_CLUSTER_PAGES = 25
+ACCOUNT_ID_PATTERN = re.compile(r"\d{12}")
+REVIEW_CSV_SUFFIX = ".review.csv"
+REPORT_CSV_SUFFIX = ".report.csv"
 AWS_READ_CONNECT_TIMEOUT_SECONDS = 5
 AWS_READ_TIMEOUT_SECONDS = 10
 # Capture the actual OS implementation functions at import time: offline fault
@@ -547,33 +552,33 @@ def _cur_scan_batch_aggregates(paths, receipts, active_month, account, kind_filt
         exact_amount = decimal_cost_of(row)
         category, reason, key = classify_cur_row(
             row, account=account, kind_filter=kind_filter, rid_class=rid_class)
-        if category == "CUR_RECOGNIZED":
-            if key is None:
-                raise ValueError("CUR recognized identity missing")
-            current = aggregates.get(key)
-            legacy_amount = cost_of(row)
-            legacy_total = legacy_amount if current is None else current.legacy_rank_cost + legacy_amount
-            if not math.isfinite(legacy_total):
-                raise ValueError("CUR aggregated amount is not finite")
-            if current is None:
-                if len(aggregates) >= MAX_CUR_DISTINCT_RESOURCES:
-                    raise ValueError("CUR distinct-resource budget exceeded")
-                exact_total = exact_amount
-            else:
-                exact_total = exact_add((current.exact_cost, exact_amount))
-            aggregates[key] = CurCostAggregate(exact_total, legacy_total)
-            provenance[key]["services"].add(row["line_item_product_code"])
-            provenance[key]["billing_rows"] += 1
-            provenance[key]["currency"].add(row["line_item_currency_code"])
+        if category != "CUR_RECOGNIZED":
+            if category not in billing:
+                raise ValueError("Unknown CUR population category")
+            entry = billing[category]
+            entry["billing_rows"] += 1
+            entry["exact_cost"] = exact_add((entry["exact_cost"], exact_amount))
+            reason_entry = reasons[(category, reason)]
+            reason_entry["billing_rows"] += 1
+            reason_entry["exact_cost"] = exact_add((reason_entry["exact_cost"], exact_amount))
             return
-        if category not in billing:
-            raise ValueError("Unknown CUR population category")
-        entry = billing[category]
-        entry["billing_rows"] += 1
-        entry["exact_cost"] = exact_add((entry["exact_cost"], exact_amount))
-        reason_entry = reasons[(category, reason)]
-        reason_entry["billing_rows"] += 1
-        reason_entry["exact_cost"] = exact_add((reason_entry["exact_cost"], exact_amount))
+        if key is None:
+            raise ValueError("CUR recognized identity missing")
+        current = aggregates.get(key)
+        legacy_amount = cost_of(row)
+        legacy_total = legacy_amount if current is None else current.legacy_rank_cost + legacy_amount
+        if not math.isfinite(legacy_total):
+            raise ValueError("CUR aggregated amount is not finite")
+        if current is None:
+            if len(aggregates) >= MAX_CUR_DISTINCT_RESOURCES:
+                raise ValueError("CUR distinct-resource budget exceeded")
+            exact_total = exact_amount
+        else:
+            exact_total = exact_add((current.exact_cost, exact_amount))
+        aggregates[key] = CurCostAggregate(exact_total, legacy_total)
+        provenance[key]["services"].add(row["line_item_product_code"])
+        provenance[key]["billing_rows"] += 1
+        provenance[key]["currency"].add(row["line_item_currency_code"])
 
     second_budget = {"bytes": 0, "rows": 0}
     for index, path in enumerate(paths):
@@ -722,6 +727,22 @@ class _BudgetedAWSSession:
 
 def _budgeted_session(session):
     return session if isinstance(session, _BudgetedAWSSession) else _BudgetedAWSSession(session)
+
+
+@dataclass(slots=True)
+class _ResolutionContext:
+    """Mutable accumulator for one resource-specific resolver pass."""
+
+    kind: str
+    locator: str
+    region: str
+    name_state_fn: Callable[[dict], str]
+    candidate_states: tuple[str, ...]
+    result: dict
+    tags: dict | None = None
+    candidate: str | None = None
+    evidence: str = ""
+    confidence: str = "high"
 
 
 class Investigator:
@@ -905,338 +926,423 @@ class Investigator:
         az=subnet.get("AvailabilityZone", "")
         return suffix_name(sn,"nat",az[-1:] if az else "az",nat["NatGatewayId"][-6:]),f"NAT {nat['NatGatewayId']} -> subnet {nat['SubnetId']} Name={sn} + VPC {nat['VpcId']} Name={vn}"
 
+    def _resolve_instance(self, state):
+        loc,region=state.locator,state.region
+        obj=self.instance(region,loc)
+        state.tags=tagmap(obj.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)
+        if state.name_state_fn(state.tags) not in state.candidate_states:
+            return
+        relations=[]
+        for key,label in (("aws:autoscaling:groupName","AutoScaling Group"),
+                          ("aws:cloudformation:stack-name","CloudFormation Stack")):
+            value=meaningful(state.tags.get(key,""))
+            if value:
+                relations.append((value,f"{label}={value}"))
+        if not relations:
+            raise ValueError("EC2 instance missing Name and structured ASG/CloudFormation ownership")
+        if len({name_scope_prefix(value[0]) for value in relations})!=1:
+            raise ValueError("EC2 ASG and CloudFormation Stack Names have conflicting namespaces")
+        anchor=relations[0][0]
+        state.candidate=suffix_name(anchor,"ec2",loc[-7:])
+        state.evidence=f"EC2 {loc} -> "+", ".join(value[1] for value in relations)
+        state.confidence="medium"
+
+    def _resolve_volume(self, state):
+        state.tags=tagmap(self.volume(state.region,state.locator).get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)
+        if state.name_state_fn(state.tags) in state.candidate_states:
+            state.candidate,state.evidence=self.volume_owner(state.region,state.locator)
+
+    def _resolve_snapshot(self, state, client):
+        snapshots=client.describe_snapshots(SnapshotIds=[state.locator],OwnerIds=["self"]).get("Snapshots",[])
+        if len(snapshots)!=1 or snapshots[0].get("OwnerId")!=self.account:
+            raise ValueError("snapshot is absent or not owned by target account")
+        obj=snapshots[0]
+        state.tags=tagmap(obj.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)
+        if state.name_state_fn(state.tags) in state.candidate_states:
+            source=obj.get("VolumeId","")
+            if not source:
+                raise ValueError("snapshot missing source volume")
+            raise ValueError(f"Snapshot {state.locator} source VolumeId={source}; historical owner evidence required")
+
+    def _resolve_eni(self, state, client):
+        interfaces=client.describe_network_interfaces(NetworkInterfaceIds=[state.locator]).get("NetworkInterfaces",[])
+        if len(interfaces)!=1:
+            raise ValueError("ENI not found")
+        obj=interfaces[0]
+        state.tags=tagmap(obj.get("TagSet",[]),expected_shape="list",allow_missing_non_name_value=True)
+        if state.name_state_fn(state.tags) not in state.candidate_states:
+            return
+        instance_id=obj.get("Attachment",{}).get("InstanceId")
+        if not instance_id:
+            raise ValueError("ENI not attached to EC2 instance")
+        base,path=self.parent_instance(state.region,instance_id)
+        index=obj["Attachment"].get("DeviceIndex")
+        if index is None:
+            raise ValueError("ENI device index unavailable")
+        state.candidate=suffix_name(base,"eni",f"eth{index}",state.locator[-7:])
+        state.evidence=f"ENI {state.locator} -> {path}"
+
+    def _resolve_eip(self, state, client):
+        addresses=client.describe_addresses(AllocationIds=[state.locator]).get("Addresses",[])
+        if len(addresses)!=1:
+            raise ValueError("EIP not found")
+        address=addresses[0]
+        state.tags=tagmap(address.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)
+        if state.name_state_fn(state.tags) in state.candidate_states:
+            state.candidate,state.evidence,_=self.eip_owner(state.region,state.locator)
+
+    def _resolve_nat(self, state, client):
+        gateways=client.describe_nat_gateways(NatGatewayIds=[state.locator]).get("NatGateways",[])
+        if len(gateways)!=1:
+            raise ValueError("NAT not found")
+        obj=gateways[0]
+        state.tags=tagmap(obj.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)
+        if state.name_state_fn(state.tags) in state.candidate_states:
+            state.candidate,state.evidence=self.nat_owner(state.region,obj)
+            state.confidence="medium"
+
+    def _resolve_endpoint(self, state, client):
+        endpoints=client.describe_vpc_endpoints(VpcEndpointIds=[state.locator]).get("VpcEndpoints",[])
+        if len(endpoints)!=1:
+            raise ValueError("VPC endpoint not found")
+        endpoint=endpoints[0]
+        state.tags=tagmap(endpoint.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)
+        if state.name_state_fn(state.tags) not in state.candidate_states:
+            return
+        vpc=self.vpc(state.region,endpoint["VpcId"])
+        vpc_name=meaningful(name_of(tagmap(vpc.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)))
+        subnets=[self.subnet(state.region,subnet_id) for subnet_id in endpoint.get("SubnetIds",[])]
+        subnet_names=[meaningful(name_of(tagmap(subnet.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True))) for subnet in subnets]
+        if not vpc_name or not subnet_names or any(name is None or name_scope_prefix(name)!=name_scope_prefix(vpc_name) for name in subnet_names):
+            raise ValueError("VPC endpoint shared/ambiguous; require uniformly named VPC and all subnets")
+        service=endpoint["ServiceName"].split(".")[-1]
+        state.candidate=suffix_name(vpc_name,"vpce",service,state.locator[-6:])
+        state.confidence="medium"
+        state.evidence=f"endpoint {state.locator} -> VPC {endpoint['VpcId']} Name={vpc_name} and {len(subnets)} same-namespace subnets"
+
+    def _resolve_rds_cluster(self, state, client):
+        loc=state.locator
+        if re.fullmatch(r"cluster-[a-z0-9]{14,}",loc,re.I):
+            results=[]
+            marker=None
+            seen_markers=set()
+            for _ in range(MAX_RDS_CLUSTER_PAGES):
+                query={"MaxRecords":100}
+                if marker is not None:
+                    query["Marker"]=marker
+                page=client.describe_db_clusters(**query)
+                results.extend(cluster for cluster in page.get("DBClusters",[]) if cluster.get("DbClusterResourceId","").casefold()==loc.casefold())
+                next_marker=page.get("Marker")
+                if next_marker in (None,""):
+                    break
+                if not isinstance(next_marker,str) or next_marker in seen_markers:
+                    raise ValueError("RDS cluster pagination marker invalid or repeated")
+                seen_markers.add(next_marker)
+                marker=next_marker
+            else:
+                raise ValueError("RDS cluster pagination page budget exceeded")
+        else:
+            results=client.describe_db_clusters(DBClusterIdentifier=loc).get("DBClusters",[])
+        if len(results)!=1:
+            raise ValueError("RDS cluster not found/unique")
+        obj=results[0]
+        arn=obj["DBClusterArn"]
+        if loc.lower().startswith("cluster-") and loc.casefold()!=obj.get("DbClusterResourceId","").casefold():
+            raise ValueError("CUR RDS cluster resource id differs from resolved cluster")
+        state.tags=tagmap(client.list_tags_for_resource(ResourceName=arn).get("TagList",[]),expected_shape="list",allow_missing_non_name_value=True)
+        anchor=meaningful(obj.get("DBClusterIdentifier",""))
+        if not anchor:
+            raise ValueError("RDS cluster identifier is opaque; inspect member names manually")
+        state.candidate=anchor if anchor.endswith("-rds") or "-db-" in anchor else suffix_name(anchor,"rds")
+        state.evidence=f"CUR cluster {loc} -> DescribeDBClusters {obj['DBClusterIdentifier']} / DbClusterResourceId={obj.get('DbClusterResourceId','')} / ARN={arn}"
+        state.result["write_target"]=arn
+
+    def _resolve_rds_instance(self, state, client):
+        instances=client.describe_db_instances(DBInstanceIdentifier=state.locator).get("DBInstances",[])
+        if len(instances)!=1:
+            raise ValueError("RDS DB instance not found")
+        obj=instances[0]
+        arn=obj["DBInstanceArn"]
+        state.tags=tagmap(client.list_tags_for_resource(ResourceName=arn).get("TagList",[]),expected_shape="list",allow_missing_non_name_value=True)
+        identity=obj["DBInstanceIdentifier"]
+        anchor=meaningful(identity)
+        cluster_id=obj.get("DBClusterIdentifier")
+        if cluster_id:
+            clusters=client.describe_db_clusters(DBClusterIdentifier=cluster_id).get("DBClusters",[])
+            if len(clusters)!=1:
+                raise ValueError("RDS parent cluster missing or ambiguous")
+            parent=clusters[0]
+            members={member.get("DBInstanceIdentifier") for member in parent.get("DBClusterMembers",[])}
+            if identity not in members:
+                raise ValueError("RDS instance not listed among DBClusterMembers; refusing inference")
+            cluster_tags=tagmap(client.list_tags_for_resource(ResourceName=parent["DBClusterArn"]).get("TagList",[]),expected_shape="list",allow_missing_non_name_value=True)
+            parent_name=meaningful(name_of(cluster_tags)) or meaningful(parent["DBClusterIdentifier"])
+            if not parent_name:
+                raise ValueError("RDS parent cluster has no identifiable Name/identifier")
+            if anchor and name_scope_prefix(anchor)!=name_scope_prefix(parent_name):
+                raise ValueError("RDS parent and child Name namespaces conflict")
+            if not anchor:
+                anchor=suffix_name(parent_name,"instance",obj.get("DbiResourceId",identity)[-7:].lower())
+                state.confidence="medium"
+            state.evidence=(f"RDS {identity} -> DBClusterIdentifier={cluster_id} -> "
+                            f"DBClusterMembers includes {identity} -> "
+                            f"cluster Name={name_of(cluster_tags) or '(unset)'} "
+                            f"/ clusterId={parent['DBClusterIdentifier']} "
+                            f"/ instance Product={state.tags.get('Product','(unset)')}")
+        else:
+            state.evidence=f"RDS standalone DBInstanceIdentifier={identity} (no parent cluster)"
+        if not anchor:
+            raise ValueError("RDS instance and cluster lack a descriptive Name namespace")
+        state.candidate=anchor if anchor.endswith("-rds") or "-db-" in anchor else suffix_name(anchor,"rds")
+        state.result["write_target"]=arn
+
+    def _resolve_opensearch(self, state):
+        client=self.client("opensearch",state.region)
+        obj=client.describe_domain(DomainName=state.locator)["DomainStatus"]
+        arn=obj["ARN"]
+        state.tags=tagmap(client.list_tags(ARN=arn).get("TagList",[]),expected_shape="list")
+        anchor=meaningful(obj["DomainName"])
+        if not anchor:
+            raise ValueError("OpenSearch domain lacks a structured namespace")
+        state.candidate=anchor if "opensearch" in anchor else suffix_name(anchor,"opensearch")
+        state.evidence=f"DescribeDomain {state.locator} -> domain {obj['DomainName']}"
+        state.result["write_target"]=arn
+
+    def _resolve_elbv2(self, state):
+        client=self.client("elbv2",state.region)
+        load_balancers=client.describe_load_balancers(LoadBalancerArns=[state.locator]).get("LoadBalancers",[])
+        if len(load_balancers)!=1:
+            raise ValueError("load balancer not found")
+        load_balancer=load_balancers[0]
+        state.tags=tagmap(client.describe_tags(ResourceArns=[state.locator])["TagDescriptions"][0]["Tags"],expected_shape="list",allow_missing_non_name_value=True)
+        anchor=meaningful(load_balancer["LoadBalancerName"])
+        if not anchor:
+            raise ValueError("LB name lacks a structured namespace")
+        role={"application":"alb","network":"nlb","gateway":"gwlb"}.get(load_balancer["Type"],"lb")
+        state.candidate=anchor if anchor.endswith("-"+role) else suffix_name(anchor,role)
+        state.evidence=f"LoadBalancer {state.locator} -> LoadBalancerName={load_balancer['LoadBalancerName']}"
+        state.result["write_target"]=state.locator
+
+    def _resolve_apigw_stage(self, state):
+        api_id,stage,arn=state.locator.split("|",2)
+        client=self.client("apigateway",state.region)
+        api=client.get_rest_api(restApiId=api_id)
+        state.tags=tagmap(client.get_tags(resourceArn=arn).get("tags",{}),expected_shape="map")
+        anchor=meaningful(api.get("name",""))
+        if not anchor:
+            raise ValueError("REST API name lacks a structured namespace")
+        stage_anchor=meaningful(stage)
+        if stage_anchor and name_scope_prefix(stage_anchor)==name_scope_prefix(anchor):
+            state.candidate=suffix_name(stage_anchor,"apigateway-stage")
+        else:
+            state.candidate=suffix_name(anchor,"stage",stage)
+        state.evidence=f"REST API stage {stage} -> GetRestApi({api_id}) name={api['name']}"
+        state.result["write_target"]=arn
+
+    def _resolve_cloudfront(self, state):
+        client=self.client("cloudfront","us-east-1")
+        distribution_id=state.locator.rsplit("/",1)[-1]
+        state.tags=tagmap(client.list_tags_for_resource(Resource=state.locator)["Tags"].get("Items",[]),expected_shape="list",allow_missing_non_name_value=True)
+        config=client.get_distribution_config(Id=distribution_id)["DistributionConfig"]
+        origins=[origin["DomainName"].lower() for origin in config.get("Origins",{}).get("Items",[])]
+        anchors=[]
+        for origin in origins:
+            host=origin.removesuffix(".")
+            anchor=meaningful(host.split(".")[0])
+            if not anchor:
+                raise ValueError(f"CloudFront origin lacks a structured namespace: {host}")
+            anchors.append(anchor)
+        if not anchors or len({name_scope_prefix(anchor) for anchor in anchors})!=1:
+            raise ValueError("CloudFront has no origins or conflicting Name namespaces")
+        anchor=anchors[0] if len(anchors)==1 else name_scope_prefix(anchors[0])
+        comment=config.get("Comment","")
+        aliases=config.get("Aliases",{}).get("Items",[])
+        role=""
+        if "resize" in comment.lower():
+            role="image-resize" if "image" in comment.lower() else "resize"
+        elif any(alias.startswith(("image.","static.image.")) for alias in aliases):
+            role="image"
+        state.candidate=suffix_name(anchor,*([role] if role else []),"cloudfront",distribution_id[-7:].lower())
+        state.evidence=(f"CloudFront {distribution_id} -> origins={origins}; "
+                        f"comment={comment!r}; aliases={aliases}; anchor={anchor}")
+        state.result["write_target"]=state.locator
+        state.confidence="medium"
+
+    def _resolve_athena(self, state):
+        client=self.client("athena",state.region)
+        tag_page=client.list_tags_for_resource(ResourceARN=state.locator)
+        if tag_page.get("NextToken") is not None:
+            raise ValueError("Athena tag response is paginated; Name state UNKNOWN until all tags are read")
+        state.tags=tagmap(tag_page.get("Tags",[]),expected_shape="list",allow_missing_non_name_value=True)
+        workgroup_name=state.locator.rsplit("/",1)[-1]
+        workgroup=client.get_work_group(WorkGroup=workgroup_name)["WorkGroup"]
+        anchor=meaningful(workgroup["Name"])
+        if not anchor:
+            raise ValueError("Athena workgroup name is not product-identifiable")
+        state.candidate=suffix_name(anchor,"athena-workgroup")
+        state.evidence=f"Athena workgroup ARN -> WorkGroup.Name={workgroup['Name']}"
+        state.result["write_target"]=state.locator
+
+    def _resolve_log_group(self, state):
+        client=self.client("logs",state.region)
+        arn=f"arn:aws:logs:{state.region}:{self.account}:log-group:{state.locator}"
+        state.tags=tagmap(client.list_tags_for_resource(resourceArn=arn).get("tags",{}),expected_shape="map")
+        anchor=meaningful(state.locator)
+        if anchor is None and state.locator.startswith("/aws/lambda/"):
+            function=state.locator.rsplit("/",1)[-1]
+            config=self.client("lambda",state.region).get_function_configuration(FunctionName=function)
+            anchor=meaningful(config.get("FunctionName",""))
+            if anchor:
+                state.evidence=f"log group {state.locator} -> lambda function {function}"
+        if not anchor:
+            raise ValueError("LogGroup cannot be linked to a structured resource name")
+        state.candidate=anchor if anchor.endswith(("-log","-logs")) else suffix_name(anchor,"logs")
+        if not state.evidence:
+            state.evidence=f"LogGroup explicitly named {state.locator}"
+        state.result["write_target"]=arn
+
+    def _resolve_lambda(self, state):
+        client=self.client("lambda",state.region)
+        config=client.get_function_configuration(FunctionName=state.locator)
+        state.tags=tagmap(client.list_tags(Resource=config["FunctionArn"]).get("Tags",{}),expected_shape="map")
+        anchor=meaningful(config.get("FunctionName",""))
+        if not anchor:
+            raise ValueError("Lambda function name lacks a structured namespace")
+        state.candidate=anchor if anchor.endswith("-lambda") else suffix_name(anchor,"lambda")
+        state.evidence=f"Lambda {state.locator} -> function={config['FunctionName']}"
+        state.result["write_target"]=config["FunctionArn"]
+
+    def _resolve_wafv2(self, state):
+        client=self.client("wafv2",state.region)
+        tag_page=client.list_tags_for_resource(ResourceARN=state.locator)
+        marker=tag_page.get("NextMarker")
+        if marker is not None and marker!="":
+            raise ValueError("WAFv2 tag response is paginated; Name state UNKNOWN until all tags are read")
+        state.tags=tagmap(tag_page.get("TagInfoForResource",{}).get("TagList",[]),expected_shape="list")
+        acl_name,idpart=state.locator.split("/webacl/",1)[-1].split("/",1)
+        scope="CLOUDFRONT" if ":global/" in state.locator else "REGIONAL"
+        webacl=client.get_web_acl(Name=acl_name,Scope=scope,Id=idpart)["WebACL"]
+        if webacl.get("ARN")!=state.locator:
+            raise ValueError("WAF WebACL ARN does not match live returned ACL")
+        anchor=meaningful(webacl["Name"])
+        if not anchor:
+            raise ValueError("WAF ACL name lacks a structured namespace")
+        state.candidate=anchor if anchor.endswith("-waf") else suffix_name(anchor,"waf")
+        state.evidence=f"WAF GetWebACL {webacl['Name']} id={idpart} ARN={state.locator}"
+        state.result["write_target"]=state.locator
+
+    def _resolve_s3_bucket(self, state):
+        client=self.client("s3","us-east-1")
+        try:
+            state.tags=tagmap(client.get_bucket_tagging(Bucket=state.locator,ExpectedBucketOwner=self.account).get("TagSet",[]),expected_shape="list")
+        except Exception as error:
+            code=getattr(error,"response",{}).get("Error",{}).get("Code","")
+            if code in ("NoSuchTagSet","NoSuchTagSetError"):
+                state.tags={}
+            else:
+                raise
+        anchor=meaningful(state.locator)
+        if not anchor:
+            raise ValueError("Bucket name lacks a structured namespace")
+        if anchor.startswith("dh-"):
+            anchor=anchor[3:]
+        state.candidate=anchor if anchor.endswith("-s3") else suffix_name(anchor,"s3")
+        state.evidence=f"Bucket {state.locator} (ExpectedBucketOwner={self.account}) -> bucket naming convention"
+        state.result["write_target"]=state.locator
+        state.confidence="medium"
+
+    def _resolve_ec2_resource(self, state):
+        client=self.client("ec2",state.region)
+        match state.kind:
+            case "instance": self._resolve_instance(state)
+            case "volume": self._resolve_volume(state)
+            case "snapshot": self._resolve_snapshot(state,client)
+            case "eni": self._resolve_eni(state,client)
+            case "eip": self._resolve_eip(state,client)
+            case "nat": self._resolve_nat(state,client)
+            case "endpoint": self._resolve_endpoint(state,client)
+        state.result["write_target"]=state.locator
+
+    def _resolve_rds_resource(self, state):
+        client=self.client("rds",state.region)
+        if state.kind=="rds_cluster":
+            self._resolve_rds_cluster(state,client)
+        else:
+            self._resolve_rds_instance(state,client)
+
+    def _resolve_service_resource(self, state):
+        match state.kind:
+            case "opensearch": self._resolve_opensearch(state)
+            case "elbv2": self._resolve_elbv2(state)
+            case "apigw_stage": self._resolve_apigw_stage(state)
+            case "cloudfront": self._resolve_cloudfront(state)
+            case "athena_workgroup": self._resolve_athena(state)
+            case "log_group": self._resolve_log_group(state)
+            case "lambda": self._resolve_lambda(state)
+            case "wafv2": self._resolve_wafv2(state)
+            case "s3_bucket": self._resolve_s3_bucket(state)
+            case _:
+                raise ValueError("Unsupported AWS service/resource type")
+
     def resolve(self, item: dict, *, name_state_fn=name_state,
                 candidate_states=NAME_CANDIDATE_STATES) -> dict:
-        """Read live tags, trace lineage, and make a conservative proposal."""
-        kind,loc,region=item["kind"],item["locator"],item["region"]
-        res={"status":"manual_review", "proposed_name":"", "confidence":"none", "evidence":"", "write_target":"", "kind":kind,
-             "name_state":"UNKNOWN", "name_key_present":None, "name_raw_value":None,
-             "existing_name":""}
+        kind,locator,region=item["kind"],item["locator"],item["region"]
+        result={"status":"manual_review","proposed_name":"","confidence":"none",
+                "evidence":"","write_target":"","kind":kind,
+                "name_state":"UNKNOWN","name_key_present":None,
+                "name_raw_value":None,"existing_name":""}
+        state=_ResolutionContext(kind,locator,region,name_state_fn,candidate_states,result)
         try:
-            tags=None; candidate=None; evidence=""; confidence="high"
             if kind in ("instance","volume","snapshot","eni","eip","nat","endpoint"):
-                ec2=self.client("ec2",region)
-                if kind=="instance":
-                    o=self.instance(region,loc);tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state_fn(tags) in candidate_states:
-                        relations=[]
-                        for key,label in (("aws:autoscaling:groupName","AutoScaling Group"),
-                                          ("aws:cloudformation:stack-name","CloudFormation Stack")):
-                            value=meaningful(tags.get(key,""))
-                            if value:relations.append((value,f"{label}={value}"))
-                        if not relations:
-                            raise ValueError("EC2 instance missing Name and structured ASG/CloudFormation ownership")
-                        if len({name_scope_prefix(x[0]) for x in relations})!=1:
-                            raise ValueError("EC2 ASG and CloudFormation Stack Names have conflicting namespaces")
-                        # ASG/CloudFormation is an actual owning relationship, not an opaque ID guess.
-                        anchor=relations[0][0]
-                        candidate=suffix_name(anchor,"ec2",loc[-7:])
-                        evidence=f"EC2 {loc} -> " + ", ".join(x[1] for x in relations)
-                        confidence="medium"  # team should confirm a distinct EC2 role
-                if kind=="volume":
-                    o=self.volume(region,loc);tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state_fn(tags) in candidate_states:
-                        base,evidence=self.volume_owner(region,loc)
-                        # EBS without Name inherits uniquely attached EC2's Name.
-                        candidate=base
-                elif kind=="snapshot":
-                    snaps=ec2.describe_snapshots(SnapshotIds=[loc],OwnerIds=["self"]).get("Snapshots",[])
-                    if len(snaps)!=1 or snaps[0].get("OwnerId")!=self.account:
-                        raise ValueError("snapshot is absent or not owned by target account")
-                    o=snaps[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state_fn(tags) in candidate_states:
-                        src=o.get("VolumeId","")
-                        if not src: raise ValueError("snapshot missing source volume")
-                        # Source volume's CURRENT attachment does not establish
-                        # who owned the snapshot at its creation time.
-                        raise ValueError(f"Snapshot {loc} source VolumeId={src}; historical owner evidence required")
-                elif kind=="eni":
-                    eni=ec2.describe_network_interfaces(NetworkInterfaceIds=[loc]).get("NetworkInterfaces",[])
-                    if len(eni)!=1: raise ValueError("ENI not found")
-                    o=eni[0];tags=tagmap(o.get("TagSet",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state_fn(tags) in candidate_states:
-                        iid=o.get("Attachment",{}).get("InstanceId")
-                        if not iid: raise ValueError("ENI not attached to EC2 instance")
-                        base,path=self.parent_instance(region,iid)
-                        idx=o["Attachment"].get("DeviceIndex")
-                        if idx is None:raise ValueError("ENI device index unavailable")
-                        candidate=suffix_name(base,"eni",f"eth{idx}",loc[-7:]); evidence=f"ENI {loc} -> {path}"
-                elif kind=="eip":
-                    obj=ec2.describe_addresses(AllocationIds=[loc]).get("Addresses",[])
-                    if len(obj)!=1: raise ValueError("EIP not found")
-                    tags=tagmap(obj[0].get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state_fn(tags) in candidate_states:candidate,evidence,_=self.eip_owner(region,loc)
-                elif kind=="nat":
-                    nat=ec2.describe_nat_gateways(NatGatewayIds=[loc]).get("NatGateways",[])
-                    if len(nat)!=1:raise ValueError("NAT not found")
-                    o=nat[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state_fn(tags) in candidate_states:
-                        candidate,evidence=self.nat_owner(region,o);confidence="medium"
-                elif kind=="endpoint":
-                    end=ec2.describe_vpc_endpoints(VpcEndpointIds=[loc]).get("VpcEndpoints",[])
-                    if len(end)!=1:raise ValueError("VPC endpoint not found")
-                    o=end[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state_fn(tags) in candidate_states:
-                        vpc=self.vpc(region,o["VpcId"])
-                        vn=meaningful(name_of(tagmap(vpc.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)))
-                        ss=[self.subnet(region,id) for id in o.get("SubnetIds",[])]
-                        names=[meaningful(name_of(tagmap(s.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True))) for s in ss]
-                        if not vn or not names or any(n is None or name_scope_prefix(n)!=name_scope_prefix(vn) for n in names):
-                            raise ValueError("VPC endpoint shared/ambiguous; require uniformly named VPC and all subnets")
-                        svc=o["ServiceName"].split(".")[-1]
-                        candidate=suffix_name(vn,"vpce",svc,loc[-6:]);confidence="medium"
-                        evidence=f"endpoint {loc} -> VPC {o['VpcId']} Name={vn} and {len(ss)} same-namespace subnets"
-                res["write_target"]=loc
+                self._resolve_ec2_resource(state)
             elif kind in ("rds_cluster","rds_instance"):
-                rds=self.client("rds",region)
-                if kind=="rds_cluster":
-                    if re.fullmatch(r"cluster-[a-z0-9]{14,}",loc,re.I):
-                        # CUR normalizes IDs to lowercase but AWS RDS reports
-                        # DbClusterResourceId with uppercase characters.
-                        # AWS filters are case-sensitive: scan read-only pages
-                        # and compare case-insensitively before proposing.
-                        results=[];marker=None;seen_markers=set()
-                        for _ in range(MAX_RDS_CLUSTER_PAGES):
-                            query={"MaxRecords":100}
-                            if marker is not None:query["Marker"]=marker
-                            page=rds.describe_db_clusters(**query)
-                            results.extend(c for c in page.get("DBClusters",[])
-                                           if c.get("DbClusterResourceId","").casefold()==loc.casefold())
-                            next_marker=page.get("Marker")
-                            if next_marker in (None, ""):
-                                break
-                            if not isinstance(next_marker, str) or next_marker in seen_markers:
-                                raise ValueError("RDS cluster pagination marker invalid or repeated")
-                            seen_markers.add(next_marker)
-                            marker=next_marker
-                        else:
-                            raise ValueError("RDS cluster pagination page budget exceeded")
-                    else:
-                        results=rds.describe_db_clusters(DBClusterIdentifier=loc).get("DBClusters",[])
-                    if len(results)!=1:raise ValueError("RDS cluster not found/unique")
-                    o=results[0];arn=o["DBClusterArn"]
-                    if loc.lower().startswith("cluster-") and loc.casefold()!=o.get("DbClusterResourceId","").casefold():
-                        raise ValueError("CUR RDS cluster resource id differs from resolved cluster")
-                    tags=tagmap(rds.list_tags_for_resource(ResourceName=arn).get("TagList",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    anchor=meaningful(o.get("DBClusterIdentifier",""))
-                    if not anchor:
-                        raise ValueError("RDS cluster identifier is opaque; inspect member names manually")
-                    candidate=anchor if anchor.endswith("-rds") or "-db-" in anchor else suffix_name(anchor,"rds")
-                    evidence=f"CUR cluster {loc} -> DescribeDBClusters {o['DBClusterIdentifier']} / DbClusterResourceId={o.get('DbClusterResourceId','')} / ARN={arn}"
-                    res["write_target"]=arn
-                else:
-                    results=rds.describe_db_instances(DBInstanceIdentifier=loc).get("DBInstances",[])
-                    if len(results)!=1:raise ValueError("RDS DB instance not found")
-                    o=results[0];arn=o["DBInstanceArn"]
-                    tags=tagmap(rds.list_tags_for_resource(ResourceName=arn).get("TagList",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    identity=o["DBInstanceIdentifier"]
-                    anchor=meaningful(identity)
-                    cluster_id=o.get("DBClusterIdentifier")
-                    if cluster_id:
-                        clusters=rds.describe_db_clusters(DBClusterIdentifier=cluster_id).get("DBClusters",[])
-                        if len(clusters)!=1:
-                            raise ValueError("RDS parent cluster missing or ambiguous")
-                        parent=clusters[0]
-                        members={m.get("DBInstanceIdentifier") for m in parent.get("DBClusterMembers",[])}
-                        if identity not in members:
-                            raise ValueError("RDS instance not listed among DBClusterMembers; refusing inference")
-                        cluster_tags=tagmap(rds.list_tags_for_resource(ResourceName=parent["DBClusterArn"]).get("TagList",[]), expected_shape="list", allow_missing_non_name_value=True)
-                        parent_name=meaningful(name_of(cluster_tags)) or meaningful(parent["DBClusterIdentifier"])
-                        if not parent_name:
-                            raise ValueError("RDS parent cluster has no identifiable Name/identifier")
-                        if anchor and name_scope_prefix(anchor)!=name_scope_prefix(parent_name):
-                            raise ValueError("RDS parent and child Name namespaces conflict")
-                        if not anchor:
-                            anchor=suffix_name(parent_name,"instance",o.get("DbiResourceId",identity)[-7:].lower())
-                            confidence="medium"
-                        evidence=(f"RDS {identity} -> DBClusterIdentifier={cluster_id} -> "
-                                  f"DBClusterMembers includes {identity} -> "
-                                  f"cluster Name={name_of(cluster_tags) or '(unset)'} "
-                                  f"/ clusterId={parent['DBClusterIdentifier']} "
-                                  f"/ instance Product={tags.get('Product','(unset)')}")
-                    else:
-                        evidence=f"RDS standalone DBInstanceIdentifier={identity} (no parent cluster)"
-                    if not anchor:
-                        raise ValueError("RDS instance and cluster lack a descriptive Name namespace")
-                    candidate=anchor if anchor.endswith("-rds") or "-db-" in anchor else suffix_name(anchor,"rds")
-                    # Product/Name mapping is external and never gates a proposal.
-                    res["write_target"]=arn
-            elif kind=="opensearch":
-                os=self.client("opensearch",region)
-                o=os.describe_domain(DomainName=loc)["DomainStatus"];arn=o["ARN"]
-                tags=tagmap(os.list_tags(ARN=arn).get("TagList",[]), expected_shape="list")
-                anchor=meaningful(o["DomainName"])
-                if not anchor:raise ValueError("OpenSearch domain lacks a structured namespace")
-                candidate=anchor if "opensearch" in anchor else suffix_name(anchor,"opensearch")
-                evidence=f"DescribeDomain {loc} -> domain {o['DomainName']}";res["write_target"]=arn
-            elif kind=="elbv2":
-                c=self.client("elbv2",region)
-                o=c.describe_load_balancers(LoadBalancerArns=[loc]).get("LoadBalancers",[])
-                if len(o)!=1:raise ValueError("load balancer not found")
-                tags=tagmap(c.describe_tags(ResourceArns=[loc])["TagDescriptions"][0]["Tags"], expected_shape="list", allow_missing_non_name_value=True)
-                anchor=meaningful(o[0]["LoadBalancerName"])
-                if not anchor:raise ValueError("LB name lacks a structured namespace")
-                role={"application":"alb","network":"nlb","gateway":"gwlb"}.get(o[0]["Type"],"lb")
-                candidate=anchor if anchor.endswith("-"+role) else suffix_name(anchor,role)
-                evidence=f"LoadBalancer {loc} -> LoadBalancerName={o[0]['LoadBalancerName']}";res["write_target"]=loc
-            elif kind=="apigw_stage":
-                api_id,stage,arn=loc.split("|",2); c=self.client("apigateway",region)
-                o=c.get_rest_api(restApiId=api_id)
-                tags=tagmap(c.get_tags(resourceArn=arn).get("tags",{}), expected_shape="map")
-                anchor=meaningful(o.get("name",""))
-                if not anchor:raise ValueError("REST API name lacks a structured namespace")
-                stage_anchor=meaningful(stage)
-                if stage_anchor and name_scope_prefix(stage_anchor)==name_scope_prefix(anchor):
-                    candidate=suffix_name(stage_anchor,"apigateway-stage")
-                else:
-                    candidate=suffix_name(anchor,"stage",stage)
-                evidence=f"REST API stage {stage} -> GetRestApi({api_id}) name={o['name']}";res["write_target"]=arn
-            elif kind=="cloudfront":
-                c=self.client("cloudfront","us-east-1")
-                distid=loc.rsplit("/",1)[-1]
-                tags=tagmap(c.list_tags_for_resource(Resource=loc)["Tags"].get("Items",[]), expected_shape="list", allow_missing_non_name_value=True)
-                conf=c.get_distribution_config(Id=distid)["DistributionConfig"]
-                origins=[o["DomainName"].lower() for o in conf.get("Origins",{}).get("Items",[])]
-                # Origins are provenance, not arbitrary opaque distribution ids.
-                anchors=[]
-                for origin in origins:
-                    host=origin.removesuffix(".")
-                    start=host.split(".")[0]
-                    anchor=meaningful(start)
-                    if not anchor:raise ValueError(f"CloudFront origin lacks a structured namespace: {host}")
-                    anchors.append(anchor)
-                if not anchors or len({name_scope_prefix(x) for x in anchors})!=1:
-                    raise ValueError("CloudFront has no origins or conflicting Name namespaces")
-                anchor=anchors[0] if len(anchors)==1 else name_scope_prefix(anchors[0])
-                comment=conf.get("Comment","")
-                aliases=conf.get("Aliases",{}).get("Items",[])
-                role=""
-                if "resize" in comment.lower():
-                    role="image-resize" if ("image" in comment.lower()) else "resize"
-                elif any(a.startswith(("image.", "static.image.")) for a in aliases):
-                    role="image"
-                # No arbitrary Comment->Product mapping. A Comment is weak evidence
-                # of purpose, while actual origin remains the ownership anchor.
-                candidate=suffix_name(anchor,*([role] if role else []),"cloudfront",distid[-7:].lower())
-                evidence=(f"CloudFront {distid} -> origins={origins}; "
-                          f"comment={comment!r}; aliases={aliases}; anchor={anchor}")
-                res["write_target"]=loc
-                confidence="medium" # CloudFront may be shared; require explicit approval
-            elif kind=="athena_workgroup":
-                c=self.client("athena",region)
-                tag_page=c.list_tags_for_resource(ResourceARN=loc)
-                # The first page is not evidence of an ABSENT/EMPTY Name if
-                # additional tags might be on later pages. Fail closed instead
-                # of drawing conclusions from an incomplete collection.
-                if tag_page.get("NextToken") is not None:
-                    raise ValueError("Athena tag response is paginated; Name state UNKNOWN until all tags are read")
-                tags=tagmap(tag_page.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                wg=loc.rsplit("/",1)[-1];o=c.get_work_group(WorkGroup=wg)["WorkGroup"]
-                anchor=meaningful(o["Name"])
-                if not anchor:raise ValueError("Athena workgroup name is not product-identifiable")
-                candidate=suffix_name(anchor,"athena-workgroup")
-                evidence=f"Athena workgroup ARN -> WorkGroup.Name={o['Name']}";res["write_target"]=loc
-            elif kind=="log_group":
-                c=self.client("logs",region)
-                # Complete LogGroup ARN requires account; do NOT append :*.
-                arn=f"arn:aws:logs:{region}:{self.account}:log-group:{loc}"
-                tags=tagmap(c.list_tags_for_resource(resourceArn=arn).get("tags",{}), expected_shape="map")
-                anchor=meaningful(loc)
-                if anchor is None and loc.startswith("/aws/lambda/"):
-                    function=loc.rsplit("/",1)[-1]
-                    conf=self.client("lambda",region).get_function_configuration(FunctionName=function)
-                    anchor=meaningful(conf.get("FunctionName",""))
-                    if anchor:evidence=f"log group {loc} -> lambda function {function}"
-                if not anchor:raise ValueError("LogGroup cannot be linked to a structured resource name")
-                candidate=anchor if anchor.endswith(("-log", "-logs")) else suffix_name(anchor,"logs")
-                if not evidence:evidence=f"LogGroup explicitly named {loc}"
-                res["write_target"]=arn
-            elif kind=="lambda":
-                c=self.client("lambda",region);conf=c.get_function_configuration(FunctionName=loc)
-                tags=tagmap(c.list_tags(Resource=conf["FunctionArn"]).get("Tags",{}), expected_shape="map")
-                anchor=meaningful(conf.get("FunctionName",""))
-                if not anchor:raise ValueError("Lambda function name lacks a structured namespace")
-                candidate=anchor if anchor.endswith("-lambda") else suffix_name(anchor,"lambda")
-                evidence=f"Lambda {loc} -> function={conf['FunctionName']}";res["write_target"]=conf["FunctionArn"]
-            elif kind=="wafv2":
-                c=self.client("wafv2",region)
-                tag_page=c.list_tags_for_resource(ResourceARN=loc)
-                # WAFv2 NextMarker is at the top level, not inside
-                # TagInfoForResource. A partial page must never authorize a
-                # Name candidate, even if its TagList has no Name key.
-                # AWS CLI examples use an empty string for the terminal marker,
-                # despite the API model's nonempty marker constraint. Only an
-                # actual nonempty (or malformed non-string) marker fails closed.
-                marker=tag_page.get("NextMarker")
-                if marker is not None and marker != "":
-                    raise ValueError("WAFv2 tag response is paginated; Name state UNKNOWN until all tags are read")
-                tags=tagmap(tag_page.get("TagInfoForResource",{}).get("TagList",[]), expected_shape="list")
-                acl_name,idpart=loc.split("/webacl/",1)[-1].split("/",1)
-                scope="CLOUDFRONT" if ":global/" in loc else "REGIONAL"
-                webacl=c.get_web_acl(Name=acl_name,Scope=scope,Id=idpart)["WebACL"]
-                if webacl.get("ARN")!=loc:
-                    raise ValueError("WAF WebACL ARN does not match live returned ACL")
-                anchor=meaningful(webacl["Name"])
-                if not anchor:raise ValueError("WAF ACL name lacks a structured namespace")
-                candidate=anchor if anchor.endswith("-waf") else suffix_name(anchor,"waf")
-                evidence=f"WAF GetWebACL {webacl['Name']} id={idpart} ARN={loc}";res["write_target"]=loc
-            elif kind=="s3_bucket":
-                c=self.client("s3","us-east-1")
-                # Neither CUR nor account ownership is sufficient: ExpectedBucketOwner is mandatory.
-                try:
-                    tags=tagmap(c.get_bucket_tagging(Bucket=loc,ExpectedBucketOwner=self.account).get("TagSet",[]), expected_shape="list")
-                except Exception as e:
-                    code=getattr(e,"response",{}).get("Error",{}).get("Code","")
-                    if code in ("NoSuchTagSet","NoSuchTagSetError"):
-                        tags={}
-                    else:raise
-                anchor=meaningful(loc)
-                if not anchor:raise ValueError("Bucket name lacks a structured namespace")
-                if anchor.startswith("dh-"): anchor=anchor[3:]
-                candidate=anchor if anchor.endswith("-s3") else suffix_name(anchor,"s3")
-                evidence=f"Bucket {loc} (ExpectedBucketOwner={self.account}) -> bucket naming convention"
-                res["write_target"]=loc;confidence="medium"
+                self._resolve_rds_resource(state)
             else:
-                raise ValueError("Unsupported AWS service/resource type")
-            observed = name_state_fn(tags)
-            res.update(name_state=observed,
-                       name_key_present="Name" in tags if isinstance(tags, dict) else None,
-                       name_raw_value=name_of(tags),
-                       existing_name=name_of(tags) or "")
-            if observed == "NONEMPTY":
-                res.update(status="already_named", evidence=f"current nonempty Name protected; unchanged: {name_of(tags)}")
-                return res
-            if observed == "UNKNOWN":
-                res.update(status="manual_review", evidence="Name tag state UNKNOWN: unreadable or malformed; no proposal")
-                return res
-            if not candidate or not meaningful(candidate):
-                raise ValueError("Candidate lacks a structured Name namespace")
-            if shared_scope(candidate):
-                # A shared-service Name describes infrastructure only; it is
-                # NOT an assertion of single-product ownership.
-                confidence="medium"
-                evidence += "; shared infrastructure: descriptive Name only, no product classification"
-            res.update(status="proposed", proposed_name=candidate, confidence=confidence,evidence=evidence)
-        except Exception as e:
-            if isinstance(e, AWSReadBudgetExceeded):
-                res.update(status="manual_review", proposed_name="", confidence="none",
-                           name_state="UNKNOWN", name_key_present=None,
-                           name_raw_value=None, existing_name="",
-                           evidence=f"{type(e).__name__}: {e}")
-                return res
-            observed = name_state_fn(tags)
-            res.update(name_state=observed,
-                       name_key_present="Name" in tags if isinstance(tags, dict) else None,
-                       name_raw_value=name_of(tags) if isinstance(tags, dict) else None,
-                       existing_name=(name_of(tags) or "") if isinstance(tags, dict) else "")
-            if observed == "NONEMPTY":
-                res.update(status="already_named", evidence=f"current nonempty Name protected; unchanged: {name_of(tags)}")
-                return res
-            from botocore.exceptions import BotoCoreError, ClientError
-            if isinstance(e,(BotoCoreError,ClientError)):
-                res["status"]="api_error"  # failed read MUST never fall back to guessing
-            res["evidence"]=f"{type(e).__name__}: {e}"
-        return res
+                self._resolve_service_resource(state)
+            self._finish_resolution(state)
+        except Exception as error:
+            self._finish_resolution_error(state,error)
+        return result
+
+    def _finish_resolution(self,state):
+        tags=state.tags
+        observed=state.name_state_fn(tags)
+        state.result.update(name_state=observed,
+                            name_key_present="Name" in tags if isinstance(tags,dict) else None,
+                            name_raw_value=name_of(tags),existing_name=name_of(tags) or "")
+        if observed=="NONEMPTY":
+            state.result.update(status="already_named",evidence=f"current nonempty Name protected; unchanged: {name_of(tags)}")
+            return
+        if observed=="UNKNOWN":
+            state.result.update(status="manual_review",evidence="Name tag state UNKNOWN: unreadable or malformed; no proposal")
+            return
+        if not state.candidate or not meaningful(state.candidate):
+            raise ValueError("Candidate lacks a structured Name namespace")
+        if shared_scope(state.candidate):
+            state.confidence="medium"
+            state.evidence += "; shared infrastructure: descriptive Name only, no product classification"
+        state.result.update(status="proposed",proposed_name=state.candidate,
+                            confidence=state.confidence,evidence=state.evidence)
+
+    def _finish_resolution_error(self,state,error):
+        if isinstance(error,AWSReadBudgetExceeded):
+            state.result.update(status="manual_review",proposed_name="",confidence="none",
+                                name_state="UNKNOWN",name_key_present=None,name_raw_value=None,
+                                existing_name="",evidence=f"{type(error).__name__}: {error}")
+            return
+        tags=state.tags
+        observed=state.name_state_fn(tags)
+        state.result.update(name_state=observed,
+                            name_key_present="Name" in tags if isinstance(tags,dict) else None,
+                            name_raw_value=name_of(tags) if isinstance(tags,dict) else None,
+                            existing_name=(name_of(tags) or "") if isinstance(tags,dict) else "")
+        if observed=="NONEMPTY":
+            state.result.update(status="already_named",evidence=f"current nonempty Name protected; unchanged: {name_of(tags)}")
+            return
+        from botocore.exceptions import BotoCoreError, ClientError
+        if isinstance(error,(BotoCoreError,ClientError)):
+            state.result["status"]="api_error"
+        state.result["evidence"]=f"{type(error).__name__}: {error}"
 
     def write_name(self, item: dict):
         """Fail closed for ALL callers, including direct invocation.
@@ -1371,7 +1477,7 @@ def safe_csv_row(row):
 def report_output_paths(output: Path, *, mode: str | None = None) -> list[Path]:
     """Files that this invocation may create; never overwrite any of them."""
     out = Path(output)
-    paths = [out, out.with_suffix(".review.csv"), out.with_suffix(".report.csv")]
+    paths = [out, out.with_suffix(REVIEW_CSV_SUFFIX), out.with_suffix(REPORT_CSV_SUFFIX)]
     if mode == "dryrun":
         paths.append(out.with_suffix(".result.csv"))
     elif mode == "y":
@@ -1623,7 +1729,7 @@ def _require_run_cur_unchanged(args, snapshot):
 
 def run_interactive(args):
     """Human-controlled single entry point. Dryrun never invokes an AWS write API."""
-    if not re.fullmatch(r"\d{12}", args.account):
+    if not ACCOUNT_ID_PATTERN.fullmatch(args.account):
         raise SystemExit("--account must be 12 digits")
     # Check the private directory AND pre-existing output collisions before
     # login or STS. For a preselected mode, also check mode-specific files.
@@ -1847,7 +1953,7 @@ def plan_batch(args, *, scope_declarations, session=None):
     from name_tag_batch_state import batch_name_state, build_batch_review_projection
     from name_tag_batch_state import validate_batch_draft
 
-    if not re.fullmatch(r"\d{12}", args.account):
+    if not ACCOUNT_ID_PATTERN.fullmatch(args.account):
         raise SystemExit("--account must be 12 digits")
     if not args.cur or args.min_cost < 0 or args.max_resources <= 0:
         raise SystemExit("Invalid Batch CUR inputs or limits")
@@ -1855,8 +1961,8 @@ def plan_batch(args, *, scope_declarations, session=None):
     if type(max_send_attempts) is not int or not 1 <= max_send_attempts <= 20:
         raise SystemExit("--max-send-attempts must be between 1 and 20")
     out = Path(args.output)
-    review_path = out.with_suffix(".review.csv")
-    report_path = out.with_suffix(".report.csv")
+    review_path = out.with_suffix(REVIEW_CSV_SUFFIX)
+    report_path = out.with_suffix(REPORT_CSV_SUFFIX)
     destinations = [out, review_path, report_path]
     preflight_report_destination(out)
     preflight_outputs(destinations)
@@ -1940,11 +2046,11 @@ def batch_plan_cli(args, *, session=None):
 
 
 def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
-    if not re.fullmatch(r"\d{12}",args.account):raise SystemExit("--account must be 12 digits")
+    if not ACCOUNT_ID_PATTERN.fullmatch(args.account):raise SystemExit("--account must be 12 digits")
     if not args.cur:raise SystemExit("Provide at least one --cur .csv.gz file")
     out=Path(args.output)
-    review=out.with_suffix(".review.csv")
-    report=out.with_suffix(".report.csv")
+    review=out.with_suffix(REVIEW_CSV_SUFFIX)
+    report=out.with_suffix(REPORT_CSV_SUFFIX)
     destinations=report_output_paths(out, mode=extra_mode)
     # Validate the output trust contract before CUR parsing and AWS session use.
     preflight_report_destination(out)
@@ -2005,6 +2111,23 @@ def apply(args):
     raise SystemExit("ABORT: " + SAFETY_HOLD)
 
 
+def _validate_cli_args(args, parser):
+    if args.command in ("plan", "batch-plan", "run"):
+        if args.min_cost < 0 or args.max_resources <= 0:
+            parser.error("--min-cost must be nonnegative and --max-resources > 0")
+        if args.month and not re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", args.month):
+            parser.error("Invalid --month")
+        if args.command == "batch-plan" and not 1 <= args.max_send_attempts <= 20:
+            parser.error("--max-send-attempts must be between 1 and 20")
+        if args.command == "run" and args.max_writes <= 0:
+            parser.error("--max-writes must be positive")
+        return
+    if not re.fullmatch(r"[0-9a-f]{64}", args.sha256):
+        parser.error("--sha256 must be a 64-character lowercase hex string")
+    if args.max_writes <= 0:
+        parser.error("--max-writes must be positive")
+
+
 def parse_cli(argv=None):
     ap=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     sub=ap.add_subparsers(dest="command",required=True)
@@ -2055,15 +2178,7 @@ def parse_cli(argv=None):
     a.add_argument("--log",default="name_tag_apply_audit.json")
     a.set_defaults(func=apply)
     args=ap.parse_args(argv)
-    if args.command in ("plan", "batch-plan", "run"):
-        if args.min_cost<0 or args.max_resources<=0:ap.error("--min-cost must be nonnegative and --max-resources > 0")
-        if args.month and not re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])",args.month):ap.error("Invalid --month")
-        if args.command == "batch-plan" and not 1 <= args.max_send_attempts <= 20:
-            ap.error("--max-send-attempts must be between 1 and 20")
-        if args.command == "run" and args.max_writes <= 0:ap.error("--max-writes must be positive")
-    else:
-        if not re.fullmatch(r"[0-9a-f]{64}",args.sha256):ap.error("--sha256 must be a 64-character lowercase hex string")
-        if args.max_writes<=0:ap.error("--max-writes must be positive")
+    _validate_cli_args(args,ap)
     return args
 
 

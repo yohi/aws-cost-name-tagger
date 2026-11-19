@@ -21,7 +21,7 @@ from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 from collections.abc import Mapping, Sequence
 
 from name_tag_approval import (
@@ -46,6 +46,7 @@ from name_tag_batch_approval import (
 
 
 SCOPE_DECISION_NAMESPACE = "aws-cost-name-tagger-scope-decision-v1"
+_SHA256_HEX_PATTERN: Final = r"[0-9a-f]{64}"
 
 # Canonical execution payload operation allowlist.
 SUPPORTED_OPERATIONS = frozenset({"ec2:CreateTags:2016-11-15"})
@@ -138,7 +139,7 @@ def _valid_window(not_before: datetime, not_after: datetime, now: datetime) -> N
 
 def _require_sha256(value: object) -> str:
     """Require a 64-hex string; fail closed otherwise."""
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+    if not isinstance(value, str) or not re.fullmatch(_SHA256_HEX_PATTERN, value):
         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
     return value
 
@@ -285,7 +286,7 @@ def verify_scope_decision(
     signature_ref = envelope.get("signature_ref")
     if not isinstance(payload, Mapping) or not isinstance(decision_id, str) or not isinstance(signature_ref, str):
         raise LedgerError("BLOCKED_OWNER_AUTHN")
-    if not re.fullmatch(r"[0-9a-f]{64}", decision_id):
+    if not re.fullmatch(_SHA256_HEX_PATTERN, decision_id):
         raise LedgerError("BLOCKED_OWNER_AUTHN")
 
     try:
@@ -1484,7 +1485,7 @@ class IntentLedger:
             raise LedgerError("BLOCKED_INPUT_INVALID")
         if (not isinstance(reason_code,str) or re.fullmatch(r"[A-Z0-9_]{1,64}",reason_code) is None
                 or (observed_name_sha256 is not None
-                    and re.fullmatch(r"[0-9a-f]{64}",observed_name_sha256) is None)
+                    and re.fullmatch(_SHA256_HEX_PATTERN,observed_name_sha256) is None)
                 or (decision == "SKIPPED_NAME_CHANGED" and observed_name_sha256 is None)):
             raise LedgerError("BLOCKED_INPUT_INVALID")
         if type(scope) is not ScopeEvidence or not side_effects:
