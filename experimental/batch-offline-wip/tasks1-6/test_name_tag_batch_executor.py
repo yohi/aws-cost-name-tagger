@@ -1,5 +1,6 @@
 import tempfile,unittest
 from pathlib import Path
+from unittest.mock import patch
 from name_tag_batch_executor import InMemoryNameAdapter,simulate_untrusted_fixture
 from name_tag_batch_ledger import OfflineFixtureBatchLedger
 
@@ -22,7 +23,17 @@ class ExecutorFixtureTests(unittest.TestCase):
         result=simulate_untrusted_fixture('batch-2','nonce-2',self.rows,ledger=self.ledger,adapter=a,cap=2)
         self.assertEqual(a.write_calls,1)
         self.assertEqual(self.ledger.state('batch-2'),'STOPPED')
-        self.assertIn('OUTCOME_UNKNOWN',result['outcomes'])
+        self.assertEqual(result['outcomes'],['OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'])
+    def test_inactive_batch_classifies_current_and_remaining_rows(self):
+        a=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
+        register=self.ledger.register
+        def register_and_stop(*args,**kwargs):
+            register(*args,**kwargs)
+            self.ledger.stop('batch-stop','fixture stop')
+        with patch.object(self.ledger,'register',side_effect=register_and_stop):
+            result=simulate_untrusted_fixture('batch-stop','nonce-stop',self.rows,ledger=self.ledger,adapter=a,cap=2)
+        self.assertEqual(result['outcomes'],['NOT_ATTEMPTED_BATCH_STOP','NOT_ATTEMPTED_BATCH_STOP'])
+        self.assertEqual(a.write_calls,0)
     def test_presend_name_change_skips_not_consume(self):
         a=InMemoryNameAdapter({'volume-1':{'Name':'existing'},'volume-2':{}})
         result=simulate_untrusted_fixture('batch-3','nonce-3',self.rows,ledger=self.ledger,adapter=a,cap=2)

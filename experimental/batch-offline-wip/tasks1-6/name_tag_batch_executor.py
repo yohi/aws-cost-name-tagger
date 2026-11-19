@@ -44,14 +44,18 @@ def simulate_untrusted_fixture(batch_id,nonce,approved_rows,*,ledger:OfflineFixt
     ledger.register(batch_id,nonce,max_send_attempts=cap,row_count=len(approved_rows),scope_ids=scopes)
     outcomes=[]
     for i,row in enumerate(approved_rows):
-        if ledger.state(batch_id)!='ACTIVE':break
+        if ledger.state(batch_id)!='ACTIVE':
+            outcomes.extend(['NOT_ATTEMPTED_BATCH_STOP']*(len(approved_rows)-i))
+            break
         if ledger.counter(batch_id)>=cap:
             ledger.classify_cap(batch_id)
             outcomes.extend(['NOT_ATTEMPTED_CAP']*(len(approved_rows)-i))
             break
         outcome,stop=_execute_fixture_row(batch_id,i,row,ledger,adapter)
         outcomes.append(outcome)
-        if stop:break
+        if stop:
+            outcomes.extend(['NOT_ATTEMPTED_BATCH_STOP']*(len(approved_rows)-i-1))
+            break
     _finish_fixture_batch(batch_id,cap,approved_rows,outcomes,ledger)
     return {'authentication_state':'SYNTHETIC_TEST_ONLY','execution_allowed':False,
             'batch_state':ledger.state(batch_id),'send_attempts_consumed':ledger.counter(batch_id),
