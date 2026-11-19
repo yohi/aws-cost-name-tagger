@@ -2503,6 +2503,26 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
                              {'count':5,'cost_usd':'0.5'})
             self.assertEqual(reasons,{})
 
+    def test_batch_mixed_ec2_and_s3_cur_remains_reportable_without_s3_write_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'cur.csv.gz'
+            self.write_cur(path,[
+                self.row(line_item_resource_id=VOLUME,line_item_unblended_cost='2'),
+                self.row(line_item_resource_id='scs2-prd-assets',
+                         line_item_product_code='AmazonS3',line_item_unblended_cost='3'),
+            ])
+
+            _,candidates,population,_=t.cur_candidates_batch(
+                [str(path)],'2026-10',0,10,ACCOUNT)
+
+            self.assertEqual([(row['kind'],row['effective_usage_cost_usd'])
+                              for row in candidates],
+                             [('s3_bucket','3'),('volume','2')])
+            self.assertEqual(population['cur_recognized'],
+                             {'count':2,'cost_usd':'5'})
+            self.assertEqual(population['unsupported_kind'],
+                             {'known':True,'billing_rows':0,'cost_usd':'0'})
+
     def test_batch_population_separates_unattributable_unsupported_and_filtered_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'cur.csv.gz'

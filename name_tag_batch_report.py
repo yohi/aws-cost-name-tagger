@@ -3,11 +3,16 @@ from __future__ import annotations
 from decimal import Decimal,InvalidOperation
 from hashlib import sha256
 from datetime import datetime
+from types import MappingProxyType
+from typing import Final
 from name_tag_batch_state import validate_batch_draft, BatchValidationError
 from name_tag_batch_state import derive_declared_row_scope
 from name_tag_batch_approval import VerifiedBatchApproval, revalidate_verified_batch, BatchAuthRejected
+from name_tag_batch_outcomes import BatchOutcomeError,reconcile_batch_outcomes
 
 class ReportBlocked(ValueError):pass
+
+_WRITE_OPERATIONS:Final=MappingProxyType({'volume':'ec2:CreateTags'})
 
 
 def _sum_exact(a,b):
@@ -92,9 +97,37 @@ def _report(draft,authentication_state):
     for row_index,row in enumerate(draft.rows):
         arn=row.get('resource_arn')
         scope_id=None
-        if row.get('status')=='proposed' and isinstance(arn,str) and arn:
-            scope_id=derive_declared_row_scope(draft.plan,row)
-        rows.append({
+        expected_operation=_WRITE_OPERATIONS.get(row.get('kind'))
+        operation_supported=(expected_operation is not None
+                             and row.get('aws_operation')==expected_operation)
+        if expected_operation is None:
+            write_support='UNSUPPORTED_API'
+        elif operation_supported:
+            write_support='SUPPORTED_API'
+        else:
+            write_support='OPERATION_UNRESOLVED'
+        scope_application='NOT_APPLIED'
+        if row.get('status')!='proposed':
+            scope_application='NOT_APPLICABLE'
+        elif operation_supported and isinstance(arn,str) and arn:
+            try:
+                scope_id=derive_declared_row_scope(draft.plan,row)
+                scope_application='APPLIED'
+            except BatchValidationError as error:
+                if str(error)!='No unique Scope declaration':
+                    raise ReportBlocked(str(error)) from error
+        evidence=row.get('evidence')
+        proposed_name=row.get('proposed_name')
+        if isinstance(proposed_name,str) and proposed_name:
+            name_generation_state='GENERATED'
+        elif (row.get('status')=='manual_review' and isinstance(evidence,str)
+              and 'Candidate lacks a structured Name namespace' in evidence):
+            name_generation_state='UNAVAILABLE'
+        elif isinstance(evidence,str) and evidence.startswith('Proposed Name collision in batch:'):
+            name_generation_state='COLLISION'
+        else:
+            name_generation_state='NOT_EVALUATED'
+        report_row={
             'row_index':row_index,
             'proposal_id':row.get('proposal_id'),
             'kind':row.get('kind'),
@@ -108,14 +141,18 @@ def _report(draft,authentication_state):
             'name_raw_value':row.get('name_raw_value'),
             'existing_name':row.get('existing_name'),
             'proposed_name':row.get('proposed_name'),
+            'name_generation_state':name_generation_state,
+            'write_support':write_support,
+            'scope_application':scope_application,
             'approved':row.get('approved'),
             'status':row.get('status'),
             'confidence':row.get('confidence'),
             'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
             'outcome':'NOT_ATTEMPTED_UNSIGNED_PREVIEW',
             'execution_allowed':False,
-        })
-        if row.get('status') in ('manual_review','api_error') and not row.get('proposed_name'):
+        }
+        rows.append(report_row)
+        if name_generation_state=='UNAVAILABLE':
             name_generation_unavailable.append({
                 'proposal_id':row.get('proposal_id'),
                 'kind':row.get('kind'),
@@ -124,7 +161,7 @@ def _report(draft,authentication_state):
                 'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
                 'reason':row.get('evidence'),
             })
-    return {'authentication_state':authentication_state,
+    report={'authentication_state':authentication_state,
             'execution_allowed':False,
             'plan_sha256':sha256(draft.plan_bytes).hexdigest(),
             'csv_sha256':sha256(draft.csv_bytes).hexdigest(),
@@ -134,12 +171,13 @@ def _report(draft,authentication_state):
             'name_generation_unavailable':name_generation_unavailable,
             'cur_population_reason_details':reason_details,
             'cur_population':c}
+    return reconcile_batch_outcomes(report)
 
 
 def build_batch_dry_run(plan_bytes:bytes,csv_bytes:bytes):
     # Unsigned preview: no ledger, trust, STS, credentials or SDK imports.
     try:return _report(validate_batch_draft(plan_bytes,csv_bytes),'UNSIGNED_PREVIEW')
-    except (BatchValidationError,ReportBlocked) as e:raise ReportBlocked(str(e)) from e
+    except (BatchValidationError,ReportBlocked,BatchOutcomeError) as e:raise ReportBlocked(str(e)) from e
 
 
 def make_authenticated_batch_report(batch:VerifiedBatchApproval,*,plan_bytes:bytes,csv_bytes:bytes,trust=None,now_utc:datetime|None=None):
@@ -151,4 +189,4 @@ def make_authenticated_batch_report(batch:VerifiedBatchApproval,*,plan_bytes:byt
     try:revalidate_verified_batch(batch,trust=trust,now_utc=now_utc)
     except BatchAuthRejected as e:raise ReportBlocked('Fresh signature/Trust not verified') from e
     try:return _report(validate_batch_draft(plan_bytes,csv_bytes),'OWNER_VERIFIED')
-    except BatchValidationError as e:raise ReportBlocked(str(e)) from e
+    except (BatchValidationError,BatchOutcomeError) as e:raise ReportBlocked(str(e)) from e

@@ -437,6 +437,12 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(result.outcomes,("APPLIED_VERIFIED","NOT_ATTEMPTED_CAP"))
         self.assertEqual(result.batch_state,"COMPLETED")
         self.assertTrue(result.report["rows"][0]["execution_allowed"] is False)
+        self.assertEqual(result.report["outcome_reconciliation"],{
+            "APPLIED_VERIFIED":{"count":1,"cost_usd":"1"},
+            "NOT_ATTEMPTED_CAP":{"count":1,"cost_usd":"1"},
+        })
+        self.assertEqual(result.report["outcome_reconciliation_total"],
+                         {"count":2,"cost_usd":"2"})
 
     def test_fake_execution_skips_changed_name_and_sends_next_target_once(self) -> None:
         from name_tag_batch_executor import (
@@ -520,6 +526,8 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         envelope_path=self.root/"batch-envelope.json"
         runtime_path=self.root/"runtime-evidence.json"
         report_path=self.root/"batch-result.json"
+        fixture_ledger_path=self.root/"simulation-fixture-ledger.sqlite"
+        host_ledger_digest=hashlib.sha256(self.ledger_path.read_bytes()).hexdigest()
         for path,data in ((plan_path,plan_bytes),(review_path,csv_bytes),(envelope_path,envelope)):
             path.write_bytes(data);path.chmod(0o600)
         runtime_doc={
@@ -554,8 +562,7 @@ class BatchLedgerMigrationTests(unittest.TestCase):
             ):
                 result=controlled_main([
                     "batch-simulate","--plan",plan_path.name,"--review",review_path.name,
-                    "--envelope",envelope_path.name,"--ledger-path",
-                    self.ledger_path.relative_to(self.root).as_posix(),
+                    "--envelope",envelope_path.name,"--ledger-path",fixture_ledger_path.name,
                     "--runtime-evidence",runtime_path.name,"--report-out",report_path.name,
                 ])
         finally:
@@ -566,6 +573,14 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(report["batch_state"],"COMPLETED")
         self.assertEqual(report["send_attempts_consumed"],1)
         self.assertFalse(report["execution_allowed"])
+        self.assertEqual(report["execution_mode"],"ISOLATED_FIXTURE_ONLY")
+        self.assertEqual(report["outcome_reconciliation"],{
+            "APPLIED_VERIFIED":{"count":1,"cost_usd":"1"},
+            "NOT_ATTEMPTED_CAP":{"count":1,"cost_usd":"1"},
+        })
+        self.assertTrue(fixture_ledger_path.is_file())
+        self.assertEqual(hashlib.sha256(self.ledger_path.read_bytes()).hexdigest(),
+                         host_ledger_digest)
 
     def test_owner_revocation_between_rows_stops_batch_without_second_send(self) -> None:
         from name_tag_batch_executor import (

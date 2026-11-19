@@ -1845,7 +1845,7 @@ def _demote_colliding_proposals(records):
 def plan_batch(args, *, scope_declarations, session=None):
     """Build a schema-3 Batch Plan from the bounded CUR and real resolver path."""
     from name_tag_batch_state import batch_name_state, build_batch_review_projection
-    from name_tag_batch_state import derive_declared_row_scope, validate_batch_draft
+    from name_tag_batch_state import validate_batch_draft
 
     if not re.fullmatch(r"\d{12}", args.account):
         raise SystemExit("--account must be 12 digits")
@@ -1877,6 +1877,7 @@ def plan_batch(args, *, scope_declarations, session=None):
         record = {**candidate, **info}
         record["proposal_id"] = proposal_key(record)
         record["resource_arn"] = resource_arn(record, args.account)
+        record["aws_operation"] = "ec2:CreateTags" if record["kind"] == "volume" else None
         records.append(record)
     _demote_colliding_proposals(records)
     if session.read_budget.exhausted:
@@ -1900,10 +1901,7 @@ def plan_batch(args, *, scope_declarations, session=None):
     }
     plan_bytes = (json.dumps(doc, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
     review_bytes = build_batch_review_projection(plan_bytes)
-    draft = validate_batch_draft(plan_bytes, review_bytes)
-    for row in records:
-        if row["status"] == "proposed":
-            derive_declared_row_scope(doc, row)
+    validate_batch_draft(plan_bytes, review_bytes)
     session.read_budget.require_completion()
     ensure_private_output_dir(out.parent)
     with tempfile.TemporaryDirectory(prefix=f".{out.stem}.stage-", dir=out.parent) as staging:

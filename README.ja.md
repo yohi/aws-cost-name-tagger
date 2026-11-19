@@ -73,7 +73,7 @@ uv run --locked python aws_cost_name_tagger_v3.py batch-plan \
   --output ./private-reports/batch-plan.json
 ```
 
-OwnerはレビューCSVの`approved`列だけを編集します。`name_tag_controlled.py`の`prepare-batch`、`batch-dryrun`、`verify-batch`は、未署名payload作成、行別の未署名Preview、保護されたOwner署名検証を行います。検証済みReportも非実行状態（`execution_allowed=false`）です。`batch-simulate`は既存host-bound Ledgerと独立検証済みRuntime Scopeへの接続が完了するまでfail-closedです。Batch経路もAWS書込みやSafety Hold解除を許可しません。
+OwnerはレビューCSVの`approved`列だけを編集します。`name_tag_controlled.py`の`prepare-batch`、`batch-dryrun`、`verify-batch`は、未署名payload作成、行別の未署名Preview、保護されたOwner署名検証を行います。検証済みReportも非実行状態（`execution_allowed=false`）です。`batch-simulate`は新規の隔離Fixture Ledgerとメモリ内fakeだけを使い、既存Ledger pathを拒否します。Host LedgerやAWS/STSには接続せず、Reportは常に`execution_allowed=false`です。Batch経路もAWS書込みやSafety Hold解除を許可しません。
 
 ## v3.5 → v3.6 の変更点（OwnerのR1.1要件）
 

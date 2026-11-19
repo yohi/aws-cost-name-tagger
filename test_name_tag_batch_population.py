@@ -35,6 +35,15 @@ class PopulationTests(unittest.TestCase):
         self.assertEqual(classify_cur_row(row,account='123456789013',kind_filter=None,rid_class=lambda r: ('volume','vol-a','ap-northeast-1'))[0],'UNATTRIBUTABLE_CUR')
         with self.assertRaises(CurBudgetExceeded): partition_cur_population({}, min_cost=0.0,max_resources=0)
 
+    def test_excluded_supported_kind_is_classified_before_missing_region(self):
+        row={'line_item_resource_id':'vol-a','product_region_code':''}
+
+        result=classify_cur_row(
+            row,account='123456789012',kind_filter={'instance'},
+            rid_class=lambda resource:('volume','vol-a',None))
+
+        self.assertEqual(result,('OUTSIDE_REQUESTED_KINDS','EXCLUDED_BY_KINDS',None))
+
     def test_signed_population_rejects_record_cost_mismatch(self):
         plan={'count':1,'records':[{'effective_usage_cost_usd':'1.25'}],
               'cur_population':sample_population(cost='1.24')}

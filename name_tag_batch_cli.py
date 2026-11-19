@@ -1,13 +1,8 @@
-"""Offline-only Batch draft CLI. No AWS/STS/host Ledger access or live writes.
-
-verify-batch and batch-simulate are deliberately fail-closed until trusted
-OwnerTrust and full project-ledger adapters are integrated and tested.
-"""
+"""Offline Batch CLI. Simulation uses an isolated fixture Ledger and fake only."""
 from __future__ import annotations
 import argparse,json,sys
 import os
 import stat
-from contextlib import closing
 from datetime import datetime,timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -19,9 +14,9 @@ from name_tag_batch_report import build_batch_dry_run, ReportBlocked
 from name_tag_batch_report import make_authenticated_batch_report
 from name_tag_batch_trust import load_current_protected_owner_trust
 from name_tag_batch_fake import BatchOfflineRuntime,BatchRuntimeEvidence,FakeBatchSDKAdapter
-from name_tag_batch_runtime import execute_batch_offline
-from name_tag_ledger import open_ledger
-from name_tag_ledger_errors import LedgerError
+from name_tag_batch_executor import simulate_on_fixture_ledger,validate_fixture_scope
+from name_tag_batch_ledger import LedgerBlocked
+from name_tag_batch_report import reconcile_batch_outcomes
 from name_tag_scope import ScopeEvidence,SideEffectEvidence
 
 
@@ -224,7 +219,6 @@ def _run_command(args):
     elif args.command=='verify-batch':
         trust=load_current_protected_owner_trust()
         envelope=_read_private(args.envelope)
-        from name_tag_batch_approval import verify_batch_approval
         now=datetime.now(timezone.utc)
         batch=verify_batch_approval(plan,review,envelope,trust=trust,now_utc=now)
         report=make_authenticated_batch_report(
@@ -232,15 +226,26 @@ def _run_command(args):
         _write_new(args.report_out,_pretty(report))
     elif args.command=='batch-simulate':
         trust=load_current_protected_owner_trust()
-        from name_tag_batch_approval import verify_batch_approval
+        now=datetime.now(timezone.utc)
         batch=verify_batch_approval(
             plan,review,_read_private(args.envelope),trust=trust,
-            now_utc=datetime.now(timezone.utc))
+            now_utc=now)
         runtime=parse_offline_runtime(_read_private(args.runtime_evidence))
-        with closing(open_ledger(args.ledger_path,trusted_host=True,trust=trust)) as ledger:
-            result=execute_batch_offline(
-                batch,plan_bytes=plan,csv_bytes=review,ledger=ledger,runtime=runtime)
-        _write_new(args.report_out,_pretty(dict(result.report)))
+        validate_fixture_scope(batch,runtime)
+        result=simulate_on_fixture_ledger(
+            batch.batch_id,batch.payload['batch_nonce'],batch.approved_rows,
+            ledger_path=args.ledger_path,adapter=runtime.adapter,
+            cap=json.loads(plan)['execution_limits']['max_send_attempts'])
+        report=make_authenticated_batch_report(
+            batch,plan_bytes=plan,csv_bytes=review,trust=trust,now_utc=now)
+        report=reconcile_batch_outcomes(
+            report,dict(zip(batch.approved_row_indexes,result['outcomes'],strict=True)))
+        report['batch_state']=result['batch_state']
+        report['send_attempts_consumed']=result['send_attempts_consumed']
+        report['writes_complete']=result['writes_complete']
+        report['execution_allowed']=False
+        report['execution_mode']='ISOLATED_FIXTURE_ONLY'
+        _write_new(args.report_out,_pretty(report))
     return 0
 
 
@@ -248,7 +253,7 @@ def main(argv=None):
     args=_build_parser().parse_args(argv)
     try:
         return _run_command(_resolve_arguments(args))
-    except (OSError,ValueError,BatchValidationError,ReportBlocked,BatchAuthRejected,LedgerError) as e:
+    except (OSError,ValueError,BatchValidationError,ReportBlocked,BatchAuthRejected,LedgerBlocked) as e:
         print('BLOCKED (offline): '+str(e),file=sys.stderr)
         return 2
 

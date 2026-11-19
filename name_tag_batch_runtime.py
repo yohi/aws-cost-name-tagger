@@ -15,8 +15,10 @@ from name_tag_batch_approval import (
     revalidate_verified_batch,
 )
 from name_tag_batch_credentials import CredentialBlocked, OfflineFakeIssuer
+from name_tag_batch_credentials import validate_issued_batch_session
 from name_tag_batch_iam import IAMPolicyBlocked, KindPolicy, build_subset_session_policy
 from name_tag_batch_report import ReportBlocked, make_authenticated_batch_report
+from name_tag_batch_report import reconcile_batch_outcomes
 from name_tag_batch_state import classify_batch_name
 from name_tag_batch_trust import load_current_protected_owner_trust
 from name_tag_batch_fake import (
@@ -179,8 +181,7 @@ def execute_batch_offline(
             )
             issuer = OfflineFakeIssuer()
             issued = issuer.issue(batch, subset, kind_registry=_VOLUME_POLICY)
-            if issued.provenance != "OFFLINE_SYNTHETIC_NOT_STS":
-                raise CredentialBlocked("Unexpected credential provenance")
+            validate_issued_batch_session(batch,subset,issued)
             handle = ledger.create_batch_intent(
                 authority, scope=evidence.scope, side_effects=evidence.side_effects
             )
@@ -215,14 +216,19 @@ def execute_batch_offline(
     ):
         ledger.complete_batch(batch)
         state = ledger.batch_execution_state(batch)
-    report_rows = report["rows"]
-    if not isinstance(report_rows, list):
-        raise ReportBlocked("Authenticated report has no row collection")
+    outcomes_by_row:dict[int,str]={}
     for position, row_index in enumerate(batch.approved_row_indexes):
-        for report_row in report_rows:
-            if isinstance(report_row, dict) and report_row.get("row_index") == row_index:
-                report_row["outcome"] = state.outcomes[position]
-                break
+        outcome=state.outcomes[position]
+        if outcome=="WRITE_INTENT_RECORDED":
+            outcome="NOT_ATTEMPTED_BATCH_STOP"
+        elif outcome=="SEND_ATTEMPT_CONSUMED":
+            outcome="OUTCOME_UNKNOWN"
+        elif outcome=="UNCLAIMED":
+            if state.state!="STOPPED":
+                raise ReportBlocked("Active Batch has an unclaimed approved row")
+            outcome="NOT_ATTEMPTED_BATCH_STOP"
+        outcomes_by_row[row_index]=outcome
+    report=reconcile_batch_outcomes(report,outcomes_by_row)
     report["batch_state"] = state.state
     report["send_attempts_consumed"] = state.send_attempts_consumed
     report["max_send_attempts"] = state.max_send_attempts

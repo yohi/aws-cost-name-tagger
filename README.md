@@ -55,10 +55,11 @@ uv run --locked python aws_cost_name_tagger_v3.py batch-plan \
 The Owner edits only the `approved` CSV column. `name_tag_controlled.py` exposes
 `prepare-batch`, `batch-dryrun`, and `verify-batch` for unsigned payload creation,
 row-level unsigned preview, and protected Owner signature verification. The
-verified report remains non-executing (`execution_allowed=false`). `batch-simulate`
-fails closed until the Batch path is connected to the existing host-bound Ledger
-and independently verified runtime Scope evidence. No Batch command enables
-AWS writes or lifts the Safety Hold.
+verified report remains non-executing (`execution_allowed=false`).
+`batch-simulate` is synthetic-only: it creates a new, isolated fixture Ledger,
+refuses an existing Ledger path, uses only the in-memory fake adapter, and marks
+its report `execution_allowed=false`. It never opens the host-bound Ledger or
+contacts AWS/STS. No Batch command enables AWS writes or lifts the Safety Hold.
 
 Example payload preparation:
 

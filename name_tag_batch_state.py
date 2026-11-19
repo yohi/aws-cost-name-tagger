@@ -78,7 +78,7 @@ def _validate_plan_structure(plan):
 
 
 def _validate_scope_declarations(scopes):
-    if type(scopes) is not list or not scopes:raise ValueError('missing scopes')
+    if type(scopes) is not list:raise ValueError('scope declarations must be a list')
     ids=[]
     members=set()
     for scope in scopes:
@@ -153,6 +153,8 @@ def _read_review_csv(csv_bytes:bytes)->list[list[str]]:
 
 
 def derive_declared_row_scope(plan:dict,row:dict)->str:
+    if row.get('kind')!='volume' or row.get('aws_operation')!='ec2:CreateTags':
+        raise BatchValidationError('Kind/API has no approved write implementation')
     arn=row.get('resource_arn','')
     account=plan.get('account');partition=plan.get('partition');region=row.get('region')
     if type(arn) is not str or type(region) is not str:raise BatchValidationError('Bad ARN')

@@ -5,10 +5,17 @@ An authenticated production executor is NOT supplied by this module.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from collections.abc import Mapping,Sequence
+from contextlib import closing
+from datetime import datetime,timezone
+from pathlib import Path
+import json
+import re
 import sqlite3
+from typing import TypedDict
+from name_tag_batch_approval import VerifiedBatchApproval
 from name_tag_batch_state import classify_batch_name
 from name_tag_batch_ledger import OfflineFixtureBatchLedger,LedgerBlocked
-from name_tag_batch_approval import VerifiedBatchApproval
 from name_tag_ledger import IntentLedger
 from name_tag_batch_fake import (
     BatchOfflineRuntime,
@@ -43,9 +50,27 @@ class InMemoryNameAdapter:
         return self.read_current(arn)
 
 
-def simulate_untrusted_fixture(batch_id,nonce,approved_rows,*,ledger:OfflineFixtureBatchLedger,adapter:InMemoryNameAdapter,cap:int):
+class FixtureSimulationResult(TypedDict):
+    authentication_state:str
+    execution_allowed:bool
+    batch_state:str
+    send_attempts_consumed:int
+    outcomes:list[str]
+    writes_complete:bool
+
+
+def simulate_untrusted_fixture(
+    batch_id:str,
+    nonce:str,
+    approved_rows:Sequence[Mapping[str,str|bool|None]],
+    *,
+    ledger:OfflineFixtureBatchLedger,
+    adapter:InMemoryNameAdapter|FakeBatchSDKAdapter,
+    cap:int,
+)->FixtureSimulationResult:
     """Synthetic test harness. Its output is never Owner/AWS authorization evidence."""
-    if type(ledger) is not OfflineFixtureBatchLedger or type(adapter) is not InMemoryNameAdapter:
+    if (type(ledger) is not OfflineFixtureBatchLedger
+            or type(adapter) not in (InMemoryNameAdapter, FakeBatchSDKAdapter)):
         raise LedgerBlocked('Fixture-only objects required')
     if not approved_rows or type(cap) is not int or not (1<=cap<=20):raise LedgerBlocked('Invalid fixture inputs')
     scopes=[]
@@ -79,6 +104,52 @@ def simulate_untrusted_fixture(batch_id,nonce,approved_rows,*,ledger:OfflineFixt
             'batch_state':batch_state,'send_attempts_consumed':send_attempts_consumed,
             'outcomes':outcomes,
             'writes_complete':batch_state=='COMPLETED' and len(outcomes)==len(approved_rows) and all(o=='APPLIED_VERIFIED' for o in outcomes)}
+
+
+def validate_fixture_scope(batch:VerifiedBatchApproval,runtime:BatchOfflineRuntime)->None:
+    """Match signed approved rows to synthetic Scope and side-effect evidence."""
+    plan=json.loads(batch.plan_bytes)
+    now=datetime.now(timezone.utc)
+    for row in batch.approved_rows:
+        scope_id=row.get('writer_control_scope_id')
+        scope_evidence=runtime.evidence_by_scope.get(scope_id)
+        if scope_evidence is None:
+            raise LedgerBlocked('Fixture Scope is not present')
+        scope=scope_evidence.scope
+        arn=row.get('resource_arn')
+        if (scope.writer_control_scope_id!=scope_id
+                or scope.account!=plan.get('account')
+                or scope.partition!=plan.get('partition')
+                or scope.region!=row.get('region')
+                or arn not in scope.controlled_arns
+                or scope.responsible_owner!=batch.owner_principal_id
+                or re.fullmatch(r'[0-9a-f]{64}',scope.writer_evidence_digest) is None
+                or not scope.not_before_utc<=now<=scope.not_after_utc):
+            raise LedgerBlocked('Fixture Scope does not match signed row')
+        effects=[effect for effect in scope_evidence.side_effects if effect.target_arn==arn]
+        if (len(effects)!=1
+                or effects[0].iam_abac_resource_tag_assessment!='PASS'
+                or effects[0].iac_assessment!='PASS'
+                or effects[0].event_automation_assessment!='PASS'
+                or not effects[0].evidence_references
+                or any(not reference for reference in effects[0].evidence_references)
+                or not effects[0].not_before_utc<=now<=effects[0].not_after_utc):
+            raise LedgerBlocked('Fixture side-effect evidence is not valid for signed row')
+
+
+def simulate_on_fixture_ledger(
+    batch_id:str,
+    nonce:str,
+    approved_rows:Sequence[Mapping[str,str|bool|None]],
+    *,
+    ledger_path:Path,
+    adapter:FakeBatchSDKAdapter|InMemoryNameAdapter,
+    cap:int,
+)->FixtureSimulationResult:
+    """Create a fresh fixture Ledger; refuse to open any existing database."""
+    with closing(OfflineFixtureBatchLedger.create_fixture(ledger_path)) as ledger:
+        return simulate_untrusted_fixture(
+            batch_id,nonce,approved_rows,ledger=ledger,adapter=adapter,cap=cap)
 
 
 def _validate_fixture_approval(row):

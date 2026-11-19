@@ -2,6 +2,7 @@ import hashlib,json,unittest
 from types import MappingProxyType
 from name_tag_batch_iam import build_subset_session_policy, KindPolicy, IAMPolicyBlocked, SessionPolicySpec
 from name_tag_batch_credentials import OfflineFakeIssuer, CredentialBlocked
+from name_tag_batch_credentials import IssuedBatchSession, validate_issued_batch_session
 from name_tag_batch_approval import VerifiedBatchApproval, prepare_batch_approval
 from name_tag_batch_state import build_batch_review_projection, validate_batch_draft
 from test_helpers import sample_population
@@ -61,8 +62,24 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(sess.policy_sha256,spec.policy_sha256)
         self.assertEqual(sess.batch_id,self.batch.batch_id)
         self.assertEqual(sess.row_indexes,spec.row_indexes)
+        self.assertEqual(sess.role_arn,self.batch.payload['authorized_role_arn'])
+        self.assertEqual(sess.provenance,'OFFLINE_SYNTHETIC_NOT_STS')
         self.assertIn(b'aws:TagKeys',sess.policy_bytes)
         with self.assertRaises(CredentialBlocked):fake.issue(self.batch,build_subset_session_policy(self.batch,(1,),kind_registry=self.kind),kind_registry=self.kind,tamper_policy=True)
+
+    def test_issued_session_claims_are_revalidated_before_use(self):
+        spec=build_subset_session_policy(self.batch,(1,),kind_registry=self.kind)
+        issuer=OfflineFakeIssuer()
+        session=issuer.issue(self.batch,spec,kind_registry=self.kind)
+
+        validate_issued_batch_session(self.batch,spec,session)
+
+        counterfeit=IssuedBatchSession(
+            batch_id='foreign-batch',policy_bytes=session.policy_bytes,
+            policy_sha256=session.policy_sha256,row_indexes=session.row_indexes,
+            role_arn=session.role_arn)
+        with self.assertRaises(CredentialBlocked):
+            validate_issued_batch_session(self.batch,spec,counterfeit)
     def test_issuer_rejects_self_hashed_wildcard_policy(self):
         policy=b'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:CreateTags","Resource":"*"}]}'
         forged=SessionPolicySpec(self.batch.batch_id,(1,),policy,hashlib.sha256(policy).hexdigest(),('*',),('ec2:CreateTags',),('ec2:DescribeVolumes',))

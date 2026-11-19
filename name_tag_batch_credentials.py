@@ -40,3 +40,24 @@ class OfflineFakeIssuer:
         if not isinstance(role,str) or not role.startswith('arn:'):
             raise CredentialBlocked('Missing role identity')
         return IssuedBatchSession(batch.batch_id,raw,subset.policy_sha256,subset.row_indexes,role)
+
+
+def validate_issued_batch_session(
+    batch:VerifiedBatchApproval,
+    subset:SessionPolicySpec,
+    issued:IssuedBatchSession,
+)->None:
+    """Recheck every synthetic issuance claim before an offline Intent is opened."""
+    role=batch.payload.get('authorized_role_arn')
+    if (type(batch) is not VerifiedBatchApproval
+            or type(subset) is not SessionPolicySpec
+            or type(issued) is not IssuedBatchSession
+            or not isinstance(role,str)
+            or issued.batch_id!=batch.batch_id
+            or issued.policy_bytes!=subset.policy_bytes
+            or issued.policy_sha256!=subset.policy_sha256
+            or sha256(issued.policy_bytes).hexdigest()!=issued.policy_sha256
+            or issued.row_indexes!=subset.row_indexes
+            or issued.role_arn!=role
+            or issued.provenance!='OFFLINE_SYNTHETIC_NOT_STS'):
+        raise CredentialBlocked('Synthetic issued-session binding mismatch')

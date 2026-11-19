@@ -2,8 +2,44 @@ import unittest, tempfile, json, pathlib, os, io, contextlib
 import stat
 from name_tag_batch_cli import main, parse_offline_runtime
 from name_tag_batch_state import build_batch_review_projection
+from name_tag_batch_executor import InMemoryNameAdapter,simulate_on_fixture_ledger
+from name_tag_batch_ledger import LedgerBlocked
 
 class CliTests(unittest.TestCase):
+    def test_simulation_refuses_existing_host_ledger_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = pathlib.Path(directory) / 'host-ledger.db'
+            ledger_path.write_bytes(b'host ledger contents')
+            before = ledger_path.read_bytes()
+
+            with self.assertRaises(LedgerBlocked):
+                simulate_on_fixture_ledger(
+                    'batch-fixture', 'nonce-fixture', [],
+                    ledger_path=ledger_path,
+                    adapter=InMemoryNameAdapter({}), cap=1,
+                )
+
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_simulation_creates_only_a_new_isolated_fixture_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path=pathlib.Path(directory)/'fixture-ledger.db'
+            adapter=InMemoryNameAdapter({'fixture-volume':{}})
+            row={'resource_arn':'fixture-volume','writer_control_scope_id':'scope-1',
+                 'name_state':'ABSENT','name_key_present':False,'name_raw_value':None,
+                 'approved_name':'Name-1','proposed_name':'Name-1','approved':'YES',
+                 'status':'proposed','confidence':'high','kind':'volume',
+                 'aws_operation':'ec2:CreateTags','evidence':'fixture evidence'}
+
+            result=simulate_on_fixture_ledger(
+                'batch-fixture','nonce-fixture',[row],ledger_path=ledger_path,
+                adapter=adapter,cap=1)
+
+            self.assertTrue(ledger_path.is_file())
+            self.assertEqual(result['authentication_state'],'SYNTHETIC_TEST_ONLY')
+            self.assertEqual(result['outcomes'],['APPLIED_VERIFIED'])
+            self.assertEqual(adapter.write_calls,1)
+
     def test_offline_runtime_document_builds_scope_bound_fake(self):
         document={
             'scopes':[{'account':'123456789012','partition':'aws','region':'us-east-1',
