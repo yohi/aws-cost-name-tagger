@@ -93,39 +93,46 @@ def _validated_reason_details(plan):
     return details
 
 
+def _write_support(row):
+    operation=_WRITE_OPERATIONS.get(row.get('kind'))
+    if operation is None:
+        return 'UNSUPPORTED_API'
+    if row.get('aws_operation')==operation:
+        return 'SUPPORTED_API'
+    return 'OPERATION_UNRESOLVED'
+
+
+def _scope_application(plan,row,arn,write_support):
+    if row.get('status')!='proposed':
+        return None,'NOT_APPLICABLE'
+    if write_support!='SUPPORTED_API' or not isinstance(arn,str) or not arn:
+        return None,'NOT_APPLIED'
+    try:
+        return derive_declared_row_scope(plan,row),'APPLIED'
+    except BatchValidationError as error:
+        if str(error)=='No unique Scope declaration':
+            return None,'NOT_APPLIED'
+        raise ReportBlocked(str(error)) from error
+
+
+def _name_generation_state(row):
+    proposed_name=row.get('proposed_name')
+    evidence=row.get('evidence')
+    if isinstance(proposed_name,str) and proposed_name:
+        return 'GENERATED'
+    if (row.get('status')=='manual_review' and isinstance(evidence,str)
+            and 'Candidate lacks a structured Name namespace' in evidence):
+        return 'UNAVAILABLE'
+    if isinstance(evidence,str) and evidence.startswith('Proposed Name collision in batch:'):
+        return 'COLLISION'
+    return 'NOT_EVALUATED'
+
+
 def _report_row(row,row_index,plan):
     arn=row.get('resource_arn')
-    expected_operation=_WRITE_OPERATIONS.get(row.get('kind'))
-    operation_supported=(expected_operation is not None
-                         and row.get('aws_operation')==expected_operation)
-    if expected_operation is None:
-        write_support='UNSUPPORTED_API'
-    elif operation_supported:
-        write_support='SUPPORTED_API'
-    else:
-        write_support='OPERATION_UNRESOLVED'
-    scope_id=None
-    scope_application='NOT_APPLIED'
-    if row.get('status')!='proposed':
-        scope_application='NOT_APPLICABLE'
-    elif operation_supported and isinstance(arn,str) and arn:
-        try:
-            scope_id=derive_declared_row_scope(plan,row)
-            scope_application='APPLIED'
-        except BatchValidationError as error:
-            if str(error)!='No unique Scope declaration':
-                raise ReportBlocked(str(error)) from error
-    evidence=row.get('evidence')
-    proposed_name=row.get('proposed_name')
-    if isinstance(proposed_name,str) and proposed_name:
-        name_generation_state='GENERATED'
-    elif (row.get('status')=='manual_review' and isinstance(evidence,str)
-          and 'Candidate lacks a structured Name namespace' in evidence):
-        name_generation_state='UNAVAILABLE'
-    elif isinstance(evidence,str) and evidence.startswith('Proposed Name collision in batch:'):
-        name_generation_state='COLLISION'
-    else:
-        name_generation_state='NOT_EVALUATED'
+    write_support=_write_support(row)
+    scope_id,scope_application=_scope_application(plan,row,arn,write_support)
+    name_generation_state=_name_generation_state(row)
     report_row={
         'row_index':row_index,'proposal_id':row.get('proposal_id'),
         'kind':row.get('kind'),'locator':row.get('locator'),'region':row.get('region'),

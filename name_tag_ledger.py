@@ -1348,6 +1348,22 @@ class IntentLedger:
         finally:
             self._unlock()
 
+    def _validated_batch_intent_fields(self,row,scope,side_effects):
+        scope_id=row.get("writer_control_scope_id")
+        resource_arn=row.get("resource_arn")
+        approved_name=row.get("approved_name")
+        aws_operation=row.get("aws_operation")
+        proposal_id=row.get("proposal_id")
+        fields=(scope_id,resource_arn,approved_name,aws_operation,proposal_id)
+        if (not all(isinstance(value,str) and value for value in fields)
+                or aws_operation!="ec2:CreateTags"
+                or not isinstance(scope,ScopeEvidence)
+                or scope.writer_control_scope_id!=scope_id
+                or not isinstance(side_effects,Sequence) or not side_effects
+                or any(not isinstance(item,SideEffectEvidence) for item in side_effects)):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        return scope_id,resource_arn,approved_name,aws_operation,proposal_id
+
     def create_batch_intent(
         self,
         row_authority: VerifiedBatchRowAuthority,
@@ -1361,20 +1377,9 @@ class IntentLedger:
         fresh = self._revalidate_batch_row(row_authority)
         batch = fresh.batch
         row = fresh.row
-        scope_id = row.get("writer_control_scope_id")
-        resource_arn = row.get("resource_arn")
-        approved_name = row.get("approved_name")
-        aws_operation = row.get("aws_operation")
-        proposal_id = row.get("proposal_id")
-        if (not all(isinstance(value, str) and value for value in
-                    (scope_id, resource_arn, approved_name, aws_operation, proposal_id))
-                or aws_operation != "ec2:CreateTags"
-                or not isinstance(scope, ScopeEvidence)
-                or scope.writer_control_scope_id != scope_id
-                or not isinstance(side_effects, Sequence)
-                or not side_effects
-                or any(not isinstance(item, SideEffectEvidence) for item in side_effects)):
-            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        scope_id,resource_arn,approved_name,aws_operation,proposal_id=(
+            self._validated_batch_intent_fields(row,scope,side_effects)
+        )
         now = self._now()
         intent_id = uuid.uuid4().hex
         ownership_token = uuid.uuid4().hex
@@ -1466,6 +1471,41 @@ class IntentLedger:
             batch_row_authority=fresh,batch_scope=scope,batch_side_effects=tuple(side_effects),
         )
 
+    def _validate_batch_disposition_input(self,decision,reason_code,observed_name_sha256):
+        valid_decisions=("SKIPPED_NAME_CHANGED","SKIPPED_IAM_UNSUPPORTED","NOT_ATTEMPTED_CAP")
+        if decision not in valid_decisions:
+            raise LedgerError("BLOCKED_INPUT_INVALID")
+        if (not isinstance(reason_code,str) or re.fullmatch(r"[A-Z0-9_]{1,64}",reason_code) is None
+                or (observed_name_sha256 is not None
+                    and re.fullmatch(_SHA256_HEX_PATTERN,observed_name_sha256) is None)
+                or (decision=="SKIPPED_NAME_CHANGED" and observed_name_sha256 is None)):
+            raise LedgerError("BLOCKED_INPUT_INVALID")
+
+    def _assert_disposition_available(self,connection,fresh,decision):
+        batch=fresh.batch
+        batch_state=connection.execute(
+            "SELECT state,max_send_attempts,send_attempts_consumed "
+            "FROM batch_registry WHERE batch_id=?",(batch.batch_id,)
+        ).fetchone()
+        if batch_state is None or batch_state[0]!="ACTIVE":
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        at_cap=batch_state[2]>=batch_state[1]
+        if (decision=="NOT_ATTEMPTED_CAP" and not at_cap) or (decision!="NOT_ATTEMPTED_CAP" and at_cap):
+            raise LedgerError("BLOCKED_AUTH_REPLAY")
+        duplicate=connection.execute(
+            "SELECT 1 FROM batch_rows WHERE (batch_id=? AND row_index=?) "
+            "OR row_authority_id=? UNION ALL "
+            "SELECT 1 FROM batch_row_dispositions WHERE (batch_id=? AND row_index=?) "
+            "OR row_authority_id=? LIMIT 1",
+            (batch.batch_id,fresh.row_index,fresh.row_authority_id,
+             batch.batch_id,fresh.row_index,fresh.row_authority_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise LedgerError("BLOCKED_AUTH_REPLAY")
+        disposition_check=self._revalidate_batch_row(fresh)
+        if disposition_check.row_authority_id!=fresh.row_authority_id:
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+
     def record_batch_presend_disposition(
         self,
         row_authority: VerifiedBatchRowAuthority,
@@ -1479,15 +1519,7 @@ class IntentLedger:
         observed_name_sha256: str | None = None,
     ) -> None:
         """Persist a one-shot terminal no-send decision without allocating an Intent."""
-        if decision not in (
-            "SKIPPED_NAME_CHANGED", "SKIPPED_IAM_UNSUPPORTED", "NOT_ATTEMPTED_CAP"
-        ):
-            raise LedgerError("BLOCKED_INPUT_INVALID")
-        if (not isinstance(reason_code,str) or re.fullmatch(r"[A-Z0-9_]{1,64}",reason_code) is None
-                or (observed_name_sha256 is not None
-                    and re.fullmatch(_SHA256_HEX_PATTERN,observed_name_sha256) is None)
-                or (decision == "SKIPPED_NAME_CHANGED" and observed_name_sha256 is None)):
-            raise LedgerError("BLOCKED_INPUT_INVALID")
+        self._validate_batch_disposition_input(decision,reason_code,observed_name_sha256)
         if type(scope) is not ScopeEvidence or not side_effects:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
         fresh=self._revalidate_batch_row(row_authority)
@@ -1508,30 +1540,7 @@ class IntentLedger:
                 self._assert_scope_evidence(connection,scope,side_effects)
                 if self._effective_scope_state(connection,scope_id) != "CLEARED":
                     raise LedgerError("BLOCKED_SCOPE_HOLD")
-                batch_state=connection.execute(
-                    "SELECT state,max_send_attempts,send_attempts_consumed "
-                    "FROM batch_registry WHERE batch_id=?",(batch.batch_id,)
-                ).fetchone()
-                if batch_state is None or batch_state[0] != "ACTIVE":
-                    raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                if decision == "NOT_ATTEMPTED_CAP":
-                    if batch_state[2] < batch_state[1]:
-                        raise LedgerError("BLOCKED_AUTH_REPLAY")
-                elif batch_state[2] >= batch_state[1]:
-                    raise LedgerError("BLOCKED_AUTH_REPLAY")
-                duplicate=connection.execute(
-                    "SELECT 1 FROM batch_rows WHERE (batch_id=? AND row_index=?) "
-                    "OR row_authority_id=? UNION ALL "
-                    "SELECT 1 FROM batch_row_dispositions WHERE (batch_id=? AND row_index=?) "
-                    "OR row_authority_id=? LIMIT 1",
-                    (batch.batch_id,fresh.row_index,fresh.row_authority_id,
-                     batch.batch_id,fresh.row_index,fresh.row_authority_id),
-                ).fetchone()
-                if duplicate is not None:
-                    raise LedgerError("BLOCKED_AUTH_REPLAY")
-                disposition_check=self._revalidate_batch_row(fresh)
-                if disposition_check.row_authority_id != fresh.row_authority_id:
-                    raise LedgerError("BLOCKED_OWNER_AUTHN")
+                self._assert_disposition_available(connection,fresh,decision)
                 connection.execute(
                     "INSERT INTO batch_row_dispositions(batch_id,row_index,row_authority_id,"
                     "decision,reason_code,observed_name_sha256,decided_at_utc) "
@@ -1626,6 +1635,35 @@ class IntentLedger:
         finally:
             self._unlock()
 
+    def _batch_row_execution_outcome(self,connection,batch,index,registry_state):
+        expected=self._expected_batch_row_identity(batch,index)
+        intent=connection.execute(
+            "SELECT br.row_authority_id,br.proposal_id,br.resource_arn,"
+            "br.approved_name,br.aws_operation,br.scope_id,i.state,i.outcome FROM batch_rows br "
+            "JOIN intents i ON i.intent_id=br.intent_id "
+            "WHERE br.batch_id=? AND br.row_index=?",
+            (batch.batch_id,index),
+        ).fetchone()
+        disposition=connection.execute(
+            "SELECT row_authority_id,decision FROM batch_row_dispositions "
+            "WHERE batch_id=? AND row_index=?",(batch.batch_id,index),
+        ).fetchone()
+        if intent is None and disposition is None:
+            if registry_state=="STOPPED":
+                return "NOT_ATTEMPTED_BATCH_STOP"
+            if registry_state=="ACTIVE":
+                return "UNCLAIMED"
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        if (intent is not None)==(disposition is not None):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        if intent is not None:
+            if tuple(intent[:6])!=expected:
+                raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+            return intent[7] if intent[6]=="TERMINAL" else intent[6]
+        if disposition[0]!=expected[0]:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        return disposition[1]
+
     def batch_execution_state(self, batch: VerifiedBatchApproval) -> BatchExecutionState:
         """Read reconciled durable row outcomes for the exact signed Batch."""
         from name_tag_batch_trust import load_current_protected_owner_trust
@@ -1680,37 +1718,9 @@ class IntentLedger:
                     raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
                 result_by_row:dict[int,str]={}
                 for index in fresh_batch.approved_row_indexes:
-                    expected=self._expected_batch_row_identity(fresh_batch,index)
-                    intent=connection.execute(
-                        "SELECT br.row_authority_id,br.proposal_id,br.resource_arn,"
-                        "br.approved_name,br.aws_operation,br.scope_id,i.state,i.outcome FROM batch_rows br "
-                        "JOIN intents i ON i.intent_id=br.intent_id "
-                        "WHERE br.batch_id=? AND br.row_index=?",
-                        (fresh_batch.batch_id,index),
-                    ).fetchone()
-                    disposition=connection.execute(
-                        "SELECT row_authority_id,decision FROM batch_row_dispositions "
-                        "WHERE batch_id=? AND row_index=?",
-                        (fresh_batch.batch_id,index),
-                    ).fetchone()
-                    if intent is None and disposition is None:
-                        if registry[3] == "STOPPED":
-                            result_by_row[index]="NOT_ATTEMPTED_BATCH_STOP"
-                            continue
-                        if registry[3] == "ACTIVE":
-                            result_by_row[index]="UNCLAIMED"
-                            continue
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                    if (intent is not None) == (disposition is not None):
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                    if intent is not None:
-                        if tuple(intent[:6]) != expected:
-                            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                        result_by_row[index]=intent[7] if intent[6]=="TERMINAL" else intent[6]
-                    else:
-                        if disposition[0] != expected[0]:
-                            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                        result_by_row[index]=disposition[1]
+                    result_by_row[index]=self._batch_row_execution_outcome(
+                        connection,fresh_batch,index,registry[3]
+                    )
                 return BatchExecutionState(
                     registry[3],registry[5],registry[4],
                     tuple(result_by_row[index] for index in fresh_batch.approved_row_indexes),
@@ -1842,6 +1852,41 @@ class IntentLedger:
             ownership_token=ownership_token,
         )
 
+    def _validate_batch_send_record(
+        self,conn,handle,fresh_authority,identity_fields
+    ):
+        record=None
+        if _ledger_metadata_value(conn,"schema_version")=="2":
+            record=conn.execute(
+                "SELECT row_authority_id,batch_id,row_index,resource_arn,approved_name,"
+                "aws_operation,scope_id FROM batch_rows WHERE intent_id=?",
+                (handle.intent_id,),
+            ).fetchone()
+        if record is None:
+            if fresh_authority is not None:
+                raise LedgerError("BLOCKED_INTENT_REPLAY")
+            return None
+        if fresh_authority is None:
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        batch=fresh_authority.batch
+        expected=(fresh_authority.row_authority_id,batch.batch_id,
+                  fresh_authority.row_index,*identity_fields)
+        if tuple(record)!=expected or handle.batch_scope is None or handle.batch_side_effects is None:
+            raise LedgerError("BLOCKED_INTENT_REPLAY")
+        self._register_batch_in_transaction(
+            conn,batch,timestamp=self._iso(self._now()),current_intent_id=handle.intent_id
+        )
+        self._assert_scope_evidence(conn,handle.batch_scope,handle.batch_side_effects)
+        batch_state=conn.execute(
+            "SELECT max_send_attempts,send_attempts_consumed,state "
+            "FROM batch_registry WHERE batch_id=?",(batch.batch_id,)
+        ).fetchone()
+        if batch_state is None or batch_state[2]!="ACTIVE":
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        if batch_state[1]>=batch_state[0]:
+            raise LedgerError("BLOCKED_AUTH_REPLAY")
+        return record
+
     def consume_first_send(self, handle: IntentHandle) -> FirstSendPermit:
         """Consume the one first-send right for ``handle``.
 
@@ -1854,10 +1899,7 @@ class IntentLedger:
             raise LedgerError("BLOCKED_INTENT_REPLAY")
 
         batch_authority = handle.batch_row_authority
-        fresh_batch_authority = (
-            self._revalidate_batch_row(batch_authority)
-            if batch_authority is not None else None
-        )
+        fresh_batch_authority = self._revalidate_batch_row(batch_authority) if batch_authority is not None else None
         if (fresh_batch_authority is not None
                 and fresh_batch_authority.row_authority_id != handle.authorization_id):
             raise LedgerError("BLOCKED_INTENT_REPLAY")
@@ -1913,44 +1955,10 @@ class IntentLedger:
                 if prior is not None:
                     raise LedgerError("BLOCKED_INCOMPLETE_INTENT")
 
-                batch_record = None
-                if _ledger_metadata_value(conn, "schema_version") == "2":
-                    batch_record = conn.execute(
-                        "SELECT row_authority_id,batch_id,row_index,resource_arn,approved_name,"
-                        "aws_operation,scope_id FROM batch_rows WHERE intent_id=?",
-                        (handle.intent_id,),
-                    ).fetchone()
-                if batch_record is not None:
-                    if fresh_batch_authority is None:
-                        raise LedgerError("BLOCKED_OWNER_AUTHN")
-                    fresh_batch=fresh_batch_authority.batch
-                    if (batch_record[0] != fresh_batch_authority.row_authority_id
-                            or batch_record[1] != fresh_batch.batch_id
-                            or batch_record[2] != fresh_batch_authority.row_index
-                            or batch_record[3] != resource_arn
-                            or batch_record[4] != approved_name
-                            or batch_record[5] != aws_operation
-                            or batch_record[6] != scope_id
-                            or handle.batch_scope is None
-                            or handle.batch_side_effects is None):
-                        raise LedgerError("BLOCKED_INTENT_REPLAY")
-                    self._register_batch_in_transaction(
-                        conn,fresh_batch,timestamp=self._iso(self._now()),
-                        current_intent_id=handle.intent_id,
-                    )
-                    self._assert_scope_evidence(
-                        conn,handle.batch_scope,handle.batch_side_effects
-                    )
-                    batch_state=conn.execute(
-                        "SELECT max_send_attempts,send_attempts_consumed,state "
-                        "FROM batch_registry WHERE batch_id=?",(fresh_batch.batch_id,)
-                    ).fetchone()
-                    if batch_state is None or batch_state[2] != "ACTIVE":
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                    if batch_state[1] >= batch_state[0]:
-                        raise LedgerError("BLOCKED_AUTH_REPLAY")
-                elif fresh_batch_authority is not None:
-                    raise LedgerError("BLOCKED_INTENT_REPLAY")
+                batch_record=self._validate_batch_send_record(
+                    conn,handle,fresh_batch_authority,
+                    (resource_arn,approved_name,aws_operation,scope_id),
+                )
 
                 now = self._now()
                 timestamp = self._iso(now)
@@ -1989,6 +1997,38 @@ class IntentLedger:
             aws_operation=aws_operation,
             execution_id=self._execution_id,
             ownership_token=handle.ownership_token,
+        )
+
+    def _persist_readback_scope_hold(self,conn,scope_id,outcome,timestamp):
+        conn.execute(
+            "UPDATE scopes SET state = ?, reason = ?, updated_at_utc = ? WHERE scope_id = ?",
+            ("HOLD", f"readback:{outcome}", timestamp, scope_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO scope_history (
+                scope_id, state, decision_id, decision_nonce, owner_principal_id,
+                writer_evidence_digest, side_effect_evidence_digest, target_arns,
+                reason, timestamp_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (scope_id, "HOLD", None, None, None, None, None, None, f"readback:{outcome}", timestamp),
+        )
+
+    def _persist_batch_readback(self,conn,batch_record,outcome,scope_id,handle,timestamp):
+        if batch_record is None:
+            return
+        if outcome != "APPLIED_VERIFIED":
+            conn.execute(
+                "UPDATE batch_registry SET state='STOPPED',stop_reason=?,stopped_at_utc=? "
+                "WHERE batch_id=? AND state='ACTIVE'",
+                (outcome,timestamp,batch_record[0]),
+            )
+        conn.execute(
+            "INSERT INTO batch_events(batch_id,event,reason,scope_id,intent_id,timestamp_utc) "
+            "VALUES(?,?,?,?,?,?)",
+            (batch_record[0],f"TERMINAL:{outcome}",outcome,scope_id,
+             handle.intent_id,timestamp),
         )
 
     def record_readback(
@@ -2041,20 +2081,7 @@ class IntentLedger:
 
                 # Any outcome other than explicit success requires durable scope HOLD before terminal.
                 if outcome != "APPLIED_VERIFIED":
-                    conn.execute(
-                        "UPDATE scopes SET state = ?, reason = ?, updated_at_utc = ? WHERE scope_id = ?",
-                        ("HOLD", f"readback:{outcome}", timestamp, scope_id),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO scope_history (
-                            scope_id, state, decision_id, decision_nonce, owner_principal_id,
-                            writer_evidence_digest, side_effect_evidence_digest, target_arns,
-                            reason, timestamp_utc
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (scope_id, "HOLD", None, None, None, None, None, None, f"readback:{outcome}", timestamp),
-                    )
+                    self._persist_readback_scope_hold(conn,scope_id,outcome,timestamp)
 
                 conn.execute(
                     """
@@ -2070,19 +2097,7 @@ class IntentLedger:
                     """,
                     (handle.intent_id, f"TERMINAL:{outcome}", timestamp),
                 )
-                if batch_record is not None:
-                    if outcome != "APPLIED_VERIFIED":
-                        conn.execute(
-                            "UPDATE batch_registry SET state='STOPPED',stop_reason=?,stopped_at_utc=? "
-                            "WHERE batch_id=? AND state='ACTIVE'",
-                            (outcome,timestamp,batch_record[0]),
-                        )
-                    conn.execute(
-                        "INSERT INTO batch_events(batch_id,event,reason,scope_id,intent_id,timestamp_utc) "
-                        "VALUES(?,?,?,?,?,?)",
-                        (batch_record[0],f"TERMINAL:{outcome}",outcome,scope_id,
-                         handle.intent_id,timestamp),
-                    )
+                self._persist_batch_readback(conn,batch_record,outcome,scope_id,handle,timestamp)
                 conn.commit()
         except LedgerError as exc:
             # Re-raise known LedgerErrors (e.g., replay) as-is.

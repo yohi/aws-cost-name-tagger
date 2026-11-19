@@ -50,6 +50,7 @@ MAX_RDS_CLUSTER_PAGES = 25
 ACCOUNT_ID_PATTERN = re.compile(r"\d{12}")
 REVIEW_CSV_SUFFIX = ".review.csv"
 REPORT_CSV_SUFFIX = ".report.csv"
+ACCOUNT_ERROR_MESSAGE = "--account must be 12 digits"
 AWS_READ_CONNECT_TIMEOUT_SECONDS = 5
 AWS_READ_TIMEOUT_SECONDS = 10
 # Capture the actual OS implementation functions at import time: offline fault
@@ -530,62 +531,68 @@ def cur_candidates(files: list[str], month: str | None, min_cost: float,
         aggregates, provenance, min_cost, max_resources)
 
 
+def _accumulate_other_batch_cur_row(state,category,reason,exact_amount,exact_add):
+    if category not in state.billing:
+        raise ValueError("Unknown CUR population category")
+    entry=state.billing[category]
+    entry["billing_rows"]+=1
+    entry["exact_cost"]=exact_add((entry["exact_cost"],exact_amount))
+    reason_entry=state.reasons[(category,reason)]
+    reason_entry["billing_rows"]+=1
+    reason_entry["exact_cost"]=exact_add((reason_entry["exact_cost"],exact_amount))
+
+
+def _accumulate_recognized_batch_cur_row(state,row,key,exact_amount,exact_add):
+    if key is None:
+        raise ValueError("CUR recognized identity missing")
+    current=state.aggregates.get(key)
+    legacy_amount=cost_of(row)
+    legacy_total=legacy_amount if current is None else current.legacy_rank_cost+legacy_amount
+    if not math.isfinite(legacy_total):
+        raise ValueError("CUR aggregated amount is not finite")
+    if current is None and len(state.aggregates)>=MAX_CUR_DISTINCT_RESOURCES:
+        raise ValueError("CUR distinct-resource budget exceeded")
+    exact_total=(exact_amount if current is None
+                 else exact_add((current.exact_cost,exact_amount)))
+    from name_tag_batch_population import CurCostAggregate
+    state.aggregates[key]=CurCostAggregate(exact_total,legacy_total)
+    state.provenance[key]["services"].add(row["line_item_product_code"])
+    state.provenance[key]["billing_rows"]+=1
+    state.provenance[key]["currency"].add(row["line_item_currency_code"])
+
+
+def _accumulate_batch_cur_row(state,row):
+    from name_tag_batch_population import classify_cur_row,decimal_cost_of,exact_add
+
+    if not _cur_selected_usage(row,state.month,state.account):
+        return
+    exact_amount=decimal_cost_of(row)
+    category,reason,key=classify_cur_row(
+        row,account=state.account,kind_filter=state.kind_filter,rid_class=rid_class
+    )
+    if category!="CUR_RECOGNIZED":
+        _accumulate_other_batch_cur_row(state,category,reason,exact_amount,exact_add)
+        return
+    _accumulate_recognized_batch_cur_row(state,row,key,exact_amount,exact_add)
+
+
 def _cur_scan_batch_aggregates(paths, receipts, active_month, account, kind_filter):
     """Scan the same bounded CUR input for exact Batch accounting and legacy rank."""
     from decimal import Decimal
 
-    from name_tag_batch_population import CurCostAggregate, classify_cur_row
-    from name_tag_batch_population import decimal_cost_of, exact_add
-
-    aggregates = {}
-    provenance = defaultdict(lambda: {"services": set(), "billing_rows": 0, "currency": set()})
-    billing = {
+    state = _CurBatchAggregateState(active_month,account,kind_filter,{},
+        defaultdict(lambda: {"services": set(), "billing_rows": 0, "currency": set()}),{
         "UNATTRIBUTABLE_CUR": {"billing_rows": 0, "exact_cost": Decimal(0)},
         "OUTSIDE_REQUESTED_KINDS": {"billing_rows": 0, "exact_cost": Decimal(0)},
         "UNSUPPORTED_KIND": {"billing_rows": 0, "exact_cost": Decimal(0)},
-    }
-    reasons = defaultdict(lambda: {"billing_rows": 0, "exact_cost": Decimal(0)})
-
-    def aggregate_row(row):
-        if not _cur_selected_usage(row, active_month, account):
-            return
-        exact_amount = decimal_cost_of(row)
-        category, reason, key = classify_cur_row(
-            row, account=account, kind_filter=kind_filter, rid_class=rid_class)
-        if category != "CUR_RECOGNIZED":
-            if category not in billing:
-                raise ValueError("Unknown CUR population category")
-            entry = billing[category]
-            entry["billing_rows"] += 1
-            entry["exact_cost"] = exact_add((entry["exact_cost"], exact_amount))
-            reason_entry = reasons[(category, reason)]
-            reason_entry["billing_rows"] += 1
-            reason_entry["exact_cost"] = exact_add((reason_entry["exact_cost"], exact_amount))
-            return
-        if key is None:
-            raise ValueError("CUR recognized identity missing")
-        current = aggregates.get(key)
-        legacy_amount = cost_of(row)
-        legacy_total = legacy_amount if current is None else current.legacy_rank_cost + legacy_amount
-        if not math.isfinite(legacy_total):
-            raise ValueError("CUR aggregated amount is not finite")
-        if current is None:
-            if len(aggregates) >= MAX_CUR_DISTINCT_RESOURCES:
-                raise ValueError("CUR distinct-resource budget exceeded")
-            exact_total = exact_amount
-        else:
-            exact_total = exact_add((current.exact_cost, exact_amount))
-        aggregates[key] = CurCostAggregate(exact_total, legacy_total)
-        provenance[key]["services"].add(row["line_item_product_code"])
-        provenance[key]["billing_rows"] += 1
-        provenance[key]["currency"].add(row["line_item_currency_code"])
+    },defaultdict(lambda: {"billing_rows": 0, "exact_cost": Decimal(0)}))
 
     second_budget = {"bytes": 0, "rows": 0}
     for index, path in enumerate(paths):
-        receipt = _scan_cur_file(path, second_budget, aggregate_row)
+        receipt = _scan_cur_file(path, second_budget,lambda row:_accumulate_batch_cur_row(state,row))
         if receipts[index] != receipt:
             raise ValueError("CUR content or metadata changed between passes")
-    return aggregates, provenance, billing, reasons
+    return state.aggregates,state.provenance,state.billing,state.reasons
 
 
 def cur_candidates_batch(
@@ -743,6 +750,17 @@ class _ResolutionContext:
     candidate: str | None = None
     evidence: str = ""
     confidence: str = "high"
+
+
+@dataclass(slots=True)
+class _CurBatchAggregateState:
+    month: str
+    account: str
+    kind_filter: set[str] | None
+    aggregates: dict
+    provenance: dict
+    billing: dict
+    reasons: dict
 
 
 class Investigator:
@@ -1020,8 +1038,7 @@ class Investigator:
         state.confidence="medium"
         state.evidence=f"endpoint {state.locator} -> VPC {endpoint['VpcId']} Name={vpc_name} and {len(subnets)} same-namespace subnets"
 
-    def _resolve_rds_cluster(self, state, client):
-        loc=state.locator
+    def _find_rds_cluster(self,client,loc):
         if re.fullmatch(r"cluster-[a-z0-9]{14,}",loc,re.I):
             results=[]
             marker=None
@@ -1042,7 +1059,12 @@ class Investigator:
             else:
                 raise ValueError("RDS cluster pagination page budget exceeded")
         else:
-            results=client.describe_db_clusters(DBClusterIdentifier=loc).get("DBClusters",[])
+            return client.describe_db_clusters(DBClusterIdentifier=loc).get("DBClusters",[])
+        return results
+
+    def _resolve_rds_cluster(self, state, client):
+        loc=state.locator
+        results=self._find_rds_cluster(client,loc)
         if len(results)!=1:
             raise ValueError("RDS cluster not found/unique")
         obj=results[0]
@@ -1057,6 +1079,33 @@ class Investigator:
         state.evidence=f"CUR cluster {loc} -> DescribeDBClusters {obj['DBClusterIdentifier']} / DbClusterResourceId={obj.get('DbClusterResourceId','')} / ARN={arn}"
         state.result["write_target"]=arn
 
+    def _resolve_rds_parent(self,state,client,obj,identity,anchor):
+        cluster_id=obj.get("DBClusterIdentifier")
+        if not cluster_id:
+            return anchor,f"RDS standalone DBInstanceIdentifier={identity} (no parent cluster)",False
+        clusters=client.describe_db_clusters(DBClusterIdentifier=cluster_id).get("DBClusters",[])
+        if len(clusters)!=1:
+            raise ValueError("RDS parent cluster missing or ambiguous")
+        parent=clusters[0]
+        members={member.get("DBInstanceIdentifier") for member in parent.get("DBClusterMembers",[])}
+        if identity not in members:
+            raise ValueError("RDS instance not listed among DBClusterMembers; refusing inference")
+        cluster_tags=tagmap(client.list_tags_for_resource(ResourceName=parent["DBClusterArn"]).get("TagList",[]),expected_shape="list",allow_missing_non_name_value=True)
+        parent_name=meaningful(name_of(cluster_tags)) or meaningful(parent["DBClusterIdentifier"])
+        if not parent_name:
+            raise ValueError("RDS parent cluster has no identifiable Name/identifier")
+        if anchor and name_scope_prefix(anchor)!=name_scope_prefix(parent_name):
+            raise ValueError("RDS parent and child Name namespaces conflict")
+        generated=not anchor
+        if generated:
+            anchor=suffix_name(parent_name,"instance",obj.get("DbiResourceId",identity)[-7:].lower())
+        evidence=(f"RDS {identity} -> DBClusterIdentifier={cluster_id} -> "
+                  f"DBClusterMembers includes {identity} -> "
+                  f"cluster Name={name_of(cluster_tags) or '(unset)'} "
+                  f"/ clusterId={parent['DBClusterIdentifier']} "
+                  f"/ instance Product={state.tags.get('Product','(unset)')}")
+        return anchor,evidence,generated
+
     def _resolve_rds_instance(self, state, client):
         instances=client.describe_db_instances(DBInstanceIdentifier=state.locator).get("DBInstances",[])
         if len(instances)!=1:
@@ -1066,31 +1115,9 @@ class Investigator:
         state.tags=tagmap(client.list_tags_for_resource(ResourceName=arn).get("TagList",[]),expected_shape="list",allow_missing_non_name_value=True)
         identity=obj["DBInstanceIdentifier"]
         anchor=meaningful(identity)
-        cluster_id=obj.get("DBClusterIdentifier")
-        if cluster_id:
-            clusters=client.describe_db_clusters(DBClusterIdentifier=cluster_id).get("DBClusters",[])
-            if len(clusters)!=1:
-                raise ValueError("RDS parent cluster missing or ambiguous")
-            parent=clusters[0]
-            members={member.get("DBInstanceIdentifier") for member in parent.get("DBClusterMembers",[])}
-            if identity not in members:
-                raise ValueError("RDS instance not listed among DBClusterMembers; refusing inference")
-            cluster_tags=tagmap(client.list_tags_for_resource(ResourceName=parent["DBClusterArn"]).get("TagList",[]),expected_shape="list",allow_missing_non_name_value=True)
-            parent_name=meaningful(name_of(cluster_tags)) or meaningful(parent["DBClusterIdentifier"])
-            if not parent_name:
-                raise ValueError("RDS parent cluster has no identifiable Name/identifier")
-            if anchor and name_scope_prefix(anchor)!=name_scope_prefix(parent_name):
-                raise ValueError("RDS parent and child Name namespaces conflict")
-            if not anchor:
-                anchor=suffix_name(parent_name,"instance",obj.get("DbiResourceId",identity)[-7:].lower())
-                state.confidence="medium"
-            state.evidence=(f"RDS {identity} -> DBClusterIdentifier={cluster_id} -> "
-                            f"DBClusterMembers includes {identity} -> "
-                            f"cluster Name={name_of(cluster_tags) or '(unset)'} "
-                            f"/ clusterId={parent['DBClusterIdentifier']} "
-                            f"/ instance Product={state.tags.get('Product','(unset)')}")
-        else:
-            state.evidence=f"RDS standalone DBInstanceIdentifier={identity} (no parent cluster)"
+        anchor,state.evidence,generated=self._resolve_rds_parent(state,client,obj,identity,anchor)
+        if generated:
+            state.confidence="medium"
         if not anchor:
             raise ValueError("RDS instance and cluster lack a descriptive Name namespace")
         state.candidate=anchor if anchor.endswith("-rds") or "-db-" in anchor else suffix_name(anchor,"rds")
@@ -1730,7 +1757,7 @@ def _require_run_cur_unchanged(args, snapshot):
 def run_interactive(args):
     """Human-controlled single entry point. Dryrun never invokes an AWS write API."""
     if not ACCOUNT_ID_PATTERN.fullmatch(args.account):
-        raise SystemExit("--account must be 12 digits")
+        raise SystemExit(ACCOUNT_ERROR_MESSAGE)
     # Check the private directory AND pre-existing output collisions before
     # login or STS. For a preselected mode, also check mode-specific files.
     out = Path(args.output)
@@ -1954,7 +1981,7 @@ def plan_batch(args, *, scope_declarations, session=None):
     from name_tag_batch_state import validate_batch_draft
 
     if not ACCOUNT_ID_PATTERN.fullmatch(args.account):
-        raise SystemExit("--account must be 12 digits")
+        raise SystemExit(ACCOUNT_ERROR_MESSAGE)
     if not args.cur or args.min_cost < 0 or args.max_resources <= 0:
         raise SystemExit("Invalid Batch CUR inputs or limits")
     max_send_attempts = getattr(args, "max_send_attempts", 20)
@@ -2046,7 +2073,7 @@ def batch_plan_cli(args, *, session=None):
 
 
 def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
-    if not ACCOUNT_ID_PATTERN.fullmatch(args.account):raise SystemExit("--account must be 12 digits")
+    if not ACCOUNT_ID_PATTERN.fullmatch(args.account):raise SystemExit(ACCOUNT_ERROR_MESSAGE)
     if not args.cur:raise SystemExit("Provide at least one --cur .csv.gz file")
     out=Path(args.output)
     review=out.with_suffix(REVIEW_CSV_SUFFIX)

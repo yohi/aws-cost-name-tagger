@@ -50,6 +50,27 @@ def _cost(value:str)->Decimal:
     return amount
 
 
+def _status_outcome(row:BatchOutcomeRow)->str|None:
+    if row.get('status')=='already_named':
+        return 'ALREADY_NAMED'
+    if row.get('status')=='proposed':
+        if row.get('write_support')=='UNSUPPORTED_API':
+            return 'WRITE_UNSUPPORTED'
+        if row.get('write_support')=='OPERATION_UNRESOLVED':
+            return 'WRITE_OPERATION_UNRESOLVED'
+        if row.get('scope_application')!='APPLIED':
+            return 'SCOPE_NOT_APPLIED'
+    if row.get('name_generation_state')=='UNAVAILABLE':
+        return 'NAME_GENERATION_UNAVAILABLE'
+    if row.get('name_state')=='UNKNOWN':
+        return 'NAME_STATE_UNKNOWN'
+    if row.get('status')=='api_error':
+        return 'METADATA_READ_FAILED'
+    if row.get('status')=='manual_review':
+        return 'MANUAL_REVIEW'
+    return None
+
+
 def _row_outcome(row:BatchOutcomeRow,authentication_state:str)->str:
     outcome=row.get('outcome')
     if outcome in _DURABLE_OUTCOMES:
@@ -58,26 +79,13 @@ def _row_outcome(row:BatchOutcomeRow,authentication_state:str)->str:
         return 'WRITE_UNSUPPORTED'
     if row.get('approved')=='YES' and authentication_state=='UNSIGNED_PREVIEW':
         return 'NOT_ATTEMPTED_UNSIGNED_PREVIEW'
-    if row.get('status')=='already_named':
-        return 'ALREADY_NAMED'
-    if row.get('status')=='proposed' and row.get('write_support')=='UNSUPPORTED_API':
-        return 'WRITE_UNSUPPORTED'
-    if row.get('status')=='proposed' and row.get('write_support')=='OPERATION_UNRESOLVED':
-        return 'WRITE_OPERATION_UNRESOLVED'
-    if row.get('status')=='proposed' and row.get('scope_application')!='APPLIED':
-        return 'SCOPE_NOT_APPLIED'
-    if row.get('name_generation_state')=='UNAVAILABLE':
-        return 'NAME_GENERATION_UNAVAILABLE'
-    if row.get('name_state')=='UNKNOWN':
-        return 'NAME_STATE_UNKNOWN'
-    if row.get('status')=='api_error':
-        return 'METADATA_READ_FAILED'
+    status_outcome=_status_outcome(row)
+    if status_outcome is not None:
+        return status_outcome
     if row.get('approved')=='YES':
         return ('NOT_ATTEMPTED_UNSIGNED_PREVIEW'
                 if authentication_state=='UNSIGNED_PREVIEW'
                 else 'NOT_ATTEMPTED_OWNER_VERIFIED')
-    if row.get('status')=='manual_review':
-        return 'MANUAL_REVIEW'
     return 'UNAPPROVED'
 
 

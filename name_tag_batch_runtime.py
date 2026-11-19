@@ -171,6 +171,73 @@ def _execute_unclaimed_row(
     return outcome == "OUTCOME_UNKNOWN"
 
 
+def _advance_batch_row(
+    batch: VerifiedBatchApproval,
+    row_index: int,
+    position: int,
+    state: BatchExecutionState,
+    ledger: IntentLedger,
+    runtime: BatchOfflineRuntime,
+    report: dict[str, JsonValue],
+) -> bool:
+    outcome=state.outcomes[position]
+    if outcome!="UNCLAIMED":
+        if outcome in ("WRITE_INTENT_RECORDED","SEND_ATTEMPT_CONSUMED"):
+            ledger.stop_batch(batch,reason_code="BLOCKED_INCOMPLETE_INTENT")
+            return True
+        return state.state=="STOPPED"
+    if state.state=="STOPPED":
+        return True
+    if state.send_attempts_consumed>=state.max_send_attempts:
+        if _record_cap_for_unclaimed(batch,ledger,runtime,state):
+            report["authentication_state"]="OWNER_AUTHN_REVOKED"
+        return True
+    return _execute_unclaimed_row(batch,row_index,ledger,runtime,report)
+
+
+def _row_outcomes_by_index(
+    batch: VerifiedBatchApproval,
+    state: BatchExecutionState,
+) -> dict[int,str]:
+    outcomes_by_row:dict[int,str]={}
+    for position,row_index in enumerate(batch.approved_row_indexes):
+        outcome=state.outcomes[position]
+        if outcome=="WRITE_INTENT_RECORDED":
+            outcome="NOT_ATTEMPTED_BATCH_STOP"
+        elif outcome=="SEND_ATTEMPT_CONSUMED":
+            outcome="OUTCOME_UNKNOWN"
+        elif outcome=="UNCLAIMED":
+            if state.state!="STOPPED":
+                raise ReportBlocked("Active Batch has an unclaimed approved row")
+            outcome="NOT_ATTEMPTED_BATCH_STOP"
+        outcomes_by_row[row_index]=outcome
+    return outcomes_by_row
+
+
+def _complete_run_result(
+    report: dict[str, JsonValue],
+    state: BatchExecutionState,
+    outcomes_by_row: dict[int,str],
+) -> BatchRunResult:
+    report=reconcile_batch_outcomes(report,outcomes_by_row)
+    report["batch_state"]=state.state
+    report["send_attempts_consumed"]=state.send_attempts_consumed
+    report["max_send_attempts"]=state.max_send_attempts
+    remaining=state.outcomes.count("NOT_ATTEMPTED_CAP")
+    report["remaining_unattempted_cap"]=remaining
+    writes_complete=bool(
+        state.state=="COMPLETED" and state.outcomes
+        and all(outcome=="APPLIED_VERIFIED" for outcome in state.outcomes)
+    )
+    report["writes_complete"]=writes_complete
+    report["execution_allowed"]=False
+    report["execution_mode"]="OFFLINE_FAKE_ONLY"
+    return BatchRunResult(
+        state.state,state.send_attempts_consumed,state.max_send_attempts,
+        remaining,state.outcomes,writes_complete,MappingProxyType(report),
+    )
+
+
 def execute_batch_offline(
     batch: VerifiedBatchApproval,
     *,
@@ -200,22 +267,7 @@ def execute_batch_offline(
     )
     for position, row_index in enumerate(batch.approved_row_indexes):
         state = ledger.batch_execution_state(batch)
-        outcome = state.outcomes[position]
-        if outcome != "UNCLAIMED":
-            if outcome in ("WRITE_INTENT_RECORDED", "SEND_ATTEMPT_CONSUMED"):
-                ledger.stop_batch(batch, reason_code="BLOCKED_INCOMPLETE_INTENT")
-                break
-            if state.state == "STOPPED":
-                break
-            continue
-        if state.state == "STOPPED":
-            break
-        if state.send_attempts_consumed >= state.max_send_attempts:
-            if _record_cap_for_unclaimed(batch, ledger, runtime, state):
-                report["authentication_state"]="OWNER_AUTHN_REVOKED"
-            break
-
-        if _execute_unclaimed_row(batch,row_index,ledger,runtime,report):
+        if _advance_batch_row(batch,row_index,position,state,ledger,runtime,report):
             break
 
     state = ledger.batch_execution_state(batch)
@@ -225,32 +277,5 @@ def execute_batch_offline(
     ):
         ledger.complete_batch(batch)
         state = ledger.batch_execution_state(batch)
-    outcomes_by_row:dict[int,str]={}
-    for position, row_index in enumerate(batch.approved_row_indexes):
-        outcome=state.outcomes[position]
-        if outcome=="WRITE_INTENT_RECORDED":
-            outcome="NOT_ATTEMPTED_BATCH_STOP"
-        elif outcome=="SEND_ATTEMPT_CONSUMED":
-            outcome="OUTCOME_UNKNOWN"
-        elif outcome=="UNCLAIMED":
-            if state.state!="STOPPED":
-                raise ReportBlocked("Active Batch has an unclaimed approved row")
-            outcome="NOT_ATTEMPTED_BATCH_STOP"
-        outcomes_by_row[row_index]=outcome
-    report=reconcile_batch_outcomes(report,outcomes_by_row)
-    report["batch_state"] = state.state
-    report["send_attempts_consumed"] = state.send_attempts_consumed
-    report["max_send_attempts"] = state.max_send_attempts
-    report["remaining_unattempted_cap"] = state.outcomes.count("NOT_ATTEMPTED_CAP")
-    writes_complete = bool(
-        state.state == "COMPLETED" and state.outcomes
-        and all(outcome == "APPLIED_VERIFIED" for outcome in state.outcomes)
-    )
-    report["writes_complete"] = writes_complete
-    report["execution_allowed"] = False
-    report["execution_mode"] = "OFFLINE_FAKE_ONLY"
-    return BatchRunResult(
-        state.state,state.send_attempts_consumed,state.max_send_attempts,
-        state.outcomes.count("NOT_ATTEMPTED_CAP"),state.outcomes,writes_complete,
-        MappingProxyType(report),
-    )
+    outcomes_by_row=_row_outcomes_by_index(batch,state)
+    return _complete_run_result(report,state,outcomes_by_row)
