@@ -133,6 +133,17 @@ class OfflineFixtureBatchLedger:
                 self.conn.execute("UPDATE scopes SET state='HOLD' WHERE scope_id=?",(r[1],))
                 self.conn.execute("UPDATE batch_registry SET state='STOPPED',stop_reason='OUTCOME_UNKNOWN',stopped_at_utc='fixture' WHERE batch_id=?",(id,))
             self.conn.execute('INSERT INTO batch_events(batch_id,event,reason) VALUES(?,?,?)',(id,'READBACK',outcome))
+    def outcome_unknown_after_readback_failure(self,id,index):
+        """Atomically record uncertain post-send state, Batch STOP, and Scope HOLD."""
+        with self._tx():
+            batch_state=self.conn.execute('SELECT state FROM batch_registry WHERE batch_id=?',(id,)).fetchone()
+            row=self.conn.execute('SELECT state,scope_id FROM intents WHERE batch_id=? AND row_index=?',(id,index)).fetchone()
+            if batch_state!=('ACTIVE',) or not row or row[0]!='SEND_ATTEMPT_CONSUMED':
+                raise LedgerBlocked('No active consumed Intent for unknown outcome')
+            self.conn.execute("UPDATE intents SET state='OUTCOME_UNKNOWN' WHERE batch_id=? AND row_index=?",(id,index))
+            self.conn.execute("UPDATE scopes SET state='HOLD' WHERE scope_id=?",(row[1],))
+            self.conn.execute("UPDATE batch_registry SET state='STOPPED',stop_reason='OUTCOME_UNKNOWN',stopped_at_utc='fixture' WHERE batch_id=?",(id,))
+            self.conn.execute("INSERT INTO batch_events(batch_id,event,reason) VALUES(?,?,?)",(id,'READBACK','OUTCOME_UNKNOWN'))
     def _complete_in_tx(self,id):
         _,_,_,size=self._meta(id)
         actual=self.conn.execute('SELECT COUNT(*) FROM intents WHERE batch_id=?',(id,)).fetchone()[0]+self.conn.execute('SELECT COUNT(*) FROM batch_row_dispositions WHERE batch_id=?',(id,)).fetchone()[0]

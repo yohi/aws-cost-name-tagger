@@ -37,6 +37,56 @@ class StateTests(unittest.TestCase):
         invalid_approval=approved.replace(b'YES,proposal-1',b'Y,proposal-1')
         with self.assertRaises(BatchValidationError):validate_batch_draft(pb,invalid_approval)
 
+    def test_distinct_unconfirmed_targets_are_allowed_on_non_yes_rows(self):
+        records=[]
+        for proposal_id in ('first','second'):
+            records.append({'proposal_id':proposal_id,'kind':'unknown','locator':'','region':'ap-northeast-1',
+                'resource_arn':None,'aws_operation':None,'status':'unresolved','confidence':'low',
+                'name_state':'UNKNOWN','name_key_present':None,'name_raw_value':None,'existing_name':'',
+                'proposed_name':'','effective_usage_cost_usd':'1','evidence':'unresolved'})
+        p={'schema_version':3,'account':'123456789012','partition':'aws','count':2,
+           'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(count=2,cost='2'),
+           'scope_declarations':[{'writer_control_scope_id':'s','account':'123456789012','partition':'aws',
+              'region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-a']}],
+           'records':records}
+        plan_bytes=json.dumps(p).encode()
+        rows=validate_batch_csv(plan_bytes,build_batch_review_projection(plan_bytes))
+        self.assertEqual([row['approved'] for row in rows],['',''])
+
+    def test_volume_locator_must_match_arn_resource_id(self):
+        p={'schema_version':3,'account':'123456789012','partition':'aws','count':1,
+           'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(cost='1'),
+           'scope_declarations':[{'writer_control_scope_id':'s','account':'123456789012','partition':'aws',
+              'region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-a']}],
+           'records':[{'proposal_id':'p','kind':'volume','locator':'vol-b','region':'ap-northeast-1',
+              'resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-a',
+              'aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT',
+              'name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'Valid-Name',
+              'effective_usage_cost_usd':'1','evidence':'metadata'}]}
+        plan_bytes=json.dumps(p).encode()
+        approved=build_batch_review_projection(plan_bytes).replace(b',p,',b'YES,p,')
+        with self.assertRaises(BatchValidationError):
+            validate_batch_draft(plan_bytes,approved)
+
+    def test_proposed_name_accepts_256_unicode_chars_and_rejects_257(self):
+        p={'schema_version':3,'account':'123456789012','partition':'aws','count':1,
+           'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(cost='1'),
+           'scope_declarations':[{'writer_control_scope_id':'s','account':'123456789012','partition':'aws',
+              'region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-a']}],
+           'records':[{'proposal_id':'p','kind':'volume','locator':'vol-a','region':'ap-northeast-1',
+              'resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-a',
+              'aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT',
+              'name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'名'*256,
+              'effective_usage_cost_usd':'1','evidence':'metadata'}]}
+        plan_bytes=json.dumps(p,ensure_ascii=False).encode()
+        csv_bytes=build_batch_review_projection(plan_bytes).replace(b',p,',b'YES,p,')
+        self.assertEqual(len(validate_batch_draft(plan_bytes,csv_bytes).approved_rows[0]['approved_name']),256)
+        p['records'][0]['proposed_name']='名'*257
+        plan_bytes=json.dumps(p,ensure_ascii=False).encode()
+        csv_bytes=build_batch_review_projection(plan_bytes).replace(b',p,',b'YES,p,')
+        with self.assertRaises(BatchValidationError):
+            validate_batch_draft(plan_bytes,csv_bytes)
+
 if __name__=='__main__':unittest.main()
 
 class SecurityBoundaryTests(unittest.TestCase):

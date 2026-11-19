@@ -146,8 +146,12 @@ def derive_declared_row_scope(plan:dict,row:dict)->str:
     parts=arn.split(':',5)
     if len(parts)!=6 or parts[:2]!=['arn',partition] or parts[3]!=region or parts[4]!=account:
         raise BatchValidationError('ARN/account/partition/region mismatch')
-    if row.get('kind')=='volume' and (parts[2]!='ec2' or not re.fullmatch(r'volume/vol-[A-Za-z0-9]+',parts[5])):
-        raise BatchValidationError('Malformed volume ARN')
+    if row.get('kind')=='volume':
+        match=re.fullmatch(r'volume/(vol-[A-Za-z0-9]+)',parts[5]) if parts[2]=='ec2' else None
+        if match is None:
+            raise BatchValidationError('Malformed volume ARN')
+        if row.get('locator')!=match.group(1):
+            raise BatchValidationError('Volume locator does not match ARN')
     entries=[s for s in plan['scope_declarations'] if s['account']==account and s['partition']==partition and s['region']==region and arn in s['resource_arns']]
     if len(entries)!=1:raise BatchValidationError('No unique Scope declaration')
     return entries[0]['writer_control_scope_id']
@@ -161,7 +165,7 @@ def validate_approved_batch_row(p,r,approved:str):
     valid=(state=='ABSENT' and presence is False and raw is None) or (state=='EMPTY' and presence is True and raw=='') or (state=='WHITESPACE_ONLY' and presence is True and isinstance(raw,str) and raw!='' and raw.strip()=='')
     if not valid:raise BatchValidationError('Name cannot be overwritten')
     name=r.get('proposed_name')
-    if not isinstance(name,str) or not name or name!=name.strip() or any(ord(c)<32 or ord(c)==127 for c in name):raise BatchValidationError('Invalid proposed Name')
+    if not isinstance(name,str) or not name or len(name)>256 or name!=name.strip() or any(ord(c)<32 or ord(c)==127 for c in name):raise BatchValidationError('Invalid proposed Name')
     if not isinstance(r.get('proposal_id'),str) or not r['proposal_id'] or not isinstance(r.get('evidence'),str) or not r['evidence']:
         raise BatchValidationError('No proposal/evidence')
     if r.get('kind')!='volume' or r.get('aws_operation')!='ec2:CreateTags':
@@ -179,9 +183,12 @@ def validate_batch_csv(plan_bytes:bytes,csv_bytes:bytes)->tuple[dict,...]:
         if c['approved'] not in ('','YES','NO'):raise BatchValidationError('Invalid approved cell')
         if any(c[f]!=_csv_value(record,f) for f in CSV_COLUMNS if f!='approved'):
             raise BatchValidationError('Non-approval CSV cell changed')
-        proposal=record.get('proposal_id');identity=(record.get('resource_arn'),record.get('aws_operation'))
-        if not proposal or proposal in ids or identity in target:raise BatchValidationError('Duplicate/missing proposal or target')
-        ids.add(proposal);target.add(identity)
+        proposal=record.get('proposal_id');arn=record.get('resource_arn');operation=record.get('aws_operation')
+        identity=(arn,operation)
+        confirmed_target=isinstance(arn,str) and bool(arn) and isinstance(operation,str) and bool(operation)
+        if not proposal or proposal in ids or (confirmed_target and identity in target):raise BatchValidationError('Duplicate/missing proposal or target')
+        ids.add(proposal)
+        if confirmed_target:target.add(identity)
         result.append(validate_approved_batch_row(p,record,c['approved']) if c['approved']=='YES' else {**record,'approved':c['approved']})
     return tuple(result)
 

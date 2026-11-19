@@ -3,8 +3,9 @@ from decimal import Decimal
 
 from name_tag_batch_population import (
     CurCostAggregate, CurBudgetExceeded, partition_cur_population,
-    decimal_cost_of, classify_cur_row, exact_add,
+    decimal_cost_of, classify_cur_row, exact_add, validate_signed_population,
 )
+from test_helpers import sample_population
 
 class PopulationTests(unittest.TestCase):
     def test_precise_decimal_conservation_and_float_rank(self):
@@ -31,5 +32,16 @@ class PopulationTests(unittest.TestCase):
         self.assertEqual(classify_cur_row({**row,'line_item_resource_id':''},account='123456789012',kind_filter=None,rid_class=lambda r: ('unsupported','vol-a',None))[0],'UNATTRIBUTABLE_CUR')
         self.assertEqual(classify_cur_row(row,account='123456789013',kind_filter=None,rid_class=lambda r: ('volume','vol-a','ap-northeast-1'))[0],'UNATTRIBUTABLE_CUR')
         with self.assertRaises(CurBudgetExceeded): partition_cur_population({}, min_cost=0.0,max_resources=0)
+
+    def test_signed_population_rejects_record_cost_mismatch(self):
+        plan={'count':1,'records':[{'effective_usage_cost_usd':'1.25'}],
+              'cur_population':sample_population(cost='1.24')}
+        with self.assertRaises(ValueError):
+            validate_signed_population(plan)
+
+    def test_signed_population_accepts_matching_record_cost(self):
+        plan={'count':1,'records':[{'effective_usage_cost_usd':'1.25'}],
+              'cur_population':sample_population(cost='1.25')}
+        self.assertEqual(validate_signed_population(plan),plan['cur_population'])
 
 if __name__=='__main__':unittest.main()

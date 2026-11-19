@@ -128,6 +128,7 @@ def prepare_batch_approval(plan_bytes:bytes,csv_bytes:bytes,*,owner_principal_id
       'batch_id':sha256(can).hexdigest(),'owner_id_hint':owner_principal_id,
       'signing_namespace':BATCH_NAMESPACE,'plan_sha256':payload['plan_sha256'],
       'csv_sha256':payload['csv_sha256'],'approved_rows_sha256':payload['approved_rows_sha256'],
+      'cur_population':draft.plan['cur_population'],
       'max_send_attempts':draft.plan['execution_limits']['max_send_attempts'],
       'expires_at_utc':expires_at_utc,
       'approved_rows':[{k:r.get(k) for k in ('proposal_id','resource_arn','name_state','name_raw_value','approved_name','aws_operation','writer_control_scope_id','effective_usage_cost_usd')} for r in draft.approved_rows]}
@@ -137,7 +138,7 @@ def prepare_batch_approval(plan_bytes:bytes,csv_bytes:bytes,*,owner_principal_id
 def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope:bytes,*,trust:Any,now_utc:datetime)->VerifiedBatchApproval:
     """Require *real* existing protected OwnerTrust and OpenSSH verification. No fake fallback."""
     try:
-        from name_tag_approval import OwnerTrust, _select_signer_lines, _verify_signature
+        from name_tag_approval import ApprovalRejected, OwnerTrust, _select_signer_lines, _verify_signature
         if not isinstance(trust,OwnerTrust) or type(now_utc) is not datetime or now_utc.tzinfo is None:
             raise BatchAuthRejected()
         envelope=json.loads(signed_batch_envelope.decode('utf-8'),object_pairs_hook=_unique_pairs,
@@ -157,7 +158,10 @@ def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope
         if payload['owner_key_fingerprint'] not in allowed:raise BatchAuthRejected()
         lines=_select_signer_lines(trust._check_file(),payload['owner_principal_id'],allowed)
         signature=base64.b64decode(envelope['signature_ref'],validate=True)
-        actual=_verify_signature(signature,can,payload['owner_principal_id'],BATCH_NAMESPACE,lines)
+        try:
+            actual=_verify_signature(signature,can,payload['owner_principal_id'],BATCH_NAMESPACE,lines)
+        except ApprovalRejected as e:
+            raise BatchAuthRejected() from e
         if actual!=payload['owner_key_fingerprint']:raise BatchAuthRejected()
         approved_tuples=_approved_tuples(draft)
         return VerifiedBatchApproval(bytes(signed_batch_envelope),can,envelope['batch_id'],MappingProxyType(dict(payload)),bytes(plan_bytes),bytes(csv_bytes),draft.approved_rows,tuple(row[0] for row in approved_tuples),payload['owner_principal_id'],envelope['signature_ref'])

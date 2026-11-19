@@ -139,6 +139,8 @@ def validate_signed_population(plan:dict)->dict:
         raise ValueError('Inexact CUR population conservation')
     if type(plan.get('count')) is not int or plan['count']!=len(plan.get('records',[])) or plan['count']!=c['lookup_selected']['count']:
         raise ValueError('Selected records contradict signed population')
+    if exact_add(record['effective_usage_cost_usd'] for record in plan['records']) != cost(c['lookup_selected']['cost_usd']):
+        raise ValueError('Selected record costs contradict signed population')
     return c
 
 

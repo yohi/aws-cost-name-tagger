@@ -43,6 +43,7 @@ class ExecutorFixtureTests(unittest.TestCase):
         self.assertEqual(a.write_calls,1)
         self.assertEqual(result['outcomes'],['OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'])
         self.assertEqual(result['batch_state'],'STOPPED')
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
     def test_presend_name_change_skips_not_consume(self):
         a=InMemoryNameAdapter({'volume-1':{'Name':'existing'},'volume-2':{}})
         result=simulate_untrusted_fixture('batch-3','nonce-3',self.rows,ledger=self.ledger,adapter=a,cap=2)

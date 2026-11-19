@@ -85,7 +85,7 @@ def _execute_fixture_row(batch_id,index,row,ledger,adapter):
         return outcome,outcome=='OUTCOME_UNKNOWN'
     except (LedgerBlocked,OSError):
         if attempt_consumed:
-            if ledger.state(batch_id)=='ACTIVE':ledger.stop(batch_id,'OUTCOME_UNKNOWN')
+            ledger.outcome_unknown_after_readback_failure(batch_id,index)
             return 'OUTCOME_UNKNOWN',True
         if ledger.state(batch_id)=='ACTIVE':ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
         return 'BLOCKED_SCOPE_STATE_UNKNOWN',True
