@@ -1,5 +1,7 @@
-import tempfile,unittest
+import sqlite3,tempfile,unittest
+from unittest.mock import patch
 from pathlib import Path
+import name_tag_batch_ledger
 from name_tag_batch_ledger import OfflineFixtureBatchLedger, LedgerBlocked
 
 class DurableFixtureTests(unittest.TestCase):
@@ -48,10 +50,21 @@ class DurableFixtureTests(unittest.TestCase):
         self.ledger.admit('batch-a',0,'scope-a','row-0')
         self.ledger.consume('batch-a',0)
         self.ledger.close()
-        import sqlite3
         con=sqlite3.connect(self.path);con.execute('UPDATE batch_registry SET send_attempts_consumed=0');con.commit();con.close()
         with self.assertRaises(LedgerBlocked):OfflineFixtureBatchLedger.open_fixture(self.path)
         # TearDown should not close an already closed connection
         self.ledger=OfflineFixtureBatchLedger.open_read_only_for_fixture(self.path)
+
+    def test_create_fixture_rolls_back_partial_schema(self):
+        path = Path(self.d.name) / 'partial_fixture.sqlite'
+        ddl = 'CREATE TABLE should_rollback (id INTEGER); CREATE TABL invalid;'
+        with patch.object(name_tag_batch_ledger, 'DDL', ddl):
+            with self.assertRaises(sqlite3.OperationalError):
+                OfflineFixtureBatchLedger.create_fixture(path)
+        with sqlite3.connect(path) as connection:
+            tables = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        self.assertEqual(tables, [])
 
 if __name__=='__main__':unittest.main()

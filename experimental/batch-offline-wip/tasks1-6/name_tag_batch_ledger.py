@@ -38,7 +38,10 @@ class OfflineFixtureBatchLedger:
         path.parent.mkdir(parents=True,exist_ok=True)
         path.touch(mode=0o600,exist_ok=False)
         l=cls(path)
-        with l._tx():l.conn.executescript(DDL)
+        with l._tx():
+            for statement in DDL.split(';'):
+                if statement.strip():
+                    l.conn.execute(statement)
         return l
     @classmethod
     def open_fixture(cls,path):
