@@ -1247,18 +1247,18 @@ class IntentLedger:
             if nonce_owner is not None:
                 raise LedgerError("BLOCKED_AUTH_REPLAY")
             now = self._now()
-            timestamp = self._iso(now)
+            created_at_utc = self._iso(now)
             try:
                 connection.execute(
                     "INSERT INTO batch_registry(batch_id,batch_nonce,plan_sha256,csv_sha256,"
                     "state,max_send_attempts,created_at_utc) VALUES(?,?,?,?,?,?,?)",
-                    (batch.batch_id,batch_nonce,plan_sha256,csv_sha256,"ACTIVE",cap,timestamp),
+                    (batch.batch_id,batch_nonce,plan_sha256,csv_sha256,"ACTIVE",cap,created_at_utc),
                 )
             except sqlite3.IntegrityError as error:
                 raise LedgerError("BLOCKED_AUTH_REPLAY") from error
             connection.execute(
                 "INSERT INTO batch_events(batch_id,event,reason,timestamp_utc) VALUES(?,?,?,?)",
-                (batch.batch_id,"BATCH_REGISTERED",None,timestamp),
+                (batch.batch_id,"BATCH_REGISTERED",None,created_at_utc),
             )
         elif row != (batch_nonce,plan_sha256,csv_sha256,"ACTIVE",cap):
             raise LedgerError("BLOCKED_AUTH_REPLAY")
