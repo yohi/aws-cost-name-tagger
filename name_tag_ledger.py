@@ -1561,6 +1561,33 @@ class IntentLedger:
         finally:
             self._unlock()
 
+    def _assert_batch_row_complete(self,connection,batch,authority):
+        completion_check=self._revalidate_batch_row(authority)
+        if completion_check.row_authority_id!=authority.row_authority_id:
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        expected=self._expected_batch_row_identity(batch,authority.row_index)
+        intent=connection.execute(
+            "SELECT br.row_authority_id,br.proposal_id,br.resource_arn,"
+            "br.approved_name,br.aws_operation,br.scope_id,i.state,i.outcome "
+            "FROM batch_rows br JOIN intents i ON i.intent_id=br.intent_id "
+            "WHERE br.batch_id=? AND br.row_index=?",
+            (batch.batch_id,authority.row_index),
+        ).fetchone()
+        disposition=connection.execute(
+            "SELECT row_authority_id,decision FROM batch_row_dispositions "
+            "WHERE batch_id=? AND row_index=?",
+            (batch.batch_id,authority.row_index),
+        ).fetchone()
+        if (intent is not None)==(disposition is not None):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        if intent is not None:
+            if (tuple(intent[:6])!=expected or intent[6]!="TERMINAL"
+                    or intent[7]!="APPLIED_VERIFIED"):
+                raise LedgerError("BLOCKED_INCOMPLETE_INTENT")
+            return
+        if disposition is None or disposition[0]!=expected[0]:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+
     def complete_batch(self, batch: VerifiedBatchApproval) -> None:
         """Complete an active Batch only after every approved row is terminal and known."""
         from name_tag_batch_trust import load_current_protected_owner_trust
@@ -1587,32 +1614,7 @@ class IntentLedger:
                     connection,fresh_batch,timestamp=self._iso(self._now())
                 )
                 for authority in row_authorities:
-                    completion_check=self._revalidate_batch_row(authority)
-                    if completion_check.row_authority_id != authority.row_authority_id:
-                        raise LedgerError("BLOCKED_OWNER_AUTHN")
-                    expected=self._expected_batch_row_identity(
-                        fresh_batch,authority.row_index
-                    )
-                    intent=connection.execute(
-                        "SELECT br.row_authority_id,br.proposal_id,br.resource_arn,"
-                        "br.approved_name,br.aws_operation,br.scope_id,i.state,i.outcome "
-                        "FROM batch_rows br JOIN intents i ON i.intent_id=br.intent_id "
-                        "WHERE br.batch_id=? AND br.row_index=?",
-                        (fresh_batch.batch_id,authority.row_index),
-                    ).fetchone()
-                    disposition=connection.execute(
-                        "SELECT row_authority_id,decision FROM batch_row_dispositions "
-                        "WHERE batch_id=? AND row_index=?",
-                        (fresh_batch.batch_id,authority.row_index),
-                    ).fetchone()
-                    if (intent is not None) == (disposition is not None):
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-                    if intent is not None:
-                        if (tuple(intent[:6]) != expected or intent[6] != "TERMINAL"
-                                or intent[7] != "APPLIED_VERIFIED"):
-                            raise LedgerError("BLOCKED_INCOMPLETE_INTENT")
-                    elif disposition is None or disposition[0] != expected[0]:
-                        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+                    self._assert_batch_row_complete(connection,fresh_batch,authority)
                 active=connection.execute(
                     "SELECT state FROM batch_registry WHERE batch_id=?",
                     (fresh_batch.batch_id,),
@@ -1887,22 +1889,24 @@ class IntentLedger:
             raise LedgerError("BLOCKED_AUTH_REPLAY")
         return record
 
+    def _fresh_send_authority(self,handle):
+        if not isinstance(handle,IntentHandle) or not handle.ownership_token:
+            raise LedgerError("BLOCKED_INTENT_REPLAY")
+        if handle.execution_id!=self._execution_id:
+            raise LedgerError("BLOCKED_INTENT_REPLAY")
+        batch_authority=handle.batch_row_authority
+        fresh=self._revalidate_batch_row(batch_authority) if batch_authority is not None else None
+        if fresh is not None and fresh.row_authority_id!=handle.authorization_id:
+            raise LedgerError("BLOCKED_INTENT_REPLAY")
+        return fresh
+
     def consume_first_send(self, handle: IntentHandle) -> FirstSendPermit:
         """Consume the one first-send right for ``handle``.
 
         Verifies current exclusive execution ownership and durable
         ``SEND_ATTEMPT_CONSUMED``, then returns a non-persistable permit.
         """
-        if not isinstance(handle, IntentHandle) or not handle.ownership_token:
-            raise LedgerError("BLOCKED_INTENT_REPLAY")
-        if handle.execution_id != self._execution_id:
-            raise LedgerError("BLOCKED_INTENT_REPLAY")
-
-        batch_authority = handle.batch_row_authority
-        fresh_batch_authority = self._revalidate_batch_row(batch_authority) if batch_authority is not None else None
-        if (fresh_batch_authority is not None
-                and fresh_batch_authority.row_authority_id != handle.authorization_id):
-            raise LedgerError("BLOCKED_INTENT_REPLAY")
+        fresh_batch_authority=self._fresh_send_authority(handle)
 
         self._lock()
         try:

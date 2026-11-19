@@ -120,8 +120,8 @@
     },
     {
       "path": "name_tag_ledger.py",
-      "sha256": "9884f7d2b4312ed19b61d8789e05bc51a6e13d168b4b71e5acfe1edf8bd19ebc",
-      "bytes": 102861
+      "sha256": "f1240dd2321158a61ce1ff9b42a53e05040ea8d7b5d964e3a14ac29dbfcf4871",
+      "bytes": 102725
     },
     {
       "path": "name_tag_ledger_anchor.py",
