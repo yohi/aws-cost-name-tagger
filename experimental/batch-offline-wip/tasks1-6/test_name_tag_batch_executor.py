@@ -67,6 +67,31 @@ class ExecutorFixtureTests(unittest.TestCase):
         self.ledger.close();self.ledger=OfflineFixtureBatchLedger.open_fixture(Path(self.t.name)/'fixture.sqlite')
         self.assertEqual(self.ledger.state('batch-stop-write-failure'),'STOPPED')
         self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
+    def test_exclusive_sqlite_lock_returns_recovery_required(self):
+        lock_conn=sqlite3.connect(Path(self.t.name)/'fixture.sqlite',timeout=0.1,isolation_level=None)
+        lock_conn.execute('PRAGMA journal_mode=DELETE')
+        self.ledger.conn.execute('PRAGMA busy_timeout=100')
+        adapter=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
+        write_once=adapter.write_once
+        def write_then_lock(arn,name):
+            write_once(arn,name)
+            lock_conn.execute('BEGIN EXCLUSIVE')
+
+        try:
+            with patch.object(adapter,'write_once',side_effect=write_then_lock):
+                result=simulate_untrusted_fixture('batch-real-lock','nonce-real-lock',self.rows,ledger=self.ledger,adapter=adapter,cap=2)
+        finally:
+            if lock_conn.in_transaction:lock_conn.execute('ROLLBACK')
+            lock_conn.close()
+        self.assertEqual(adapter.write_calls,1)
+        self.assertEqual(result['outcomes'],['OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'])
+        self.assertEqual(result['batch_state'],'RECOVERY_REQUIRED')
+        self.assertEqual(result['send_attempts_consumed'],1)
+        self.assertFalse(result['writes_complete'])
+
+        self.ledger.close();self.ledger=OfflineFixtureBatchLedger.open_fixture(Path(self.t.name)/'fixture.sqlite')
+        self.assertEqual(self.ledger.state('batch-real-lock'),'STOPPED')
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
     def test_presend_name_change_skips_not_consume(self):
         a=InMemoryNameAdapter({'volume-1':{'Name':'existing'},'volume-2':{}})
         result=simulate_untrusted_fixture('batch-3','nonce-3',self.rows,ledger=self.ledger,adapter=a,cap=2)

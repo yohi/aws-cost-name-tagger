@@ -43,6 +43,7 @@ def simulate_untrusted_fixture(batch_id,nonce,approved_rows,*,ledger:OfflineFixt
             raise LedgerBlocked('Incomplete fixture')
         scopes.append(row['writer_control_scope_id'])
     ledger.register(batch_id,nonce,max_send_attempts=cap,row_count=len(approved_rows),scope_ids=scopes)
+    initial_consumed=ledger.counter(batch_id)
     outcomes=[]
     for i,row in enumerate(approved_rows):
         if ledger.state(batch_id)!='ACTIVE':
@@ -58,10 +59,16 @@ def simulate_untrusted_fixture(batch_id,nonce,approved_rows,*,ledger:OfflineFixt
             outcomes.extend(['NOT_ATTEMPTED_BATCH_STOP']*(len(approved_rows)-i-1))
             break
     _finish_fixture_batch(batch_id,approved_rows,outcomes,ledger)
+    try:
+        batch_state=ledger.state(batch_id)
+        send_attempts_consumed=ledger.counter(batch_id)
+    except sqlite3.Error:
+        batch_state='RECOVERY_REQUIRED'
+        send_attempts_consumed=initial_consumed+sum(outcome in ('APPLIED_VERIFIED','OUTCOME_UNKNOWN') for outcome in outcomes)
     return {'authentication_state':'SYNTHETIC_TEST_ONLY','execution_allowed':False,
-            'batch_state':ledger.state(batch_id),'send_attempts_consumed':ledger.counter(batch_id),
+            'batch_state':batch_state,'send_attempts_consumed':send_attempts_consumed,
             'outcomes':outcomes,
-            'writes_complete':ledger.state(batch_id)=='COMPLETED' and len(outcomes)==len(approved_rows) and all(o=='APPLIED_VERIFIED' for o in outcomes)}
+            'writes_complete':batch_state=='COMPLETED' and len(outcomes)==len(approved_rows) and all(o=='APPLIED_VERIFIED' for o in outcomes)}
 
 
 def _execute_fixture_row(batch_id,index,row,ledger,adapter):
@@ -106,8 +113,8 @@ def _write_and_readback(arn,name,adapter):
 
 
 def _finish_fixture_batch(batch_id,approved_rows,outcomes,ledger):
-    if ledger.state(batch_id)!='ACTIVE':return
     if 'OUTCOME_UNKNOWN' in outcomes:return
+    if ledger.state(batch_id)!='ACTIVE':return
     if len(outcomes)==len(approved_rows):
         ledger.complete(batch_id)
 
