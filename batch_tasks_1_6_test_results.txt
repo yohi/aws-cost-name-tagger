@@ -1,0 +1,37 @@
+AWS Cost Name Tagger Batch Tasks 1-6 offline verification
+Run date: 2026-11-19
+
+1. Batch integration regression suite
+Command:
+  uv run --locked --no-build python -m unittest -q \
+    test_name_tag_batch_migration test_name_tag_batch_executor test_name_tag_batch_cli
+Result: 28 tests passed.
+
+2. Phase A direct script runner
+Command:
+  uv run --locked --no-build python test_aws_cost_name_tagger_v3.py
+Result: 195 tests passed.
+
+3. Full repository unittest discovery
+Command:
+  TMPDIR=/var/tmp uv run --locked --no-build python -m unittest discover -s . -p 'test_*.py' -q
+Result: 590 tests passed.
+Environment note: the default /tmp contains a .git entry, so the G2 evidence
+tests correctly reject temporary evidence paths there. TMPDIR=/var/tmp keeps
+test artifacts outside Git worktrees; no project behavior or safety gate changed.
+
+4. Diff hygiene
+Command:
+  git diff --check
+Result: passed.
+
+AWS/STS: no live AWS API or STS operation was invoked. Tests used local files,
+temporary SQLite fixtures, temporary OpenSSH keys, and fake adapters. The
+schema-v1-to-v2 migration was exercised only against disposable test Ledgers;
+no existing Ledger was migrated. Safety Hold remains active.
+
+Batch Tasks 1-6 offline integration: CUR/Plan, Owner approval, host-bound Ledger
+admission and durable cap, signed schema migration, runtime Scope evidence,
+fake-only SDK execution, and authenticated reporting are connected and covered
+by the test suite. This does not enable production AWS writes, remove Safety
+Hold, authorize IAM/Trust updates, or authorize Task 7.

@@ -2476,6 +2476,112 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
         return t.cur_candidates([str(p) for p in files], None, 0,
                                 max_resources, ACCOUNT)
 
+    def test_batch_population_is_emitted_by_the_bounded_cur_scanner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'cur.csv.gz'
+            rows=[self.row(line_item_resource_id=f'vol-{index:08x}',
+                           line_item_unblended_cost='0.1')
+                  for index in range(105)]
+            rows.extend((self.row(line_item_resource_id='vol-00000000',
+                                  line_item_unblended_cost='0.1'),
+                         self.row(line_item_resource_id='vol-00000000',
+                                  line_item_unblended_cost='0.2')))
+            self.write_cur(path,rows)
+
+            month,candidates,population,reasons=t.cur_candidates_batch(
+                [str(path)],None,0.05,100,ACCOUNT)
+
+            self.assertEqual(month,'2026-10')
+            self.assertEqual(len(candidates),100)
+            self.assertEqual(population['cur_recognized'],
+                             {'count':105,'cost_usd':'10.8'})
+            self.assertEqual(population['above_min_cost'],
+                             {'count':105,'cost_usd':'10.8'})
+            self.assertEqual(population['lookup_selected'],
+                             {'count':100,'cost_usd':'10.3'})
+            self.assertEqual(population['max_resources_not_inspected'],
+                             {'count':5,'cost_usd':'0.5'})
+            self.assertEqual(reasons,{})
+
+    def test_batch_population_separates_unattributable_unsupported_and_filtered_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'cur.csv.gz'
+            self.write_cur(path,[
+                self.row(line_item_resource_id=VOLUME,line_item_unblended_cost='2'),
+                self.row(line_item_resource_id='arn:aws:unknown:ap-northeast-1:'+ACCOUNT+':resource/x',line_item_unblended_cost='3'),
+                self.row(line_item_resource_id='',line_item_unblended_cost='4'),
+                self.row(line_item_resource_id=VOLUME,product_region_code='',line_item_unblended_cost='5'),
+                self.row(line_item_resource_id='arn:aws:ec2:ap-northeast-1:999999999999:volume/vol-0123456789abcdef0',line_item_unblended_cost='6'),
+            ])
+
+            _,candidates,population,reasons=t.cur_candidates_batch(
+                [str(path)],'2026-10',0,10,ACCOUNT,kind_filter={'instance'})
+
+            self.assertEqual(candidates,[])
+            self.assertEqual(population['outside_requested_kinds'],
+                             {'known':True,'billing_rows':2,'cost_usd':'7'})
+            self.assertEqual(population['unsupported_kind'],
+                             {'known':True,'billing_rows':1,'cost_usd':'3'})
+            self.assertEqual(population['unattributable_cur'],
+                             {'known':True,'billing_rows':2,'cost_usd':'10'})
+            self.assertEqual(reasons['UNATTRIBUTABLE_CUR:MISSING_RESOURCE_ID']['billing_rows'],1)
+            self.assertEqual(reasons['UNATTRIBUTABLE_CUR:IDENTITY_MISMATCH']['cost_usd'],'6')
+
+    def test_batch_cur_budget_failure_publishes_no_partial_population(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'cur.csv.gz'
+            self.write_cur(path,[self.row(),self.row(line_item_unblended_cost='2')])
+
+            with patch.object(t,'MAX_CUR_ROWS',1):
+                with self.assertRaisesRegex(ValueError,'CUR row budget exceeded'):
+                    t.cur_candidates_batch([str(path)],'2026-10',0,100,ACCOUNT)
+
+    def test_whitespace_name_flows_through_injected_resolver_classifier(self):
+        from name_tag_batch_state import batch_name_state
+
+        ec2=FakeEC2(volume_name=' \u3000\t')
+        investigator=t.Investigator(FakeSession({'ec2':ec2}),ACCOUNT)
+
+        result=investigator.resolve(
+            row_for('volume',VOLUME),name_state_fn=batch_name_state,
+            candidate_states=('ABSENT','EMPTY','WHITESPACE_ONLY'))
+
+        self.assertEqual(result['status'],'proposed')
+        self.assertEqual(result['name_state'],'WHITESPACE_ONLY')
+        self.assertEqual(result['name_raw_value'],' \u3000\t')
+        self.assertTrue(result['proposed_name'])
+        self.assertEqual(ec2.writes,[])
+
+    def test_batch_plan_integrates_cur_resolver_scope_and_review_projection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'cur.csv.gz'
+            arn=f'arn:aws:ec2:{REGION}:{ACCOUNT}:volume/{VOLUME}'
+            self.write_cur(path,[self.row(line_item_resource_id=VOLUME,
+                                          line_item_unblended_cost='1')])
+            scope_declarations=[{'writer_control_scope_id':'signed-scope',
+                'account':ACCOUNT,'partition':'aws','region':REGION,
+                'resource_arns':[arn]}]
+            scope_path=Path(tmp)/'scope-declarations.json'
+            scope_path.write_text(json.dumps({'scope_declarations':scope_declarations}))
+            session=FakeSession({'sts':FakeSTS(),
+                                 'ec2':FakeEC2(volume_name=' \u3000\t')})
+            args=t.parse_cli(['batch-plan','--cur',str(path),'--month','2026-10',
+                '--account',ACCOUNT,'--min-cost','0','--max-resources','100',
+                '--max-send-attempts','4','--kinds','volume',
+                '--scope-declarations',str(scope_path),
+                '--output',str(Path(tmp)/'batch-plan.json')])
+
+            plan=args.func(args,session=session)
+
+            self.assertEqual(plan['schema_version'],3)
+            self.assertEqual(plan['execution_limits']['max_send_attempts'],4)
+            self.assertEqual(plan['records'][0]['name_state'],'WHITESPACE_ONLY')
+            self.assertEqual(plan['records'][0]['name_raw_value'],' \u3000\t')
+            self.assertEqual(plan['records'][0]['status'],'proposed')
+            review=Path(tmp)/'batch-plan.review.csv'
+            self.assertTrue(review.read_bytes().startswith(b'\xef\xbb\xbf'))
+            self.assertEqual(plan['cur_population']['cur_recognized']['cost_usd'],'1')
+
     def test_pr13_normal_inputs_preserve_effective_cost_and_max_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'cur.csv.gz'

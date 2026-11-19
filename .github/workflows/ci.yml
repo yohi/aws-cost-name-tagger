@@ -81,7 +81,12 @@ jobs:
           test_name_tag_ledger test_name_tag_execution test_name_tag_adapters
           test_name_tag_controlled test_name_tag_ledger_anchor
           test_name_tag_ledger_provision test_name_tag_ledger_open
-          test_name_tag_ledger_cli test_aws_cost_name_tagger_v3
+          test_name_tag_ledger_cli test_name_tag_batch_population
+          test_name_tag_batch_state test_name_tag_batch_approval
+          test_name_tag_batch_trust test_name_tag_batch_ledger
+          test_name_tag_batch_iam test_name_tag_batch_executor
+          test_name_tag_batch_report test_name_tag_batch_cli
+          test_aws_cost_name_tagger_v3
 
       - name: Unit tests (direct script runner)
         run: uv run --locked --no-build python test_aws_cost_name_tagger_v3.py
@@ -103,7 +108,12 @@ jobs:
             test_name_tag_ledger test_name_tag_execution test_name_tag_adapters \
             test_name_tag_controlled test_name_tag_ledger_anchor \
             test_name_tag_ledger_provision test_name_tag_ledger_open \
-            test_name_tag_ledger_cli test_aws_cost_name_tagger_v3 \
+            test_name_tag_ledger_cli test_name_tag_batch_population \
+            test_name_tag_batch_state test_name_tag_batch_approval \
+            test_name_tag_batch_trust test_name_tag_batch_ledger \
+            test_name_tag_batch_iam test_name_tag_batch_executor \
+            test_name_tag_batch_report test_name_tag_batch_cli \
+            test_aws_cost_name_tagger_v3 \
             2>&1 | tee trace-summary.txt
 
       - name: Generate Sonar generic coverage evidence (offline only)

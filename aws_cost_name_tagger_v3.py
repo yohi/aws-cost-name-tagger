@@ -525,6 +525,114 @@ def cur_candidates(files: list[str], month: str | None, min_cost: float,
         aggregates, provenance, min_cost, max_resources)
 
 
+def _cur_scan_batch_aggregates(paths, receipts, active_month, account, kind_filter):
+    """Scan the same bounded CUR input for exact Batch accounting and legacy rank."""
+    from decimal import Decimal
+
+    from name_tag_batch_population import CurCostAggregate, classify_cur_row
+    from name_tag_batch_population import decimal_cost_of, exact_add
+
+    aggregates = {}
+    provenance = defaultdict(lambda: {"services": set(), "billing_rows": 0, "currency": set()})
+    billing = {
+        "UNATTRIBUTABLE_CUR": {"billing_rows": 0, "exact_cost": Decimal(0)},
+        "OUTSIDE_REQUESTED_KINDS": {"billing_rows": 0, "exact_cost": Decimal(0)},
+        "UNSUPPORTED_KIND": {"billing_rows": 0, "exact_cost": Decimal(0)},
+    }
+    reasons = defaultdict(lambda: {"billing_rows": 0, "exact_cost": Decimal(0)})
+
+    def aggregate_row(row):
+        if not _cur_selected_usage(row, active_month, account):
+            return
+        exact_amount = decimal_cost_of(row)
+        category, reason, key = classify_cur_row(
+            row, account=account, kind_filter=kind_filter, rid_class=rid_class)
+        if category == "CUR_RECOGNIZED":
+            if key is None:
+                raise ValueError("CUR recognized identity missing")
+            current = aggregates.get(key)
+            legacy_amount = cost_of(row)
+            legacy_total = legacy_amount if current is None else current.legacy_rank_cost + legacy_amount
+            if not math.isfinite(legacy_total):
+                raise ValueError("CUR aggregated amount is not finite")
+            if current is None:
+                if len(aggregates) >= MAX_CUR_DISTINCT_RESOURCES:
+                    raise ValueError("CUR distinct-resource budget exceeded")
+                exact_total = exact_amount
+            else:
+                exact_total = exact_add((current.exact_cost, exact_amount))
+            aggregates[key] = CurCostAggregate(exact_total, legacy_total)
+            provenance[key]["services"].add(row["line_item_product_code"])
+            provenance[key]["billing_rows"] += 1
+            provenance[key]["currency"].add(row["line_item_currency_code"])
+            return
+        if category not in billing:
+            raise ValueError("Unknown CUR population category")
+        entry = billing[category]
+        entry["billing_rows"] += 1
+        entry["exact_cost"] = exact_add((entry["exact_cost"], exact_amount))
+        reason_entry = reasons[(category, reason)]
+        reason_entry["billing_rows"] += 1
+        reason_entry["exact_cost"] = exact_add((reason_entry["exact_cost"], exact_amount))
+
+    second_budget = {"bytes": 0, "rows": 0}
+    for index, path in enumerate(paths):
+        receipt = _scan_cur_file(path, second_budget, aggregate_row)
+        if receipts[index] != receipt:
+            raise ValueError("CUR content or metadata changed between passes")
+    return aggregates, provenance, billing, reasons
+
+
+def cur_candidates_batch(
+    files: list[str], month: str | None, min_cost: float,
+    max_resources: int, account: str, kind_filter: set[str] | None = None,
+):
+    """Return Batch-selected candidates and exact pre-cap accounting from two bounded passes."""
+    from name_tag_batch_population import exact_add, partition_cur_population
+    from name_tag_batch_population import _canonical_decimal
+
+    paths = _cur_input_paths(files)
+    periods, receipts = _cur_scan_periods(paths)
+    if month is None and not periods:
+        raise ValueError("CUR input contains no billing rows; specify --month")
+    active_month = month or max(periods)
+    aggregates, provenance, billing, reasons = _cur_scan_batch_aggregates(
+        paths, receipts, active_month, account, kind_filter)
+    population = partition_cur_population(
+        aggregates, min_cost=min_cost, max_resources=max_resources)
+    selected_keys = population.pop("selected_keys")
+    candidates = []
+    for key in selected_keys:
+        aggregate = aggregates[key]
+        candidates.append({
+            "kind": key[0], "locator": key[1], "region": key[2],
+            "effective_usage_cost_usd": _canonical_decimal(aggregate.exact_cost),
+            "legacy_rank_cost": aggregate.legacy_rank_cost,
+            "source_services": sorted(provenance[key]["services"]),
+            "billing_rows": provenance[key]["billing_rows"],
+            "currency": sorted(provenance[key]["currency"]),
+        })
+    for category, summary in billing.items():
+        population[category.lower()] = {
+            "known": True, "billing_rows": summary["billing_rows"],
+            "cost_usd": _canonical_decimal(summary["exact_cost"]),
+        }
+    population["schema_version"] = 2
+    population["accounting_complete"] = True
+    reason_details = {
+        f"{category}:{reason}": {
+            "billing_rows": values["billing_rows"],
+            "cost_usd": _canonical_decimal(values["exact_cost"]),
+        }
+        for (category, reason), values in sorted(reasons.items())
+    }
+    if _canonical_decimal(exact_add(
+            candidate["effective_usage_cost_usd"] for candidate in candidates
+    )) != population["lookup_selected"]["cost_usd"]:
+        raise ValueError("Batch selected CUR total failed exact reconciliation")
+    return active_month, candidates, population, reason_details
+
+
 class AWSReadBudgetExceeded(RuntimeError):
     """Application read budget exhausted; no partial result may be published."""
 
@@ -797,7 +905,8 @@ class Investigator:
         az=subnet.get("AvailabilityZone", "")
         return suffix_name(sn,"nat",az[-1:] if az else "az",nat["NatGatewayId"][-6:]),f"NAT {nat['NatGatewayId']} -> subnet {nat['SubnetId']} Name={sn} + VPC {nat['VpcId']} Name={vn}"
 
-    def resolve(self, item: dict) -> dict:
+    def resolve(self, item: dict, *, name_state_fn=name_state,
+                candidate_states=NAME_CANDIDATE_STATES) -> dict:
         """Read live tags, trace lineage, and make a conservative proposal."""
         kind,loc,region=item["kind"],item["locator"],item["region"]
         res={"status":"manual_review", "proposed_name":"", "confidence":"none", "evidence":"", "write_target":"", "kind":kind,
@@ -809,7 +918,7 @@ class Investigator:
                 ec2=self.client("ec2",region)
                 if kind=="instance":
                     o=self.instance(region,loc);tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state(tags) in NAME_CANDIDATE_STATES:
+                    if name_state_fn(tags) in candidate_states:
                         relations=[]
                         for key,label in (("aws:autoscaling:groupName","AutoScaling Group"),
                                           ("aws:cloudformation:stack-name","CloudFormation Stack")):
@@ -826,7 +935,7 @@ class Investigator:
                         confidence="medium"  # team should confirm a distinct EC2 role
                 if kind=="volume":
                     o=self.volume(region,loc);tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state(tags) in NAME_CANDIDATE_STATES:
+                    if name_state_fn(tags) in candidate_states:
                         base,evidence=self.volume_owner(region,loc)
                         # EBS without Name inherits uniquely attached EC2's Name.
                         candidate=base
@@ -835,7 +944,7 @@ class Investigator:
                     if len(snaps)!=1 or snaps[0].get("OwnerId")!=self.account:
                         raise ValueError("snapshot is absent or not owned by target account")
                     o=snaps[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state(tags) in NAME_CANDIDATE_STATES:
+                    if name_state_fn(tags) in candidate_states:
                         src=o.get("VolumeId","")
                         if not src: raise ValueError("snapshot missing source volume")
                         # Source volume's CURRENT attachment does not establish
@@ -845,7 +954,7 @@ class Investigator:
                     eni=ec2.describe_network_interfaces(NetworkInterfaceIds=[loc]).get("NetworkInterfaces",[])
                     if len(eni)!=1: raise ValueError("ENI not found")
                     o=eni[0];tags=tagmap(o.get("TagSet",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state(tags) in NAME_CANDIDATE_STATES:
+                    if name_state_fn(tags) in candidate_states:
                         iid=o.get("Attachment",{}).get("InstanceId")
                         if not iid: raise ValueError("ENI not attached to EC2 instance")
                         base,path=self.parent_instance(region,iid)
@@ -856,18 +965,18 @@ class Investigator:
                     obj=ec2.describe_addresses(AllocationIds=[loc]).get("Addresses",[])
                     if len(obj)!=1: raise ValueError("EIP not found")
                     tags=tagmap(obj[0].get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state(tags) in NAME_CANDIDATE_STATES:candidate,evidence,_=self.eip_owner(region,loc)
+                    if name_state_fn(tags) in candidate_states:candidate,evidence,_=self.eip_owner(region,loc)
                 elif kind=="nat":
                     nat=ec2.describe_nat_gateways(NatGatewayIds=[loc]).get("NatGateways",[])
                     if len(nat)!=1:raise ValueError("NAT not found")
                     o=nat[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state(tags) in NAME_CANDIDATE_STATES:
+                    if name_state_fn(tags) in candidate_states:
                         candidate,evidence=self.nat_owner(region,o);confidence="medium"
                 elif kind=="endpoint":
                     end=ec2.describe_vpc_endpoints(VpcEndpointIds=[loc]).get("VpcEndpoints",[])
                     if len(end)!=1:raise ValueError("VPC endpoint not found")
                     o=end[0];tags=tagmap(o.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)
-                    if name_state(tags) in NAME_CANDIDATE_STATES:
+                    if name_state_fn(tags) in candidate_states:
                         vpc=self.vpc(region,o["VpcId"])
                         vn=meaningful(name_of(tagmap(vpc.get("Tags",[]), expected_shape="list", allow_missing_non_name_value=True)))
                         ss=[self.subnet(region,id) for id in o.get("SubnetIds",[])]
@@ -1089,7 +1198,7 @@ class Investigator:
                 res["write_target"]=loc;confidence="medium"
             else:
                 raise ValueError("Unsupported AWS service/resource type")
-            observed = name_state(tags)
+            observed = name_state_fn(tags)
             res.update(name_state=observed,
                        name_key_present="Name" in tags if isinstance(tags, dict) else None,
                        name_raw_value=name_of(tags),
@@ -1115,7 +1224,7 @@ class Investigator:
                            name_raw_value=None, existing_name="",
                            evidence=f"{type(e).__name__}: {e}")
                 return res
-            observed = name_state(tags)
+            observed = name_state_fn(tags)
             res.update(name_state=observed,
                        name_key_present="Name" in tags if isinstance(tags, dict) else None,
                        name_raw_value=name_of(tags) if isinstance(tags, dict) else None,
@@ -1733,6 +1842,105 @@ def _demote_colliding_proposals(records):
             rec["proposal_id"]=proposal_key(rec)
 
 
+def plan_batch(args, *, scope_declarations, session=None):
+    """Build a schema-3 Batch Plan from the bounded CUR and real resolver path."""
+    from name_tag_batch_state import batch_name_state, build_batch_review_projection
+    from name_tag_batch_state import derive_declared_row_scope, validate_batch_draft
+
+    if not re.fullmatch(r"\d{12}", args.account):
+        raise SystemExit("--account must be 12 digits")
+    if not args.cur or args.min_cost < 0 or args.max_resources <= 0:
+        raise SystemExit("Invalid Batch CUR inputs or limits")
+    max_send_attempts = getattr(args, "max_send_attempts", 20)
+    if type(max_send_attempts) is not int or not 1 <= max_send_attempts <= 20:
+        raise SystemExit("--max-send-attempts must be between 1 and 20")
+    out = Path(args.output)
+    review_path = out.with_suffix(".review.csv")
+    report_path = out.with_suffix(".report.csv")
+    destinations = [out, review_path, report_path]
+    preflight_report_destination(out)
+    preflight_outputs(destinations)
+
+    month, candidates, cur_population, reason_details = cur_candidates_batch(
+        args.cur, args.month, args.min_cost, args.max_resources, args.account,
+        kind_filter=_cur_kind_filter(args),
+    )
+    session = _budgeted_session(session if session is not None else build_session(args.profile))
+    assert_account(session, args.account)
+    investigator = Investigator(session, args.account, retries=3)
+    records = []
+    for candidate in candidates:
+        info = investigator.resolve(
+            candidate, name_state_fn=batch_name_state,
+            candidate_states=("ABSENT", "EMPTY", "WHITESPACE_ONLY"),
+        )
+        record = {**candidate, **info}
+        record["proposal_id"] = proposal_key(record)
+        record["resource_arn"] = resource_arn(record, args.account)
+        records.append(record)
+    _demote_colliding_proposals(records)
+    if session.read_budget.exhausted:
+        raise AWSReadBudgetExceeded("AWS read budget exhausted: no partial Batch Plan")
+    doc = {
+        "schema_version": 3,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "account": args.account,
+        "partition": "aws",
+        "period": month,
+        "metric": "Usage/DiscountedUsage(RI effective)/SavingsPlanCoveredUsage(SP effective)",
+        "min_cost_usd": args.min_cost,
+        "max_resources": args.max_resources,
+        "kinds": sorted(_cur_kind_filter(args) or SUPPORTED_KINDS),
+        "count": len(records),
+        "records": records,
+        "cur_population": cur_population,
+        "cur_population_reason_details": reason_details,
+        "execution_limits": {"max_send_attempts": max_send_attempts},
+        "scope_declarations": scope_declarations,
+    }
+    plan_bytes = (json.dumps(doc, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
+    review_bytes = build_batch_review_projection(plan_bytes)
+    draft = validate_batch_draft(plan_bytes, review_bytes)
+    for row in records:
+        if row["status"] == "proposed":
+            derive_declared_row_scope(doc, row)
+    session.read_budget.require_completion()
+    ensure_private_output_dir(out.parent)
+    with tempfile.TemporaryDirectory(prefix=f".{out.stem}.stage-", dir=out.parent) as staging:
+        stage = Path(staging)
+        plan_stage, review_stage, report_stage = (stage / path.name for path in destinations)
+        write_json(plan_stage, doc)
+        with private_output(review_stage) as stream:
+            stream.write(review_bytes.decode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        write_action_csv(report_stage, records, args.account, mode="batch-plan")
+        session.read_budget.require_completion()
+        publish_staged_reports(list(zip((plan_stage, review_stage, report_stage), destinations)))
+    return doc
+
+
+def batch_plan_cli(args, *, session=None):
+    from name_tag_batch_state import _unique_object
+
+    path = Path(args.scope_declarations)
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit("--scope-declarations must be a regular file")
+    try:
+        declaration_doc = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit("Invalid --scope-declarations JSON") from exc
+    if (not isinstance(declaration_doc, dict)
+            or set(declaration_doc) != {"scope_declarations"}
+            or not isinstance(declaration_doc["scope_declarations"], list)):
+        raise SystemExit("Scope declaration file must contain only scope_declarations")
+    return plan_batch(
+        args, scope_declarations=declaration_doc["scope_declarations"], session=session
+    )
+
+
 def plan(args, session=None, *, extra_mode=None, prepared_cur=None):
     if not re.fullmatch(r"\d{12}",args.account):raise SystemExit("--account must be 12 digits")
     if not args.cur:raise SystemExit("Provide at least one --cur .csv.gz file")
@@ -1812,6 +2020,18 @@ def parse_cli(argv=None):
     p.add_argument("--kinds", help="Comma-separated types, e.g. volume,snapshot,instance,eni; optional")
     p.add_argument("--output",default=DEFAULT_REPORT_OUTPUT)
     p.set_defaults(func=plan)
+    b=sub.add_parser("batch-plan",help="Read CUR/AWS metadata into a schema-3 Batch Plan; never write tags")
+    b.add_argument("--cur",action="append",required=True)
+    b.add_argument("--month")
+    b.add_argument("--account",required=True)
+    b.add_argument("--profile")
+    b.add_argument("--min-cost",type=float,default=DEFAULT_THRESHOLD)
+    b.add_argument("--max-resources",type=int,default=100)
+    b.add_argument("--max-send-attempts",type=int,default=20)
+    b.add_argument("--kinds")
+    b.add_argument("--scope-declarations",required=True)
+    b.add_argument("--output",default=DEFAULT_REPORT_OUTPUT)
+    b.set_defaults(func=batch_plan_cli)
     r=sub.add_parser("run",help="Interactive: remote login prompt -> role info -> Y/N/dryrun -> reports")
     r.add_argument("--cur",action="append",required=True,help="Gzipped CUR v2 CSV")
     r.add_argument("--month",help="Billing month YYYY-MM")
@@ -1837,9 +2057,11 @@ def parse_cli(argv=None):
     a.add_argument("--log",default="name_tag_apply_audit.json")
     a.set_defaults(func=apply)
     args=ap.parse_args(argv)
-    if args.command in ("plan", "run"):
+    if args.command in ("plan", "batch-plan", "run"):
         if args.min_cost<0 or args.max_resources<=0:ap.error("--min-cost must be nonnegative and --max-resources > 0")
         if args.month and not re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])",args.month):ap.error("Invalid --month")
+        if args.command == "batch-plan" and not 1 <= args.max_send_attempts <= 20:
+            ap.error("--max-send-attempts must be between 1 and 20")
         if args.command == "run" and args.max_writes <= 0:ap.error("--max-writes must be positive")
     else:
         if not re.fullmatch(r"[0-9a-f]{64}",args.sha256):ap.error("--sha256 must be a 64-character lowercase hex string")

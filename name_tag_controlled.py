@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -461,6 +462,12 @@ CLI_HANDLERS: Final[dict[str, CLIHandler]] = {
 
 
 def main(argv: list[str] | None = None) -> int:
+    batch_commands = {"prepare-batch", "batch-dryrun", "verify-batch", "batch-simulate"}
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    if selected_argv and selected_argv[0] in batch_commands:
+        from name_tag_batch_cli import main as batch_cli_main
+
+        return batch_cli_main(selected_argv)
     args = parse_cli(argv)
     command = getattr(args, "command", None)
     if not isinstance(command, str):

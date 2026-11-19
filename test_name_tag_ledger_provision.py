@@ -7,6 +7,7 @@ import pwd
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -62,7 +63,7 @@ class LedgerProvisionTests(unittest.TestCase):
         self.assertEqual(anchor_info.st_mode & 0o777, 0o640)
         self.assertEqual(anchor_info.st_gid, pwd.getpwuid(os.geteuid()).pw_gid)
         instance_id = anchor.read_ledger_anchor(path, host_binding).ledger_instance_id
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             metadata = dict(connection.execute("SELECT key, value FROM ledger_meta"))
         self.assertEqual(metadata["host_binding"], host_binding)
         self.assertEqual(metadata["schema_version"], "1")
