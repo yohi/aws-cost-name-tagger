@@ -1,6 +1,6 @@
-import json,unittest
+import hashlib,json,unittest
 from types import MappingProxyType
-from name_tag_batch_iam import build_subset_session_policy, KindPolicy, IAMPolicyBlocked
+from name_tag_batch_iam import build_subset_session_policy, KindPolicy, IAMPolicyBlocked, SessionPolicySpec
 from name_tag_batch_credentials import OfflineFakeIssuer, CredentialBlocked
 from name_tag_batch_approval import VerifiedBatchApproval
 
@@ -31,11 +31,16 @@ class PolicyTests(unittest.TestCase):
     def test_issuer_requires_offline_fake_and_exact_policy(self):
         spec=build_subset_session_policy(self.batch,(1,),kind_registry=self.kind)
         fake=OfflineFakeIssuer()
-        sess=fake.issue(self.batch,spec)
+        sess=fake.issue(self.batch,spec,kind_registry=self.kind)
         self.assertEqual(sess.policy_sha256,spec.policy_sha256)
         self.assertEqual(sess.batch_id,self.batch.batch_id)
         self.assertEqual(sess.row_indexes,spec.row_indexes)
         self.assertIn(b'aws:TagKeys',sess.policy_bytes)
-        with self.assertRaises(CredentialBlocked):fake.issue(self.batch,build_subset_session_policy(self.batch,(1,),kind_registry=self.kind),tamper_policy=True)
+        with self.assertRaises(CredentialBlocked):fake.issue(self.batch,build_subset_session_policy(self.batch,(1,),kind_registry=self.kind),kind_registry=self.kind,tamper_policy=True)
+    def test_issuer_rejects_self_hashed_wildcard_policy(self):
+        policy=b'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:CreateTags","Resource":"*"}]}'
+        forged=SessionPolicySpec(self.batch.batch_id,(1,),policy,hashlib.sha256(policy).hexdigest(),('*',),('ec2:CreateTags',),('ec2:DescribeVolumes',))
+        with self.assertRaises(CredentialBlocked):
+            OfflineFakeIssuer().issue(self.batch,forged,kind_registry=self.kind)
 
 if __name__=='__main__':unittest.main()

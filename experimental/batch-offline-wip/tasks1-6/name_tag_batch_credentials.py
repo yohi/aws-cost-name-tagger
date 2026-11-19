@@ -5,9 +5,10 @@ must use the exact host-only actual AssumeRole request plus protected receipt.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from name_tag_batch_iam import SessionPolicySpec
+from name_tag_batch_iam import SessionPolicySpec, KindPolicy, IAMPolicyBlocked, build_subset_session_policy
 from name_tag_batch_approval import VerifiedBatchApproval
 from hashlib import sha256
+from typing import Mapping
 
 class CredentialBlocked(RuntimeError):pass
 
@@ -22,9 +23,15 @@ class IssuedBatchSession:
 
 class OfflineFakeIssuer:
     """No real STS client can be supplied; no network/API methods exist."""
-    def issue(self,batch:VerifiedBatchApproval,subset:SessionPolicySpec,*,tamper_policy:bool=False)->IssuedBatchSession:
+    def issue(self,batch:VerifiedBatchApproval,subset:SessionPolicySpec,*,kind_registry:Mapping[str,KindPolicy],tamper_policy:bool=False)->IssuedBatchSession:
         if type(batch) is not VerifiedBatchApproval or type(subset) is not SessionPolicySpec or batch.batch_id!=subset.batch_id:
             raise CredentialBlocked('Foreign batch/receipt')
+        try:
+            expected=build_subset_session_policy(batch,subset.row_indexes,kind_registry=kind_registry)
+        except IAMPolicyBlocked as e:
+            raise CredentialBlocked('Invalid policy subset') from e
+        if expected!=subset:
+            raise CredentialBlocked('Policy does not match authorized subset')
         raw=subset.policy_bytes
         if tamper_policy:raw+=b'x'
         if sha256(raw).hexdigest()!=subset.policy_sha256:
