@@ -3,6 +3,7 @@ import unittest, json, hashlib, base64, os, subprocess, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from name_tag_batch_approval import (prepare_batch_approval, verify_batch_approval, derive_batch_row_authority, VerifiedBatchApproval, BatchAuthRejected, BATCH_NAMESPACE)
+from name_tag_batch_iam import build_subset_session_policy, KindPolicy, IAMPolicyBlocked
 from name_tag_batch_state import build_batch_review_projection
 from types import MappingProxyType
 from name_tag_approval import EnrolledOwner, OwnerTrust
@@ -73,5 +74,19 @@ class BatchApprovalTests(unittest.TestCase):
         forged=VerifiedBatchApproval(b'not-signed',b'not-canonical','fake-batch',MappingProxyType({'account':'123456789012','partition':'aws'}),self.plan,self.csv,({'fake':'row'},),(0,),'owner','fake-signature')
         with self.assertRaises(BatchAuthRejected):
             derive_batch_row_authority(forged,0,trust=None,now_utc=datetime(2026,11,19,tzinfo=timezone.utc))
+
+    def test_session_policy_rejects_row_changed_after_owner_verification(self):
+        from dataclasses import replace
+
+        envelope=self._signed_envelope()
+        now=datetime(2026,11,19,12,tzinfo=timezone.utc)
+        verified=verify_batch_approval(self.plan,self.csv,envelope,trust=self.trust,now_utc=now)
+        changed_row=dict(verified.approved_rows[0])
+        changed_row['resource_arn']='arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-other'
+        changed=replace(verified,approved_rows=(changed_row,))
+
+        with self.assertRaises(IAMPolicyBlocked):
+            build_subset_session_policy(
+                changed,(0,),kind_registry={'volume':KindPolicy('ec2:CreateTags','ec2:DescribeVolumes')})
 
 if __name__=='__main__': unittest.main()

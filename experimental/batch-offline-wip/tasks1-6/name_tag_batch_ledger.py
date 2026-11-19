@@ -84,6 +84,8 @@ class OfflineFixtureBatchLedger:
         if held:raise LedgerBlocked('Covered Scope HOLD')
         pending=self.conn.execute("SELECT COUNT(*) FROM intents WHERE batch_id=? AND state IN ('ADMITTED','SEND_ATTEMPT_CONSUMED')",(id,)).fetchone()[0]
         if pending:raise LedgerBlocked('Prior incomplete Intent')
+        unresolved=self.conn.execute("SELECT COUNT(*) FROM intents WHERE scope_id IN (SELECT scope_id FROM batch_scopes WHERE batch_id=?) AND state='SEND_ATTEMPT_CONSUMED'",(id,)).fetchone()[0]
+        if unresolved:raise LedgerBlocked('Covered Scope has an unresolved send attempt')
         return cap,used,size
     def _claimed(self,id,index,authority):
         r=self.conn.execute('SELECT 1 FROM intents WHERE (batch_id=? AND row_index=?) OR row_authority_id=?',(id,index,authority)).fetchone()
@@ -179,6 +181,9 @@ class OfflineFixtureBatchLedger:
                 counted=self.conn.execute("SELECT COUNT(*) FROM intents WHERE batch_id=? AND state IN ('SEND_ATTEMPT_CONSUMED','APPLIED_VERIFIED','OUTCOME_UNKNOWN')",(id,)).fetchone()[0]
                 if counted!=stored:raise LedgerBlocked('Counter/history mismatch')
                 dangling=self.conn.execute("SELECT COUNT(*) FROM intents WHERE batch_id=? AND state IN ('ADMITTED','SEND_ATTEMPT_CONSUMED')",(id,)).fetchone()[0]
+                unresolved_scopes=self.conn.execute("SELECT DISTINCT scope_id FROM intents WHERE batch_id=? AND state='SEND_ATTEMPT_CONSUMED'",(id,)).fetchall()
+                for (scope_id,) in unresolved_scopes:
+                    self.conn.execute("UPDATE scopes SET state='HOLD' WHERE scope_id=?",(scope_id,))
                 held=self.conn.execute("SELECT COUNT(*) FROM batch_scopes b JOIN scopes s USING(scope_id) WHERE b.batch_id=? AND s.state='HOLD'",(id,)).fetchone()[0]
                 if state=='ACTIVE' and (dangling or held):
                     self.conn.execute("UPDATE batch_registry SET state='STOPPED',stop_reason='CRASH_OR_SCOPE_HOLD',stopped_at_utc='fixture' WHERE batch_id=?",(id,))

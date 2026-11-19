@@ -5,6 +5,7 @@ An authenticated production executor is NOT supplied by this module.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+import sqlite3
 from name_tag_batch_state import classify_batch_name
 from name_tag_batch_ledger import OfflineFixtureBatchLedger,LedgerBlocked
 
@@ -83,9 +84,13 @@ def _execute_fixture_row(batch_id,index,row,ledger,adapter):
         outcome=_write_and_readback(arn,row['approved_name'],adapter)
         ledger.readback(batch_id,index,outcome)
         return outcome,outcome=='OUTCOME_UNKNOWN'
-    except (LedgerBlocked,OSError):
+    except (LedgerBlocked,OSError,sqlite3.Error):
         if attempt_consumed:
-            ledger.outcome_unknown_after_readback_failure(batch_id,index)
+            try:
+                ledger.outcome_unknown_after_readback_failure(batch_id,index)
+            except sqlite3.Error:
+                # Keep the consumed intent as a restart-recovery barrier; never resend.
+                return 'OUTCOME_UNKNOWN',True
             return 'OUTCOME_UNKNOWN',True
         if ledger.state(batch_id)=='ACTIVE':ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
         return 'BLOCKED_SCOPE_STATE_UNKNOWN',True
@@ -102,6 +107,7 @@ def _write_and_readback(arn,name,adapter):
 
 def _finish_fixture_batch(batch_id,approved_rows,outcomes,ledger):
     if ledger.state(batch_id)!='ACTIVE':return
+    if 'OUTCOME_UNKNOWN' in outcomes:return
     if len(outcomes)==len(approved_rows):
         ledger.complete(batch_id)
 

@@ -46,6 +46,15 @@ class DurableFixtureTests(unittest.TestCase):
         self.assertEqual(self.ledger.counter('batch-a'),1)
         self.assertEqual(self.ledger.state('batch-a'),'STOPPED')
         with self.assertRaises(LedgerBlocked):self.ledger.admit('batch-a',1,'scope-b','row-1')
+    def test_crash_after_consumed_holds_scope_for_later_batches(self):
+        self.ledger.admit('batch-a',0,'scope-a','row-0')
+        self.ledger.consume('batch-a',0)
+        self.ledger.close();self.ledger=OfflineFixtureBatchLedger.open_fixture(self.path)
+        self.ledger.register('batch-b','nonce-b',max_send_attempts=1,row_count=1,scope_ids=['scope-a'])
+
+        with self.assertRaises(LedgerBlocked):
+            self.ledger.admit('batch-b',0,'scope-a','row-b')
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
     def test_history_tamper_counter_rejected(self):
         self.ledger.admit('batch-a',0,'scope-a','row-0')
         self.ledger.consume('batch-a',0)

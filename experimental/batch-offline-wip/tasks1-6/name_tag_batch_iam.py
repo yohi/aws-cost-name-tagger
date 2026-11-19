@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Mapping
 import json, re
-from name_tag_batch_approval import VerifiedBatchApproval
+from name_tag_batch_approval import VerifiedBatchApproval, _approved_tuples, canonical_bytes
+from name_tag_batch_state import validate_batch_draft
 
 class IAMPolicyBlocked(ValueError):pass
 
@@ -31,14 +32,28 @@ class SessionPolicySpec:
 def build_subset_session_policy(batch:VerifiedBatchApproval,row_indexes:tuple[int,...],*,kind_registry:Mapping[str,KindPolicy])->SessionPolicySpec:
     if type(batch) is not VerifiedBatchApproval or type(row_indexes) is not tuple or not row_indexes:
         raise IAMPolicyBlocked('Missing verified batch/subset')
-    approved_indexes=batch.approved_row_indexes
+    try:
+        payload_bytes=canonical_bytes(dict(batch.payload))
+        draft=validate_batch_draft(batch.plan_bytes,batch.csv_bytes)
+        tuples=_approved_tuples(draft)
+        approved_indexes=tuple(row[0] for row in tuples)
+    except (KeyError,TypeError,ValueError) as e:
+        raise IAMPolicyBlocked('Verified approval source data is invalid') from e
+    if (batch.canonical_payload_bytes!=payload_bytes
+            or sha256(payload_bytes).hexdigest()!=batch.batch_id
+            or batch.payload.get('plan_sha256')!=sha256(batch.plan_bytes).hexdigest()
+            or batch.payload.get('csv_sha256')!=sha256(batch.csv_bytes).hexdigest()
+            or batch.payload.get('approved_rows_sha256')!=sha256(canonical_bytes(tuples)).hexdigest()
+            or batch.approved_rows!=tuple(draft.approved_rows)):
+        raise IAMPolicyBlocked('Verified rows do not match the Owner-approved source bytes')
     if (type(approved_indexes) is not tuple
             or len(approved_indexes)!=len(batch.approved_rows)
             or any(type(i) is not int or i<0 for i in approved_indexes)
             or len(set(approved_indexes))!=len(approved_indexes)
-            or sorted(approved_indexes)!=list(approved_indexes)):
+            or sorted(approved_indexes)!=list(approved_indexes)
+            or batch.approved_row_indexes!=approved_indexes):
         raise IAMPolicyBlocked('Verified approved-row index mapping is invalid')
-    rows_by_csv_index=dict(zip(approved_indexes,batch.approved_rows,strict=True))
+    rows_by_csv_index={i:draft.rows[i] for i in approved_indexes}
     if (any(type(i) is not int or i not in rows_by_csv_index for i in row_indexes)
             or len(set(row_indexes))!=len(row_indexes)
             or sorted(row_indexes)!=list(row_indexes)):

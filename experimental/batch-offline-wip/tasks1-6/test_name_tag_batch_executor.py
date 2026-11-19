@@ -1,4 +1,4 @@
-import tempfile,unittest
+import sqlite3,tempfile,unittest
 from pathlib import Path
 from unittest.mock import patch
 from name_tag_batch_executor import InMemoryNameAdapter,simulate_untrusted_fixture
@@ -43,6 +43,29 @@ class ExecutorFixtureTests(unittest.TestCase):
         self.assertEqual(a.write_calls,1)
         self.assertEqual(result['outcomes'],['OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'])
         self.assertEqual(result['batch_state'],'STOPPED')
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
+    def test_sqlite_readback_failure_after_send_is_outcome_unknown(self):
+        a=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
+        with patch.object(self.ledger,'readback',side_effect=sqlite3.OperationalError('database is locked')):
+            result=simulate_untrusted_fixture('batch-sqlite-readback-failure','nonce-sqlite-readback-failure',self.rows,ledger=self.ledger,adapter=a,cap=2)
+        self.assertEqual(a.write_calls,1)
+        self.assertEqual(result['outcomes'],['OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'])
+        self.assertEqual(result['batch_state'],'STOPPED')
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
+    def test_failed_unknown_persistence_blocks_reuse_until_recovery(self):
+        a=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
+        with patch.object(self.ledger,'readback',side_effect=sqlite3.OperationalError('database is locked')):
+            with patch.object(self.ledger,'outcome_unknown_after_readback_failure',side_effect=sqlite3.OperationalError('database is locked')):
+                result=simulate_untrusted_fixture('batch-stop-write-failure','nonce-stop-write-failure',self.rows,ledger=self.ledger,adapter=a,cap=2)
+        self.assertEqual(result['outcomes'],['OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'])
+        self.assertEqual(result['batch_state'],'ACTIVE')
+
+        later=simulate_untrusted_fixture('batch-after-stop-write-failure','nonce-after-stop-write-failure',self.rows[:1],ledger=self.ledger,adapter=a,cap=1)
+        self.assertEqual(later['outcomes'],['BLOCKED_SCOPE_STATE_UNKNOWN'])
+        self.assertEqual(a.write_calls,1)
+
+        self.ledger.close();self.ledger=OfflineFixtureBatchLedger.open_fixture(Path(self.t.name)/'fixture.sqlite')
+        self.assertEqual(self.ledger.state('batch-stop-write-failure'),'STOPPED')
         self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
     def test_presend_name_change_skips_not_consume(self):
         a=InMemoryNameAdapter({'volume-1':{'Name':'existing'},'volume-2':{}})
