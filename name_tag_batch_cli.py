@@ -258,6 +258,8 @@ def _run_command(args):
             report,dict(zip(batch.approved_row_indexes,result['outcomes'],strict=True)))
         report['batch_state']=result['batch_state']
         report['send_attempts_consumed']=result['send_attempts_consumed']
+        report['max_send_attempts']=result['max_send_attempts']
+        report['remaining_unattempted_cap']=result['remaining_unattempted_cap']
         report['writes_complete']=result['writes_complete']
         report['execution_allowed']=False
         report['execution_mode']='ISOLATED_FIXTURE_ONLY'

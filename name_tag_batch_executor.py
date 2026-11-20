@@ -55,6 +55,8 @@ class FixtureSimulationResult(TypedDict):
     execution_allowed:bool
     batch_state:str
     send_attempts_consumed:int
+    max_send_attempts:int
+    remaining_unattempted_cap:int
     outcomes:list[str]
     writes_complete:bool
 
@@ -97,11 +99,15 @@ def simulate_untrusted_fixture(
     try:
         batch_state=ledger.state(batch_id)
         send_attempts_consumed=ledger.counter(batch_id)
+        remaining_unattempted_cap=sum(
+            decision=='NOT_ATTEMPTED_CAP' for _,decision in ledger.dispositions(batch_id))
     except sqlite3.Error:
         batch_state='RECOVERY_REQUIRED'
         send_attempts_consumed=initial_consumed+sum(outcome in ('APPLIED_VERIFIED','OUTCOME_UNKNOWN') for outcome in outcomes)
+        remaining_unattempted_cap=outcomes.count('NOT_ATTEMPTED_CAP')
     return {'authentication_state':'SYNTHETIC_TEST_ONLY','execution_allowed':False,
             'batch_state':batch_state,'send_attempts_consumed':send_attempts_consumed,
+            'max_send_attempts':cap,'remaining_unattempted_cap':remaining_unattempted_cap,
             'outcomes':outcomes,
             'writes_complete':batch_state=='COMPLETED' and len(outcomes)==len(approved_rows) and all(o=='APPLIED_VERIFIED' for o in outcomes)}
 

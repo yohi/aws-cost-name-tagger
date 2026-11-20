@@ -572,6 +572,8 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(result,0)
         self.assertEqual(report["batch_state"],"COMPLETED")
         self.assertEqual(report["send_attempts_consumed"],1)
+        self.assertEqual(report["max_send_attempts"],1)
+        self.assertEqual(report["remaining_unattempted_cap"],1)
         self.assertFalse(report["execution_allowed"])
         self.assertEqual(report["execution_mode"],"ISOLATED_FIXTURE_ONLY")
         self.assertEqual(report["outcome_reconciliation"],{
