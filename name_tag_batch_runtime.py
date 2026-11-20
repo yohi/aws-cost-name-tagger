@@ -106,7 +106,7 @@ def _record_cap_for_unclaimed(
     ledger: IntentLedger,
     runtime: BatchOfflineRuntime,
     state: BatchExecutionState,
-) -> bool:
+) -> str | None:
     if state.send_attempts_consumed < state.max_send_attempts:
         raise LedgerError("BLOCKED_AUTH_REPLAY")
     for position, row_index in enumerate(batch.approved_row_indexes):
@@ -116,17 +116,21 @@ def _record_cap_for_unclaimed(
             authority = _current_authority(batch, row_index)
         except BatchAuthRejected:
             ledger.stop_batch(batch,reason_code="BLOCKED_OWNER_AUTHN")
-            return True
+            return "BLOCKED_OWNER_AUTHN"
         try:
             evidence = _evidence_for(batch, runtime, authority.row)
         except LedgerError as error:
             ledger.stop_batch(batch,reason_code=error.code)
-            return True
-        ledger.record_batch_presend_disposition(
-            authority, scope=evidence.scope, side_effects=evidence.side_effects,
-            decision="NOT_ATTEMPTED_CAP", reason_code="SIGNED_CAP_REACHED",
-        )
-    return False
+            return error.code
+        try:
+            ledger.record_batch_presend_disposition(
+                authority, scope=evidence.scope, side_effects=evidence.side_effects,
+                decision="NOT_ATTEMPTED_CAP", reason_code="SIGNED_CAP_REACHED",
+            )
+        except LedgerError as error:
+            ledger.stop_batch(batch,reason_code=error.code)
+            return error.code
+    return None
 
 
 def _execute_unclaimed_row(
@@ -246,7 +250,8 @@ def _advance_batch_row(
     if state.state=="STOPPED":
         return True
     if state.send_attempts_consumed>=state.max_send_attempts:
-        if _record_cap_for_unclaimed(batch,ledger,runtime,state):
+        reason_code=_record_cap_for_unclaimed(batch,ledger,runtime,state)
+        if reason_code=="BLOCKED_OWNER_AUTHN":
             report["authentication_state"]="OWNER_AUTHN_REVOKED"
         return True
     return _execute_unclaimed_row(batch,row_index,ledger,runtime,report)

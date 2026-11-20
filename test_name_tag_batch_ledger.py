@@ -117,5 +117,8 @@ class DurableFixtureTests(unittest.TestCase):
         self.ledger=OfflineFixtureBatchLedger.open_fixture(self.path)
         self.assertEqual(self.ledger.state('batch-a'),'STOPPED')
         self.assertEqual(self.ledger.state('batch-b'),'STOPPED')
+        self.assertEqual(self.ledger.conn.execute(
+            "SELECT state FROM scopes WHERE scope_id='scope-b'"
+        ).fetchone(),('HOLD',))
 
 if __name__=='__main__':unittest.main()

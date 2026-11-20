@@ -101,7 +101,12 @@ def simulate_untrusted_fixture(
             ledger.classify_cap(batch_id)
             outcomes.extend(['NOT_ATTEMPTED_CAP']*(len(approved_rows)-i))
             break
-        outcome,stop=_execute_fixture_row(batch_id,i,row,ledger,adapter)
+        try:
+            outcome,stop=_execute_fixture_row(batch_id,i,row,ledger,adapter)
+        except (LedgerBlocked,sqlite3.Error):
+            state_recovery_required=True
+            outcomes.extend(['NOT_ATTEMPTED_BATCH_STOP']*(len(approved_rows)-i))
+            break
         outcomes.append(outcome)
         if stop:
             outcomes.extend(['NOT_ATTEMPTED_BATCH_STOP']*(len(approved_rows)-i-1))
@@ -235,7 +240,7 @@ def _execute_fixture_row(batch_id,index,row,ledger,adapter):
             if ledger.state(batch_id)=='ACTIVE':
                 ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
         except (LedgerBlocked,sqlite3.Error):
-            return 'NOT_ATTEMPTED_BATCH_STOP',True
+            raise
         return 'NOT_ATTEMPTED_BATCH_STOP',True
 
 

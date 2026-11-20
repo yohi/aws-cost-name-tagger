@@ -95,6 +95,17 @@ class ExecutorFixtureTests(unittest.TestCase):
         self.ledger.close();self.ledger=OfflineFixtureBatchLedger.open_fixture(Path(self.t.name)/'fixture.sqlite')
         self.assertEqual(self.ledger.state('batch-stop-write-failure'),'STOPPED')
         self.assertEqual(self.ledger.conn.execute("SELECT state FROM scopes WHERE scope_id='scope-a'").fetchone(),('HOLD',))
+
+    def test_failed_stop_persistence_reports_recovery_required(self):
+        adapter=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
+        with patch.object(self.ledger,'admit',side_effect=LedgerBlocked('fixture pre-send failure')):
+            with patch.object(self.ledger,'stop',side_effect=sqlite3.OperationalError('database is locked')):
+                result=simulate_untrusted_fixture('batch-stop-persist-failure','nonce-stop-persist-failure',
+                    self.rows,ledger=self.ledger,adapter=adapter,cap=2)
+        self.assertEqual(result['batch_state'],'RECOVERY_REQUIRED')
+        self.assertEqual(result['stop_reason'],'BLOCKED_SCOPE_STATE_UNKNOWN')
+        self.assertEqual(self.ledger.state('batch-stop-persist-failure'),'ACTIVE')
+        self.assertEqual(adapter.write_calls,0)
     def test_exclusive_sqlite_lock_returns_recovery_required(self):
         lock_conn=sqlite3.connect(Path(self.t.name)/'fixture.sqlite',timeout=0.1,isolation_level=None)
         lock_conn.execute('PRAGMA journal_mode=DELETE')

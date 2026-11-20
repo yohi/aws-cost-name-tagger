@@ -76,8 +76,9 @@ class StateTests(unittest.TestCase):
            'records':[{'proposal_id':'p','kind':'volume','locator':'vol-abcdef12345678901','region':'ap-northeast-1',
               'resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901',
               'aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT',
-              'name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'app-prod-ebs-xvda-'+'x'*230+'-5678901',
-              'effective_usage_cost_usd':'1','evidence':'EBS vol-abcdef12345678901 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)'}]}
+              'name_key_present':False,'name_raw_value':None,'existing_name':'',
+              'proposed_name':'app-'+'x'*230+'-prod-ebs-xvda-5678901',
+              'effective_usage_cost_usd':'1','evidence':'EBS vol-abcdef12345678901 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name='+'app-'+'x'*230+'-prod; Product(observed, not validated)=(unset)'}]}
         plan_bytes=json.dumps(p,ensure_ascii=False).encode()
         csv_bytes=build_batch_review_projection(plan_bytes).replace(b',p,',b'YES,p,')
         self.assertEqual(len(validate_batch_draft(plan_bytes,csv_bytes).approved_rows[0]['approved_name']),256)
@@ -200,6 +201,19 @@ class ApprovedNameEligibilityTests(unittest.TestCase):
     def test_name_not_bound_to_volume_suffix_is_rejected(self):
         with self.assertRaises(BatchValidationError):
             _approve(_single_row_plan(name='app-prod-ebs-xvda-0000000'))
+
+    def test_device_must_match_attachment_evidence(self):
+        with self.assertRaises(BatchValidationError):
+            _approve(_single_row_plan(name='app-prod-ebs-xvdb-5678901'))
+
+    def test_generated_name_at_256_character_limit_is_accepted(self):
+        anchor='app-'+'x'*230+'-prod'
+        generated=anchor+'-ebs-xvda-5678901'
+        self.assertEqual(len(generated),256)
+        evidence=(f'EBS vol-abcdef12345678901 -> attachment i-0123456789abcdef0 xvda '
+                  f'-> EC2 i-0123456789abcdef0 Name={anchor}; Product(observed, not validated)=(unset)')
+        row=_approve(_single_row_plan(name=generated,evidence=evidence)).approved_rows[0]
+        self.assertEqual(row['approved_name'],generated)
 
     def test_unapproved_rows_are_not_checked_for_eligibility(self):
         plan=_single_row_plan(name='Whatever',evidence='x')

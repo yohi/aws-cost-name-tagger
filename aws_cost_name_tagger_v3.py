@@ -1616,6 +1616,15 @@ def _partition_for_region(region: str) -> str:
     return "aws"
 
 
+def _batch_partition(candidates: list[dict]) -> str:
+    """Select the single AWS partition represented by the Batch candidates."""
+    partitions={_partition_for_region(str(candidate.get("region", "")))
+                for candidate in candidates}
+    if len(partitions)>1:
+        raise SystemExit("batch-plan cannot mix AWS partitions")
+    return next(iter(partitions),"aws")
+
+
 def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str,
                      scope_declarations: list[dict] | None = None):
     """Audit-friendly report: list ARN, old/proposed Name, result, and evidence."""
@@ -2050,6 +2059,7 @@ def plan_batch(args, *, scope_declarations, session=None):
     )
     if any(str(candidate.get("region", "")).startswith("us-gov-") for candidate in candidates):
         raise SystemExit("batch-plan does not support GovCloud regions")
+    partition=_batch_partition(candidates)
     session = _budgeted_session(session if session is not None else build_session(args.profile))
     assert_account(session, args.account)
     investigator = Investigator(session, args.account, retries=3)
@@ -2071,7 +2081,7 @@ def plan_batch(args, *, scope_declarations, session=None):
         "schema_version": 3,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "account": args.account,
-        "partition": "aws",
+        "partition": partition,
         "period": month,
         "metric": "Usage/DiscountedUsage(RI effective)/SavingsPlanCoveredUsage(SP effective)",
         "min_cost_usd": args.min_cost,

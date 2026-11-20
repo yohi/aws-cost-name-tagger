@@ -51,6 +51,12 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _validate_simulation_outputs(path,path)
 
+    def test_simulation_output_preflight_rejects_missing_ledger_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_parent=pathlib.Path(directory)/'new-ledger-parent'
+            with self.assertRaises(ValueError):
+                _validate_simulation_outputs(ledger_parent,ledger_parent/'fixture.db')
+
     def test_simulation_refuses_existing_host_ledger_path(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger_path = pathlib.Path(directory) / 'host-ledger.db'

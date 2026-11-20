@@ -56,7 +56,9 @@ def _write_new(path,bytes0):
 def _validate_simulation_outputs(report_out:Path,ledger_path:Path)->None:
     if report_out.exists() or report_out.is_symlink():
         raise ValueError('Simulation report output already exists')
-    if os.path.abspath(report_out)==os.path.abspath(ledger_path):
+    normalized_report=report_out.resolve(strict=False)
+    normalized_ledger=ledger_path.resolve(strict=False)
+    if normalized_report==normalized_ledger or normalized_report in normalized_ledger.parents:
         raise ValueError('Simulation report output aliases the fixture Ledger')
 
 

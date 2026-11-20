@@ -2627,6 +2627,11 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
             cur.assert_called_once()
             session.assert_not_called()
 
+    def test_batch_partition_comes_from_candidate_regions_and_rejects_mixed_partitions(self):
+        self.assertEqual(t._batch_partition([{'region':'cn-north-1'}]),'aws-cn')
+        with self.assertRaisesRegex(SystemExit,'mix AWS partitions'):
+            t._batch_partition([{'region':'us-east-1'}, {'region':'cn-north-1'}])
+
     def test_batch_plan_rejects_empty_scope_object_before_session_creation(self):
         with tempfile.TemporaryDirectory() as tmp:
             args=t.parse_cli(['batch-plan','--cur','unused.csv.gz','--month','2026-10',

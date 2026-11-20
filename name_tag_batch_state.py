@@ -183,12 +183,15 @@ def _validate_name_eligibility(r,name):
     if meaningful(name)!=name:
         raise BatchValidationError('Proposed Name is not a meaningful generated Name')
     evidence=r['evidence']
-    prefix=f'EBS {locator} -> attachment '
-    match=re.search(r'EC2 i-[0-9a-f]+ Name=(\S+?);',evidence) if evidence.startswith(prefix) else None
-    anchor=match.group(1) if match else None
-    if (anchor is None or meaningful(anchor)!=anchor
-            or not name.startswith(anchor+'-ebs-')
-            or not isinstance(locator,str) or not name.endswith('-'+locator[-7:])):
+    match=(re.fullmatch(
+        rf'EBS {re.escape(locator)} -> attachment (i-(?:[0-9a-f]{{8}}|[0-9a-f]{{17}})) '
+        rf'([a-z][a-z0-9-]*[a-z0-9]) -> EC2 \1 Name=(\S+?);.*',evidence)
+        if isinstance(locator,str) else None)
+    device=match.group(2) if match else None
+    anchor=match.group(3) if match else None
+    expected=(f'{anchor}-ebs-{device}-{locator[-7:]}'
+              if anchor is not None and device is not None else None)
+    if (anchor is None or meaningful(anchor)!=anchor or expected!=name):
         raise BatchValidationError('Evidence does not support the generated Name')
 
 
