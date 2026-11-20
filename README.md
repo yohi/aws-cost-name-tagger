@@ -122,6 +122,7 @@ uv run --locked --no-build python -m unittest -q \
   test_name_tag_batch_population test_name_tag_batch_state test_name_tag_batch_approval \
   test_name_tag_batch_trust test_name_tag_batch_ledger test_name_tag_batch_iam \
   test_name_tag_batch_executor test_name_tag_batch_report test_name_tag_batch_cli \
+  test_name_tag_batch_migration \
   test_aws_cost_name_tagger_v3
 ```
 
