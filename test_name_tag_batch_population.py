@@ -55,4 +55,24 @@ class PopulationTests(unittest.TestCase):
               'cur_population':sample_population(cost='1.25')}
         self.assertEqual(validate_signed_population(plan),plan['cur_population'])
 
+    def test_cost_text_rejects_exponent_and_oversized_input_before_decimal_expansion(self):
+        for invalid in ('1e1000000', '9' * 10000):
+            with self.subTest(invalid=invalid[:12]):
+                plan={'count':1,'records':[{'effective_usage_cost_usd':'1.25'}],
+                      'cur_population':sample_population(cost=invalid)}
+                with self.assertRaises(ValueError):
+                    validate_signed_population(plan)
+
+    def test_zero_resource_count_requires_zero_cost(self):
+        population=sample_population(count=1,cost='1')
+        population['below_min_cost']={'count':0,'cost_usd':'1'}
+        plan={'count':1,'records':[{'effective_usage_cost_usd':'1'}],
+              'cur_population':population}
+        with self.assertRaises(ValueError):
+            validate_signed_population(plan)
+
+    def test_aggregate_sum_allows_input_bound_times_maximum_rows(self):
+        total=exact_add(['9' * 100, '9' * 100])
+        self.assertEqual(total,Decimal('1' + '9' * 99 + '8'))
+
 if __name__=='__main__':unittest.main()

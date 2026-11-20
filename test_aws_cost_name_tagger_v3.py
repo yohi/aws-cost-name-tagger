@@ -2602,6 +2602,41 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
             self.assertTrue(review.read_bytes().startswith(b'\xef\xbb\xbf'))
             self.assertEqual(plan['cur_population']['cur_recognized']['cost_usd'],'1')
 
+            report=Path(tmp)/'batch-plan.report.csv'
+            with report.open(encoding='utf-8-sig',newline='') as stream:
+                report_row=next(csv.DictReader(stream))
+            self.assertEqual(report_row['name_generation_state'],'GENERATED')
+            self.assertEqual(report_row['write_support'],'SUPPORTED_API')
+            self.assertEqual(report_row['scope_application'],'DECLARED_ONLY')
+            self.assertEqual(report_row['host_scope_verified'],'False')
+
+    def test_resource_arn_uses_govcloud_partition_and_batch_plan_rejects_govcloud_before_session(self):
+        record={'kind':'volume','region':'us-gov-west-1','locator':'vol-0123456789abcdef0'}
+        self.assertEqual(t.resource_arn(record,ACCOUNT),
+            f'arn:aws-us-gov:ec2:us-gov-west-1:{ACCOUNT}:volume/vol-0123456789abcdef0')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args=t.parse_cli(['batch-plan','--cur','unused.csv.gz','--month','2026-10',
+                '--account',ACCOUNT,'--min-cost','0','--max-resources','10',
+                '--scope-declarations','unused.json','--output',str(Path(tmp)/'plan.json')])
+            candidate={'kind':'volume','region':'us-gov-west-1','locator':'vol-0123456789abcdef0'}
+            with patch.object(t,'cur_candidates_batch',return_value=(
+                    '2026-10',[candidate],{},{})) as cur, patch.object(t,'build_session') as session:
+                with self.assertRaisesRegex(SystemExit,'GovCloud'):
+                    t.plan_batch(args,scope_declarations=[])
+            cur.assert_called_once()
+            session.assert_not_called()
+
+    def test_batch_plan_rejects_empty_scope_object_before_session_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args=t.parse_cli(['batch-plan','--cur','unused.csv.gz','--month','2026-10',
+                '--account',ACCOUNT,'--min-cost','0','--max-resources','10',
+                '--scope-declarations','unused.json','--output',str(Path(tmp)/'plan.json')])
+            with patch.object(t,'build_session') as session:
+                with self.assertRaises(SystemExit):
+                    t.plan_batch(args,scope_declarations=[{}])
+            session.assert_not_called()
+
     def test_pr13_normal_inputs_preserve_effective_cost_and_max_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'cur.csv.gz'

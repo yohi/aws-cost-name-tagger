@@ -1585,12 +1585,13 @@ def resource_arn(rec: dict, account: str) -> str:
         return target
     kind = rec.get("kind", "")
     region = rec.get("region", "")
+    partition = _partition_for_region(region)
     if kind in ("rds_instance", "rds_cluster"):
         rtype = "db" if kind == "rds_instance" else "cluster"
         if not target:
             target = str(rec.get("locator", ""))
         if target and not target.startswith(("db-", "cluster-")):
-            return f"arn:aws:rds:{region}:{account}:{rtype}:{target}"
+            return f"arn:{partition}:rds:{region}:{account}:{rtype}:{target}"
     ec2 = {
         "instance": "instance", "volume": "volume", "snapshot": "snapshot",
         "eni": "network-interface", "eip": "elastic-ip",
@@ -1599,20 +1600,32 @@ def resource_arn(rec: dict, account: str) -> str:
     if kind in ec2:
         rid = target or str(rec.get("locator", ""))
         if rid:
-            return f"arn:aws:ec2:{region}:{account}:{ec2[kind]}/{rid}"
+            return f"arn:{partition}:ec2:{region}:{account}:{ec2[kind]}/{rid}"
     if kind == "log_group" and rec.get("locator"):
-        return f"arn:aws:logs:{region}:{account}:log-group:{rec['locator']}"
+        return f"arn:{partition}:logs:{region}:{account}:log-group:{rec['locator']}"
     if kind == "s3_bucket" and rec.get("locator"):
         return f"arn:aws:s3:::{rec['locator']}"
     return str(rec.get("locator", "")) if str(rec.get("locator", "")).startswith("arn:") else ""
 
 
-def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str):
+def _partition_for_region(region: str) -> str:
+    if region.startswith("us-gov-"):
+        return "aws-us-gov"
+    if region.startswith("cn-"):
+        return "aws-cn"
+    return "aws"
+
+
+def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str,
+                     scope_declarations: list[dict] | None = None):
     """Audit-friendly report: list ARN, old/proposed Name, result, and evidence."""
     cols = ["utc", "account", "mode", "result", "resource_arn", "kind", "region",
             "resource_id", "name_state", "name_key_present", "name_raw_value",
             "name_before", "name_proposed", "name_after",
             "effective_usage_cost_usd", "confidence", "proposal_id", "detail"]
+    if mode == "batch-plan":
+        cols.extend(("name_generation_state", "write_support", "scope_application",
+                     "host_scope_verified"))
     timestamp = datetime.now(timezone.utc).isoformat()
     with private_output(path, newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols)
@@ -1621,7 +1634,7 @@ def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str
             result = row.get("result", row.get("status", ""))
             new_name = row.get("name", row.get("proposed_name", ""))
             arn = row.get("resource_arn") or resource_arn(row, account)
-            writer.writerow(safe_csv_row({
+            values = {
                 "utc": timestamp, "account": account, "mode": mode,
                 "result": result, "resource_arn": arn,
                 "kind": row.get("kind", ""), "region": row.get("region", ""),
@@ -1636,10 +1649,42 @@ def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str
                 "confidence": row.get("confidence", ""),
                 "proposal_id": row.get("proposal_id", ""),
                 "detail": row.get("detail", row.get("evidence", "")),
-            }))
+            }
+            if mode == "batch-plan":
+                values.update(_batch_plan_report_fields(
+                    row, scope_declarations if scope_declarations is not None else [], account
+                ))
+            writer.writerow(safe_csv_row(values))
         fh.flush()
         os.fsync(fh.fileno())
     return path
+
+
+def _batch_plan_report_fields(row: dict, scope_declarations: list[dict], account: str) -> dict:
+    proposed_name = row.get("proposed_name")
+    evidence = row.get("evidence")
+    if isinstance(proposed_name, str) and proposed_name:
+        name_state = "GENERATED"
+    elif isinstance(evidence,str) and evidence.startswith("Proposed Name collision in batch:"):
+        name_state = "COLLISION"
+    elif (row.get("status") == "manual_review" and isinstance(evidence,str)
+          and "Candidate lacks a structured Name namespace" in evidence):
+        name_state = "UNAVAILABLE"
+    else:
+        name_state = "NOT_EVALUATED"
+    operation = row.get("aws_operation")
+    support = ("SUPPORTED_API" if row.get("kind") == "volume" and operation == "ec2:CreateTags"
+               else "UNSUPPORTED_API")
+    matches = [scope for scope in scope_declarations
+               if scope.get("account") == account
+               and scope.get("partition") == _partition_for_region(str(row.get("region", "")))
+               and scope.get("region") == row.get("region")
+               and row.get("resource_arn") in scope.get("resource_arns", [])]
+    scope_state = "DECLARED_ONLY" if len(matches) == 1 else "NOT_APPLIED"
+    if row.get("status") != "proposed":
+        scope_state = "NOT_APPLICABLE"
+    return {"name_generation_state": name_state, "write_support": support,
+            "scope_application": scope_state, "host_scope_verified": False}
 
 
 def show_aws_identity(session, expected: str) -> dict:
@@ -1979,6 +2024,7 @@ def plan_batch(args, *, scope_declarations, session=None):
     """Build a schema-3 Batch Plan from the bounded CUR and real resolver path."""
     from name_tag_batch_state import batch_name_state, build_batch_review_projection
     from name_tag_batch_state import validate_batch_draft
+    from name_tag_batch_state import _validate_scope_declarations
 
     if not ACCOUNT_ID_PATTERN.fullmatch(args.account):
         raise SystemExit(ACCOUNT_ERROR_MESSAGE)
@@ -1987,6 +2033,10 @@ def plan_batch(args, *, scope_declarations, session=None):
     max_send_attempts = getattr(args, "max_send_attempts", 20)
     if type(max_send_attempts) is not int or not 1 <= max_send_attempts <= 20:
         raise SystemExit("--max-send-attempts must be between 1 and 20")
+    try:
+        _validate_scope_declarations(scope_declarations)
+    except (TypeError, ValueError) as error:
+        raise SystemExit("Invalid Scope declarations") from error
     out = Path(args.output)
     review_path = out.with_suffix(REVIEW_CSV_SUFFIX)
     report_path = out.with_suffix(REPORT_CSV_SUFFIX)
@@ -1998,6 +2048,8 @@ def plan_batch(args, *, scope_declarations, session=None):
         args.cur, args.month, args.min_cost, args.max_resources, args.account,
         kind_filter=_cur_kind_filter(args),
     )
+    if any(str(candidate.get("region", "")).startswith("us-gov-") for candidate in candidates):
+        raise SystemExit("batch-plan does not support GovCloud regions")
     session = _budgeted_session(session if session is not None else build_session(args.profile))
     assert_account(session, args.account)
     investigator = Investigator(session, args.account, retries=3)
@@ -2045,7 +2097,8 @@ def plan_batch(args, *, scope_declarations, session=None):
             stream.write(review_bytes.decode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
-        write_action_csv(report_stage, records, args.account, mode="batch-plan")
+        write_action_csv(report_stage, records, args.account, mode="batch-plan",
+                         scope_declarations=scope_declarations)
         session.read_budget.require_completion()
         publish_staged_reports(list(zip((plan_stage, review_stage, report_stage), destinations)))
     return doc

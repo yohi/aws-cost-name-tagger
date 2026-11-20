@@ -87,18 +87,60 @@ class StateTests(unittest.TestCase):
         with self.assertRaises(BatchValidationError):
             validate_batch_draft(plan_bytes,csv_bytes)
 
-if __name__=='__main__':unittest.main()
+    def test_review_projection_formula_escapes_match_validation_and_keeps_approval_editable(self):
+        plan={
+            'schema_version':3,'account':'123456789012','partition':'aws',
+            'execution_limits':{'max_send_attempts':1},
+            'cur_population':sample_population(cost='1'),
+            'scope_declarations':[{'writer_control_scope_id':'s','account':'123456789012','partition':'aws',
+                'region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890']}],
+            'records':[{'proposal_id':'proposal-1','kind':'volume','locator':'vol-abcdef1234567890','region':'ap-northeast-1',
+                'resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890',
+                'aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT',
+                'name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'Meaningful-Name',
+                'writer_control_scope_id':'s',
+                'effective_usage_cost_usd':'1','evidence':'+formula'}],
+            'count':1,
+        }
+        plan_bytes=json.dumps(plan).encode()
+        projection=build_batch_review_projection(plan_bytes)
+        csv_rows=list(csv.reader(io.StringIO(projection.decode('utf-8-sig'))))
+        self.assertEqual(csv_rows[1][13],"'+formula")
+        csv_rows[1][0]='YES'
+        edited=io.StringIO(newline='')
+        writer=csv.writer(edited,lineterminator='\r\n')
+        writer.writerows(csv_rows)
+        draft=validate_batch_draft(plan_bytes,b'\xef\xbb\xbf'+edited.getvalue().encode())
+        self.assertEqual(draft.rows[0]['approved'],'YES')
+
+    def test_empty_scope_declaration_list_is_valid_for_unapprovable_plan(self):
+        plan={'schema_version':3,'account':'123456789012','partition':'aws','count':0,
+              'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(count=0,cost='0'),
+              'scope_declarations':[],'records':[]}
+        plan_bytes=json.dumps(plan).encode()
+        self.assertEqual(validate_batch_draft(plan_bytes,build_batch_review_projection(plan_bytes)).rows,())
+
+    def test_non_string_proposal_id_is_rejected_as_batch_validation_error(self):
+        plan={'schema_version':3,'account':'123456789012','partition':'aws','count':1,
+              'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(cost='1'),
+              'scope_declarations':[], 'records':[{'proposal_id':[], 'kind':'unknown','locator':'',
+              'region':'','resource_arn':None,'aws_operation':None,'status':'unresolved','confidence':'low',
+              'name_state':'UNKNOWN','name_key_present':None,'name_raw_value':None,'existing_name':'',
+              'proposed_name':'','effective_usage_cost_usd':'1','evidence':'x'}]}
+        plan_bytes=json.dumps(plan).encode()
+        with self.assertRaises(BatchValidationError):
+            validate_batch_csv(plan_bytes,build_batch_review_projection(plan_bytes))
 
 class SecurityBoundaryTests(unittest.TestCase):
     def test_variant_name_unicode_casefold_is_unknown(self):
         self.assertEqual(classify_batch_name({'nAmE':'Value'}).state,'UNKNOWN')
     def test_foreign_arn_cannot_be_approved_through_matching_declaration(self):
         p={'schema_version':3,'account':'123456789012','partition':'aws','count':1,'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(cost='1'),
-        'scope_declarations':[{'writer_control_scope_id':'s','account':'123456789012','partition':'aws','region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:999999999999:volume/vol-abcdef1234567890']}],
+        'scope_declarations':[{'writer_control_scope_id':'s','account':'999999999999','partition':'aws','region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:999999999999:volume/vol-abcdef1234567890']}],
         'records':[{'proposal_id':'a','kind':'volume','locator':'vol-abcdef1234567890','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:999999999999:volume/vol-abcdef1234567890','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'Name','effective_usage_cost_usd':'1','evidence':'E','aws_operation':'ec2:CreateTags'}]}
         pb=json.dumps(p).encode()
+        csv0=build_batch_review_projection(pb)
         with self.assertRaises(BatchValidationError):
-            csv0=build_batch_review_projection(pb)
             validate_batch_draft(pb,csv0.replace(b',a,',b'YES,a,'))
 
     def test_malformed_ec2_volume_arn_cannot_be_declared(self):
@@ -115,3 +157,6 @@ class SecurityBoundaryTests(unittest.TestCase):
 
         with self.assertRaises(BatchValidationError):
             validate_batch_draft(plan_bytes,build_batch_review_projection(plan_bytes))
+
+
+if __name__=='__main__':unittest.main()

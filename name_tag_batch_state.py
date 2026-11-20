@@ -126,7 +126,10 @@ def _csv_value(r,field):
         if v is True:return 'true'
         if v is False:return 'false'
         return ''
-    return '' if v is None else str(v)
+    value='' if v is None else str(v)
+    if value.lstrip(' \t\r\n\ufeff').startswith(('=','+','-','@')) or value.startswith(('\t','\r','\n')):
+        return "'"+value
+    return value
 
 
 def build_batch_review_projection(plan_bytes:bytes)->bytes:
@@ -190,7 +193,12 @@ def validate_approved_batch_row(p,r,approved:str):
 
 
 def validate_batch_csv(plan_bytes:bytes,csv_bytes:bytes)->tuple[dict,...]:
-    p=_parse_plan(plan_bytes);parsed=_read_review_csv(csv_bytes)
+    p=_parse_plan(plan_bytes)
+    return _validate_batch_csv_for_plan(p,csv_bytes)
+
+
+def _validate_batch_csv_for_plan(p:dict,csv_bytes:bytes)->tuple[dict,...]:
+    parsed=_read_review_csv(csv_bytes)
     if len(parsed)!=len(p['records']):raise BatchValidationError('CSV row count mismatch')
     ids=set();target=set();result=[]
     for record,cells in zip(p['records'],parsed,strict=True):
@@ -201,7 +209,7 @@ def validate_batch_csv(plan_bytes:bytes,csv_bytes:bytes)->tuple[dict,...]:
         proposal=record.get('proposal_id');arn=record.get('resource_arn');operation=record.get('aws_operation')
         identity=(arn,operation)
         confirmed_target=isinstance(arn,str) and bool(arn) and isinstance(operation,str) and bool(operation)
-        if not proposal or proposal in ids or (confirmed_target and identity in target):raise BatchValidationError('Duplicate/missing proposal or target')
+        if not isinstance(proposal,str) or not proposal or proposal in ids or (confirmed_target and identity in target):raise BatchValidationError('Duplicate/missing proposal or target')
         ids.add(proposal)
         if confirmed_target:target.add(identity)
         result.append(validate_approved_batch_row(p,record,c['approved']) if c['approved']=='YES' else {**record,'approved':c['approved']})
@@ -209,5 +217,6 @@ def validate_batch_csv(plan_bytes:bytes,csv_bytes:bytes)->tuple[dict,...]:
 
 
 def validate_batch_draft(plan_bytes:bytes,csv_bytes:bytes)->BatchDraft:
-    rows=validate_batch_csv(plan_bytes,csv_bytes)
-    return BatchDraft(bytes(plan_bytes),bytes(csv_bytes),tuple(r for r in rows if r['approved']=='YES'),rows,_parse_plan(plan_bytes))
+    plan=_parse_plan(plan_bytes)
+    rows=_validate_batch_csv_for_plan(plan,csv_bytes)
+    return BatchDraft(bytes(plan_bytes),bytes(csv_bytes),tuple(r for r in rows if r['approved']=='YES'),rows,plan)

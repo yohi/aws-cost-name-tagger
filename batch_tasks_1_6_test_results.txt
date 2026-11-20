@@ -31,7 +31,8 @@ schema-v1-to-v2 migration was exercised only against disposable test Ledgers;
 no existing Ledger was migrated. Safety Hold remains active.
 
 Batch Tasks 1-6 offline integration: CUR/Plan, Owner approval, host-bound Ledger
-admission and durable cap, signed schema migration, runtime Scope evidence,
+admission and durable cap, signed schema migration, synthetic runtime Scope
+evidence consistency only (not registered Scope or protected Host Ledger state),
 fake-only SDK execution, and authenticated reporting are connected and covered
 by the test suite. This does not enable production AWS writes, remove Safety
 Hold, authorize IAM/Trust updates, or authorize Task 7.

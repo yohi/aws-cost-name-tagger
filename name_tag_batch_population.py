@@ -6,6 +6,13 @@ from typing import Mapping
 import math
 import re
 
+MAX_CUR_ROWS = 2_000_000
+MAX_CUR_DISTINCT_RESOURCES = 250_000
+MAX_COST_DIGITS = 1_000
+MAX_COST_SCALE = 1_000
+MAX_AGGREGATE_DIGITS = MAX_COST_DIGITS + 7
+_PLAIN_DECIMAL = re.compile(r"-?[0-9]+(?:\.[0-9]+)?\Z")
+
 class CurBudgetExceeded(ValueError):
     pass
 
@@ -26,20 +33,26 @@ def _canonical_decimal(value: Decimal) -> str:
 
 def exact_add(values) -> Decimal:
     """Sum finite decimal values using unbounded integer coefficients, never rounded Decimal +."""
-    items=[_decimal_coefficient(value) for value in values]
+    items=[]
+    for value in values:
+        if len(items)>=MAX_CUR_ROWS:
+            raise CurBudgetExceeded('CUR aggregate row budget exceeded')
+        items.append(_decimal_coefficient(value))
     if not items:return Decimal(0)
     scale=min(exp for _,exp in items)
     total=sum(n*10**(exp-scale) for n,exp in items)
     if total==0:return Decimal(0)
     digits=tuple(int(c) for c in str(abs(total)))
+    if len(digits)>MAX_AGGREGATE_DIGITS or abs(scale)>MAX_COST_SCALE:
+        raise CurBudgetExceeded('CUR aggregate precision/scale budget exceeded')
     return Decimal((1 if total<0 else 0,digits,scale))
 
 
 def _decimal_coefficient(value):
     if isinstance(value,float):
         raise ValueError('Float is not a valid exact monetary source')
-    if isinstance(value,str) and re.fullmatch(r'-?[0-9]+(?:\.[0-9]+)?',value) is None:
-        raise ValueError('CUR monetary source is not a plain decimal string')
+    if isinstance(value,str) and (len(value)>MAX_COST_DIGITS+2 or _PLAIN_DECIMAL.fullmatch(value) is None):
+        raise ValueError('CUR monetary source is not a bounded plain decimal string')
     try:
         amount=Decimal(value) if isinstance(value,(str,int,Decimal)) else None
     except InvalidOperation as error:
@@ -47,7 +60,7 @@ def _decimal_coefficient(value):
     if amount is None or not amount.is_finite():
         raise ValueError('CUR monetary amount must be finite decimal')
     sign,digits,exp=amount.as_tuple()
-    if abs(exp)>1000 or len(digits)>1000:
+    if abs(exp)>MAX_COST_SCALE or len(digits)>MAX_COST_DIGITS:
         raise CurBudgetExceeded('CUR decimal scale/precision budget exceeded')
     coefficient=int(''.join(map(str,digits))) if digits else 0
     return (-coefficient if sign else coefficient,exp)
@@ -129,7 +142,8 @@ def validate_signed_population(plan:dict)->dict:
     kind_counts=('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')
     billing=('unattributable_cur','outside_requested_kinds','unsupported_kind')
     def cost(value):
-        if type(value) is not str:
+        if (type(value) is not str or len(value)>MAX_COST_DIGITS+2
+                or _PLAIN_DECIMAL.fullmatch(value) is None):
             raise ValueError('Expected exact decimal text')
         try:d=Decimal(value)
         except InvalidOperation as e:raise ValueError('Nondecimal cost') from e
@@ -150,17 +164,25 @@ def validate_signed_population(plan:dict)->dict:
 def _validate_resource_summaries(population,names,cost):
     for name in names:
         record=population[name]
-        if type(record) is not dict or set(record)!={'count','cost_usd'} or type(record['count']) is not int or record['count']<0:
+        if (type(record) is not dict or set(record)!={'count','cost_usd'}
+                or type(record['count']) is not int
+                or not 0<=record['count']<=MAX_CUR_DISTINCT_RESOURCES):
             raise ValueError('Invalid recognized resource summary')
-        cost(record['cost_usd'])
+        amount=cost(record['cost_usd'])
+        if record['count']==0 and amount!=0:
+            raise ValueError('Empty resource class has nonzero cost')
 
 
 def _validate_billing_summaries(population,names,cost):
     for name in names:
         record=population[name]
-        if type(record) is not dict or set(record)!={'known','billing_rows','cost_usd'} or record['known'] is not True or type(record['billing_rows']) is not int or record['billing_rows']<0:
+        if (type(record) is not dict or set(record)!={'known','billing_rows','cost_usd'}
+                or record['known'] is not True or type(record['billing_rows']) is not int
+                or not 0<=record['billing_rows']<=MAX_CUR_ROWS):
             raise ValueError('Unknown/incomplete billing class')
-        cost(record['cost_usd'])
+        amount=cost(record['cost_usd'])
+        if record['billing_rows']==0 and amount!=0:
+            raise ValueError('Empty billing class has nonzero cost')
 
 
 def _population_is_conserved(population,cost):

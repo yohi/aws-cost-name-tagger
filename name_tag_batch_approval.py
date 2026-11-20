@@ -171,10 +171,10 @@ def verify_batch_approval(plan_bytes:bytes,csv_bytes:bytes,signed_batch_envelope
         if envelope['batch_id']!=sha256(can).hexdigest():raise BatchAuthRejected()
         if payload['plan_sha256']!=sha256(plan_bytes).hexdigest() or payload['csv_sha256']!=sha256(csv_bytes).hexdigest():raise BatchAuthRejected()
         draft=validate_batch_draft(plan_bytes,csv_bytes)
-        if payload['approved_rows_sha256']!=sha256(canonical_bytes(_approved_tuples(draft))).hexdigest():raise BatchAuthRejected()
+        approved_tuples=_approved_tuples(draft)
+        if payload['approved_rows_sha256']!=sha256(canonical_bytes(approved_tuples)).hexdigest():raise BatchAuthRejected()
         if payload['account']!=draft.plan['account'] or payload['partition']!=draft.plan['partition']:raise BatchAuthRejected()
         _verify_batch_owner_signature(payload,can,envelope,trust,now_utc)
-        approved_tuples=_approved_tuples(draft)
         frozen_rows=tuple(MappingProxyType(dict(row)) for row in draft.approved_rows)
         return VerifiedBatchApproval(bytes(signed_batch_envelope),can,envelope['batch_id'],MappingProxyType(dict(payload)),bytes(plan_bytes),bytes(csv_bytes),frozen_rows,tuple(row[0] for row in approved_tuples),payload['owner_principal_id'],envelope['signature_ref'])
     except (ValueError,TypeError,KeyError,ImportError,OSError,AttributeError) as e:
