@@ -21,6 +21,15 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(out['rows'][0]['proposed_name'],'Name-1')
         self.assertEqual(out['rows'][0]['outcome'],'UNAPPROVED')
         self.assertFalse(out['rows'][0]['execution_allowed'])
+    def test_scope_declaration_is_not_reported_as_host_verified_scope(self):
+        row=build_batch_dry_run(self.pb,self.cb)['rows'][0]
+        self.assertEqual(row['writer_control_scope_id'],'scope')
+        self.assertEqual(row['scope_application'],'DECLARED_ONLY')
+        self.assertIs(row['host_scope_verified'],False)
+        self.assertNotEqual(row['scope_application'],'APPLIED')
+        # Declared-only scope must still classify through the existing outcome path.
+        self.assertEqual(row['outcome'],'UNAPPROVED')
+
     def test_signed_report_refuses_foreign_bytes(self):
         import hashlib
         b=VerifiedBatchApproval(b'fixture',b'p','a'*64,MappingProxyType({'plan_sha256':hashlib.sha256(self.pb).hexdigest(),'csv_sha256':hashlib.sha256(self.cb).hexdigest()}),self.pb,self.cb,(),(), 'owner','sig')

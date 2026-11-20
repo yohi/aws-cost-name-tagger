@@ -131,7 +131,11 @@ def prepare_batch_approval(plan_bytes:bytes,csv_bytes:bytes,*,owner_principal_id
       'cur_population':draft.plan['cur_population'],
       'max_send_attempts':draft.plan['execution_limits']['max_send_attempts'],
       'expires_at_utc':expires_at_utc,
-      'approved_rows':[{k:r.get(k) for k in ('proposal_id','resource_arn','name_state','name_raw_value','approved_name','aws_operation','writer_control_scope_id','effective_usage_cost_usd')} for r in draft.approved_rows]}
+      'account':draft.plan['account'],'partition':draft.plan['partition'],
+      'approved_count':len(draft.approved_rows),
+      'excluded_count':len(draft.rows)-len(draft.approved_rows),
+      'scope_id_semantics':'DECLARED_ONLY_NOT_HOST_VERIFIED',
+      'approved_rows':[{**{k:r.get(k) for k in ('proposal_id','region','resource_arn','name_state','name_key_present','name_raw_value','existing_name','approved_name','aws_operation','writer_control_scope_id','effective_usage_cost_usd')},'account':draft.plan['account'],'partition':draft.plan['partition']} for r in draft.approved_rows]}
     return PreparedBatchApproval(can,payload,sha256(can).hexdigest(),BATCH_NAMESPACE,manifest)
 
 

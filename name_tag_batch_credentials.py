@@ -9,6 +9,7 @@ from name_tag_batch_iam import SessionPolicySpec, KindPolicy, IAMPolicyBlocked, 
 from name_tag_batch_approval import VerifiedBatchApproval
 from hashlib import sha256
 from typing import Mapping
+import json
 
 class CredentialBlocked(RuntimeError):pass
 
@@ -20,6 +21,10 @@ class IssuedBatchSession:
     row_indexes:tuple[int,...]
     role_arn:str
     provenance:str='OFFLINE_SYNTHETIC_NOT_STS'
+
+# Identity registry: only sessions minted by OfflineFakeIssuer.issue are accepted
+# by the offline adapter (an equal-valued externally built copy is not).
+_ISSUED:dict[int,'IssuedBatchSession']={}
 
 class OfflineFakeIssuer:
     """No real STS client can be supplied; no network/API methods exist."""
@@ -39,7 +44,9 @@ class OfflineFakeIssuer:
         role=batch.payload.get('authorized_role_arn')
         if not isinstance(role,str) or not role.startswith('arn:'):
             raise CredentialBlocked('Missing role identity')
-        return IssuedBatchSession(batch.batch_id,raw,subset.policy_sha256,subset.row_indexes,role)
+        issued=IssuedBatchSession(batch.batch_id,raw,subset.policy_sha256,subset.row_indexes,role)
+        _ISSUED[id(issued)]=issued
+        return issued
 
 
 def validate_issued_batch_session(
@@ -61,3 +68,24 @@ def validate_issued_batch_session(
             or issued.role_arn!=role
             or issued.provenance!='OFFLINE_SYNTHETIC_NOT_STS'):
         raise CredentialBlocked('Synthetic issued-session binding mismatch')
+
+
+def authorize_offline_session_operation(session:IssuedBatchSession|None,resource_arn:str,*,write:bool=False)->None:
+    """Offline-fake check that an operation is bound to an issuer-minted session.
+
+    Synthetic evidence only; it does not prove effective production IAM permissions.
+    """
+    if (type(session) is not IssuedBatchSession
+            or _ISSUED.get(id(session)) is not session
+            or session.provenance!='OFFLINE_SYNTHETIC_NOT_STS'
+            or sha256(session.policy_bytes).hexdigest()!=session.policy_sha256):
+        raise CredentialBlocked('Operation is not bound to an issued offline session')
+    if not write:
+        return
+    try:
+        statements=json.loads(session.policy_bytes)['Statement']
+        allowed=next(st['Resource'] for st in statements if st.get('Sid')=='ApprovedNameTagWritesOnly')
+    except (ValueError,KeyError,StopIteration,TypeError) as error:
+        raise CredentialBlocked('Session policy is unreadable') from error
+    if resource_arn not in (allowed if isinstance(allowed,list) else [allowed]):
+        raise CredentialBlocked('Write target is outside the issued session subset')

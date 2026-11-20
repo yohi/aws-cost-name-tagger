@@ -118,7 +118,20 @@ def _execute_unclaimed_row(
         ledger.stop_batch(batch, reason_code="BLOCKED_SCOPE_STATE_UNKNOWN")
         return True
     try:
-        current = classify_batch_name(runtime.adapter.read_current(resource_arn))
+        subset = build_subset_session_policy(
+            batch, (row_index,), kind_registry=_VOLUME_POLICY
+        )
+        issued = OfflineFakeIssuer().issue(batch, subset, kind_registry=_VOLUME_POLICY)
+        validate_issued_batch_session(batch, subset, issued)
+    except (IAMPolicyBlocked, CredentialBlocked):
+        ledger.stop_batch(batch, reason_code="AWS_WRITE_BLOCKED")
+        return True
+    try:
+        current = classify_batch_name(
+            runtime.adapter.read_current(resource_arn, session=issued))
+    except CredentialBlocked:
+        ledger.stop_batch(batch, reason_code="AWS_WRITE_BLOCKED")
+        return True
     except OSError:
         ledger.stop_batch(batch, reason_code="BLOCKED_SCOPE_STATE_UNKNOWN")
         return True
@@ -139,25 +152,17 @@ def _execute_unclaimed_row(
             raise
         return False
     try:
-        subset = build_subset_session_policy(
-            batch, (row_index,), kind_registry=_VOLUME_POLICY
-        )
-        issuer = OfflineFakeIssuer()
-        issued = issuer.issue(batch, subset, kind_registry=_VOLUME_POLICY)
-        validate_issued_batch_session(batch, subset, issued)
         handle = ledger.create_batch_intent(
             authority, scope=evidence.scope, side_effects=evidence.side_effects
         )
         permit = ledger.consume_first_send(handle)
-    except (IAMPolicyBlocked, CredentialBlocked):
-        ledger.stop_batch(batch, reason_code="AWS_WRITE_BLOCKED")
-        return True
     except LedgerError as error:
         ledger.stop_batch(batch, reason_code=error.code)
         raise
     try:
-        runtime.adapter.write_once(permit.resource_arn, permit.approved_name)
-        readback = classify_batch_name(runtime.adapter.readback(permit.resource_arn))
+        runtime.adapter.write_once(
+            permit.resource_arn, permit.approved_name, session=issued)
+        readback = classify_batch_name(runtime.adapter.readback(permit.resource_arn, session=issued))
         outcome = (
             "APPLIED_VERIFIED"
             if readback.state == "NONEMPTY" and readback.name_raw_value == permit.approved_name

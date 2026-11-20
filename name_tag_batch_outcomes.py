@@ -58,7 +58,7 @@ def _status_outcome(row:BatchOutcomeRow)->str|None:
             return 'WRITE_UNSUPPORTED'
         if row.get('write_support')=='OPERATION_UNRESOLVED':
             return 'WRITE_OPERATION_UNRESOLVED'
-        if row.get('scope_application')!='APPLIED':
+        if row.get('scope_application')!='DECLARED_ONLY':
             return 'SCOPE_NOT_APPLIED'
     if row.get('name_generation_state')=='UNAVAILABLE':
         return 'NAME_GENERATION_UNAVAILABLE'

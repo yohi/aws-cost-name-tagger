@@ -108,7 +108,7 @@ def _scope_application(plan,row,arn,write_support):
     if write_support!='SUPPORTED_API' or not isinstance(arn,str) or not arn:
         return None,'NOT_APPLIED'
     try:
-        return derive_declared_row_scope(plan,row),'APPLIED'
+        return derive_declared_row_scope(plan,row),'DECLARED_ONLY'
     except BatchValidationError as error:
         if str(error)=='No unique Scope declaration':
             return None,'NOT_APPLIED'
@@ -141,7 +141,7 @@ def _report_row(row,row_index,plan):
         'name_key_present':row.get('name_key_present'),'name_raw_value':row.get('name_raw_value'),
         'existing_name':row.get('existing_name'),'proposed_name':row.get('proposed_name'),
         'name_generation_state':name_generation_state,'write_support':write_support,
-        'scope_application':scope_application,'approved':row.get('approved'),
+        'scope_application':scope_application,'host_scope_verified':False,'approved':row.get('approved'),
         'status':row.get('status'),'confidence':row.get('confidence'),
         'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
         'outcome':'NOT_ATTEMPTED_UNSIGNED_PREVIEW','execution_allowed':False,

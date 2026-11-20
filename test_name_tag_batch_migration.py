@@ -651,6 +651,45 @@ class BatchLedgerMigrationTests(unittest.TestCase):
                 with self.assertRaises(LedgerError):
                     ledger.batch_execution_state(batch)
 
+    def test_issuer_failure_blocks_intent_permit_and_fake_write(self) -> None:
+        from name_tag_batch_credentials import CredentialBlocked
+        from name_tag_batch_executor import (
+            BatchOfflineRuntime, BatchRuntimeEvidence, FakeBatchSDKAdapter,
+            execute_batch_offline,
+        )
+
+        migration_decision=migration.verify_ledger_migration_decision(
+            self._envelope(),trust=self.trust,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+        with patch.object(migration_apply,"load_current_protected_owner_trust",return_value=self.trust):
+            migration.upgrade_ledger_v1_to_batch_v2(self.ledger_path,decision=migration_decision)
+        plan_bytes,csv_bytes,envelope,signed_at=self._batch_inputs()
+        batch=verify_batch_approval(plan_bytes,csv_bytes,envelope,trust=self.trust,now_utc=signed_at)
+        arns=[row["resource_arn"] for row in batch.approved_rows]
+        with closing(open_ledger(self.ledger_path,trusted_host=True,trust=self.trust)) as ledger:
+            scope,effects=self._initialize_batch_scope(ledger,arns)
+            adapter=FakeBatchSDKAdapter({arn:{} for arn in arns})
+            reads=[]
+            original_read=adapter.read_current
+            adapter.read_current=lambda *a,**k:(reads.append(1),original_read(*a,**k))[1]
+            runtime=BatchOfflineRuntime({"scope-1":BatchRuntimeEvidence(scope,effects)},adapter)
+            with (
+                patch("name_tag_batch_trust.load_current_protected_owner_trust",return_value=self.trust),
+                patch("name_tag_batch_runtime.load_current_protected_owner_trust",return_value=self.trust),
+                patch("name_tag_batch_runtime.OfflineFakeIssuer.issue",
+                      side_effect=CredentialBlocked("forced")),
+            ):
+                result=execute_batch_offline(
+                    batch,plan_bytes=plan_bytes,csv_bytes=csv_bytes,ledger=ledger,runtime=runtime)
+            with ledger._connection() as connection:
+                intents=connection.execute("SELECT COUNT(*) FROM intents").fetchone()[0]
+
+        self.assertEqual(result.batch_state,"STOPPED")
+        self.assertEqual(adapter.write_calls,0)
+        self.assertEqual(reads,[])
+        self.assertEqual(intents,0)
+        self.assertEqual(result.send_attempts_consumed,0)
+
     def test_unknown_presend_name_stops_batch_without_intent_or_skip(self) -> None:
         migration_decision=migration.verify_ledger_migration_decision(
             self._envelope(),trust=self.trust,

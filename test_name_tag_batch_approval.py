@@ -45,6 +45,19 @@ class BatchApprovalTests(unittest.TestCase):
         self.assertEqual(len(p.manifest['approved_rows']),1)
         self.assertEqual(p.manifest['cur_population'],json.loads(self.plan)['cur_population'])
         self.assertEqual(p.manifest['approved_rows'][0]['writer_control_scope_id'],'scope-1')
+        manifest_row=p.manifest['approved_rows'][0]
+        for key in ('account','partition','region','resource_arn','proposal_id','name_state',
+                    'name_key_present','name_raw_value','existing_name','approved_name',
+                    'aws_operation','writer_control_scope_id','effective_usage_cost_usd'):
+            self.assertIn(key,manifest_row)
+        self.assertEqual(manifest_row['account'],p.payload['account'])
+        self.assertEqual(manifest_row['partition'],p.payload['partition'])
+        self.assertEqual(p.manifest['account'],p.payload['account'])
+        self.assertEqual(p.manifest['approved_count'],1)
+        self.assertEqual(p.manifest['excluded_count'],len(json.loads(self.plan)['records'])-1)
+        self.assertEqual(p.manifest['scope_id_semantics'],'DECLARED_ONLY_NOT_HOST_VERIFIED')
+        for key in ('plan_sha256','csv_sha256','approved_rows_sha256','max_send_attempts'):
+            self.assertIn(key,p.manifest)
         self.assertFalse(p.execution_allowed)
     def test_self_attested_claim_is_not_auth(self):
         p=prepare_batch_approval(self.plan,self.csv,**self.kw)

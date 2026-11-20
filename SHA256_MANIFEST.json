@@ -5,8 +5,8 @@
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "f8623964096a9ffed454f15137b1d331a7259019efd6ad5356ead17effe3826e",
-      "bytes": 8262
+      "sha256": "0b93989a09de1c8eeb948c04f3484483b3758492a428e3a54a9ed45e3d54197d",
+      "bytes": 8346
     },
     {
       "path": ".gitignore",
@@ -200,8 +200,8 @@
     },
     {
       "path": "name_tag_batch_approval.py",
-      "sha256": "b1efa4aa51fe3fe5cdb6cd07a5da0a12afae3fb1bb6bbd668acdbaea38a96ffa",
-      "bytes": 10670
+      "sha256": "4921b82e819d4b807eddb858d980ba5cb3d3e153b0f43a7ec104b84dd905972a",
+      "bytes": 11037
     },
     {
       "path": "name_tag_batch_cli.py",
@@ -210,13 +210,13 @@
     },
     {
       "path": "name_tag_batch_credentials.py",
-      "sha256": "4aec4794b4b2df3db2443a06b8444734ebbfffd0aa6b5867bd01a8488ae94189",
-      "bytes": 2965
+      "sha256": "460230e1a17dfcb59b48da3e37a20bddb3c2d3f9b74ac439f06062d907ca1a75",
+      "bytes": 4379
     },
     {
       "path": "name_tag_batch_fake.py",
-      "sha256": "91854dacf9cb9736bd118726ca80dee90d5fb5c28295a923423ca5b414eb10f8",
-      "bytes": 2381
+      "sha256": "4d5fcdfff810e7ff9ea74326cbd2beda236e1018293f1313112411976dc05306",
+      "bytes": 3216
     },
     {
       "path": "name_tag_batch_executor.py",
@@ -250,8 +250,8 @@
     },
     {
       "path": "name_tag_batch_report.py",
-      "sha256": "e847501f7918845e9607f293e6e436741b7146d5da98117a9142d435d524d623",
-      "bytes": 9797
+      "sha256": "e0e6f381b0ec098585be78c5bbf19f864e7832312d1581495930d158f6013670",
+      "bytes": 9831
     },
     {
       "path": "name_tag_batch_state.py",
@@ -260,8 +260,8 @@
     },
     {
       "path": "name_tag_batch_runtime.py",
-      "sha256": "0d02deeb0c962079c788ea8ed1ba13300e35e50b34f5d0f27dae0539470045a1",
-      "bytes": 10917
+      "sha256": "606c811b54b47b27e2c6354b6c23b20b94dcd8ab377cf6af52256e2cee98d5f0",
+      "bytes": 11092
     },
     {
       "path": "name_tag_batch_trust.py",
@@ -275,8 +275,8 @@
     },
     {
       "path": "test_name_tag_batch_approval.py",
-      "sha256": "3b354f5a928efa283992e6bc72fb2cae398d169c8b6dda7279253a3a353729b5",
-      "bytes": 8723
+      "sha256": "6d2c748e13c4c38ef4d96ac7d78da3c2252f4ee1f8c98b2bcd7c3bf9e0f6dbba",
+      "bytes": 9687
     },
     {
       "path": "test_name_tag_batch_cli.py",
@@ -290,8 +290,8 @@
     },
     {
       "path": "test_name_tag_batch_iam.py",
-      "sha256": "5bc3b9ca492150ad7f6a9a0686ebec35d55d6a68bfd2a97191301ceb8376bbaf",
-      "bytes": 6585
+      "sha256": "7356434967d8ab2318ea0e231b1b9bc848ca5407ceea1af3cb067912212f6bdb",
+      "bytes": 8212
     },
     {
       "path": "test_name_tag_batch_ledger.py",
@@ -300,8 +300,8 @@
     },
     {
       "path": "test_name_tag_batch_migration.py",
-      "sha256": "2fb5b8366cfdaa4c5f02232ba4b53c4821a89023b8656813732eb67fe0f94703",
-      "bytes": 36924
+      "sha256": "7f37677136f7f800974255b57850402d348597c2292de23026f04d298ef3aad4",
+      "bytes": 39257
     },
     {
       "path": "test_name_tag_batch_population.py",
@@ -310,8 +310,8 @@
     },
     {
       "path": "test_name_tag_batch_report.py",
-      "sha256": "5ebb6566a1e677b6a67c3949c57d73c7ad599a772286ab7c34e8d74214643f68",
-      "bytes": 9488
+      "sha256": "ca454dc9b88fc7ac4ff5c9186171dda732430d435ab2f28441a768dcb4059011",
+      "bytes": 10017
     },
     {
       "path": "test_name_tag_batch_state.py",

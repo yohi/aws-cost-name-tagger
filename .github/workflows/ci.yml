@@ -86,6 +86,7 @@ jobs:
           test_name_tag_batch_trust test_name_tag_batch_ledger
           test_name_tag_batch_iam test_name_tag_batch_executor
           test_name_tag_batch_report test_name_tag_batch_cli
+          test_name_tag_batch_migration
           test_aws_cost_name_tagger_v3
 
       - name: Unit tests (direct script runner)
@@ -113,6 +114,7 @@ jobs:
             test_name_tag_batch_trust test_name_tag_batch_ledger \
             test_name_tag_batch_iam test_name_tag_batch_executor \
             test_name_tag_batch_report test_name_tag_batch_cli \
+            test_name_tag_batch_migration \
             test_aws_cost_name_tagger_v3 \
             2>&1 | tee trace-summary.txt
 

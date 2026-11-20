@@ -80,6 +80,27 @@ class PolicyTests(unittest.TestCase):
             role_arn=session.role_arn)
         with self.assertRaises(CredentialBlocked):
             validate_issued_batch_session(self.batch,spec,counterfeit)
+    def test_offline_adapter_operations_require_issuer_minted_bound_session(self):
+        from name_tag_batch_fake import FakeBatchSDKAdapter
+        arn0=self.batch.approved_rows[0]['resource_arn']
+        spec=build_subset_session_policy(self.batch,(1,),kind_registry=self.kind)
+        session=OfflineFakeIssuer().issue(self.batch,spec,kind_registry=self.kind)
+        adapter=FakeBatchSDKAdapter({arn0:{}},require_session=True)
+        # Same session binds read, write and readback for its own subset.
+        adapter.read_current(arn0,session=session)
+        # Missing session, equal-valued external copy, tampered policy: all refused.
+        with self.assertRaises(CredentialBlocked):adapter.read_current(arn0)
+        copy=IssuedBatchSession(session.batch_id,session.policy_bytes,session.policy_sha256,session.row_indexes,session.role_arn)
+        with self.assertRaises(CredentialBlocked):adapter.read_current(arn0,session=copy)
+        tampered=IssuedBatchSession(session.batch_id,session.policy_bytes+b' ',session.policy_sha256,session.row_indexes,session.role_arn)
+        with self.assertRaises(CredentialBlocked):adapter.write_once(arn0,'X',session=tampered)
+        # A session for a different row subset cannot write a foreign ARN.
+        other='arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-0123456789abcdef0'
+        adapter2=FakeBatchSDKAdapter({other:{}},require_session=True)
+        with self.assertRaises(CredentialBlocked):adapter2.write_once(other,'X',session=session)
+        self.assertEqual(adapter2.write_calls,0)
+        with self.assertRaises(CredentialBlocked):adapter2.readback(other)
+
     def test_issuer_rejects_self_hashed_wildcard_policy(self):
         policy=b'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:CreateTags","Resource":"*"}]}'
         forged=SessionPolicySpec(self.batch.batch_id,(1,),policy,hashlib.sha256(policy).hexdigest(),('*',),('ec2:CreateTags',),('ec2:DescribeVolumes',))
