@@ -250,8 +250,8 @@
     },
     {
       "path": "name_tag_batch_report.py",
-      "sha256": "e0e6f381b0ec098585be78c5bbf19f864e7832312d1581495930d158f6013670",
-      "bytes": 9831
+      "sha256": "bd19b712e393252f3817660c718df4de4807bcc3705f1a75f0ba009774e69fbc",
+      "bytes": 10889
     },
     {
       "path": "name_tag_batch_state.py",
@@ -310,8 +310,8 @@
     },
     {
       "path": "test_name_tag_batch_report.py",
-      "sha256": "e2f246a13834044d03d7e52c82e054c1d20c245102fb8067a209cf72de7ca077",
-      "bytes": 10712
+      "sha256": "13f058b1b7f1fd527647259b82afd7116d88d01723313229d46a14f713614e8f",
+      "bytes": 12546
     },
     {
       "path": "test_name_tag_batch_state.py",
