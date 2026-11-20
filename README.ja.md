@@ -61,6 +61,20 @@ root所有アンカーと異なる場合も拒否します。DBのコピーを�
 
 `simulate` はin-processのテスト用fake harnessからだけ利用でき、通常のCLI起動では拒否します。`execute-approved` は常に `AWS_WRITE_BLOCKED` を返します。Phase AではAWS書込み、IAM変更、Safety Hold解除を行わず、オフラインテストの成功はPhase Bや実AWS書込みの承認を意味しません。
 
+## Batch PlanとOwnerレビュー（実行は保留）
+
+`aws_cost_name_tagger_v3.py batch-plan` は既存の上限付きCUR走査と読み取り専用Resolverを利用し、Batch Plan v3と14列のレビューCSVを出力します。Phase AのName判定は変更せず、Batch専用で元CUR文字列のDecimal集計と上限前の母集団内訳を保持し、空白のみのNameを候補に含めます。Scope宣言JSONはPlanとともにOwner署名の対象になりますが、登録済みRuntime Scopeの証明ではありません。
+
+```bash
+uv run --locked python aws_cost_name_tagger_v3.py batch-plan \
+  --cur /path/to/aws-resource-cost-detail.csv.gz \
+  --month 2026-10 --account 123456789012 --profile read-only \
+  --scope-declarations ./private-reports/scope-declarations.json \
+  --output ./private-reports/batch-plan.json
+```
+
+OwnerはレビューCSVの`approved`列だけを編集します。`name_tag_controlled.py`の`prepare-batch`、`batch-dryrun`、`verify-batch`は、未署名payload作成、行別の未署名Preview、保護されたOwner署名検証を行います。検証済みReportも非実行状態（`execution_allowed=false`）です。`batch-simulate`は新規の隔離Fixture Ledgerとメモリ内fakeだけを使い、既存Ledger pathを拒否します。Host LedgerやAWS/STSには接続せず、Reportは常に`execution_allowed=false`です。Batch経路もAWS書込みやSafety Hold解除を許可しません。
+
 ## v3.5 → v3.6 の変更点（OwnerのR1.1要件）
 
 **Name補完対象:** `Name` キーがない（`ABSENT`）か、**キーは存在し値が厳密に空文字 `""`**（`EMPTY`）の場合だけName候補とする。いずれも、関連関係・名前の妥当性が不足すれば `manual_review` に留めます。

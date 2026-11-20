@@ -36,6 +36,7 @@ from name_tag_scope import ScopeEvidence, SideEffectEvidence
 import name_tag_ledger_anchor as ledger_anchor
 import name_tag_ledger_provision as ledger_provision
 from name_tag_ledger import (
+    IntentLedger,
     LedgerError,
     _side_effect_digest,
     ScopeAction,
@@ -1405,6 +1406,15 @@ class F006RevalidationTests(LedgerTestBase):
             "approval_id": approval_digest(data),
             "signature_ref": base64.b64encode(signature).decode(),
         }
+
+
+class BatchDispositionInputTests(unittest.TestCase):
+    def test_non_string_observed_name_digest_is_blocked_as_invalid_input(self):
+        ledger=object.__new__(IntentLedger)
+        with self.assertRaises(LedgerError) as rejected:
+            ledger._validate_batch_disposition_input(
+                "SKIPPED_NAME_CHANGED","NAME_SNAPSHOT_CHANGED",123)
+        self.assertEqual(rejected.exception.code,"BLOCKED_INPUT_INVALID")
 
 
 if __name__ == "__main__":

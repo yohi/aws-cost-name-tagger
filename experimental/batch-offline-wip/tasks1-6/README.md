@@ -4,7 +4,7 @@
 
 **Human Owner authorization:** Batch Design adopted. Bounded offline implementation and offline tests for Tasks 1–6 approved; this does NOT approve an existing Ledger migration, IAM/Trust updates, AWS or STS operations, Task 7, GitHub commit/push, PR creation or Merge.
 
-**Status: PARTIAL / NOT READY FOR REPOSITORY INTEGRATION OR OPERATIONS.** The model's container could not clone the GitHub repository (`Could not resolve host: github.com`). GitHub connector allowed read-only inspection of the reviewed code/spec/plan, but did not provide a local checkout. Files here are a **standalone, offline, non-production WIP** and were **not applied** to the actual repository. They are **not a completion claim for Tasks 1–6**.
+**Snapshot status: PARTIAL / HISTORICAL SOURCE.** The files here preserve the original standalone WIP; adapted copies now live at the repository root. This directory is not an execution path. Its `manifest.json` and `test-results.txt` describe the original snapshot only and are not evidence for the current root implementation. The original WIP left host-bound Ledger admission, signed schema migration, runtime ScopeEvidence, and `batch-simulate` integration incomplete; these are now integrated and offline-tested at the repository root. The Safety Hold remains active, and no existing Ledger or AWS resource has been migrated or modified.
 
 ## Implemented and isolated-test coverage
 
@@ -40,4 +40,4 @@ G2_NOT_VERIFIED
 AWS_RUNTIME_NOT_AUTHORIZED
 ```
 
-**Owner checkpoint:** The current deliverable is usable for bounded examination and source integration, but the offline Tasks 1–6 acceptance remains unverified. A real repository checkout or a user-provided source archive is required before applying these changes safely, testing against existing modules, and considering a commit. Do not auto-start further tasks or independent reviews.
+**Historical checkpoint:** At the time this snapshot was created, it had not been applied to a repository checkout. The current implementation status and verification evidence are maintained in the repository-root worktree and final task report, not in this snapshot. Do not treat this fixture bundle as production code or start follow-on tasks from it.

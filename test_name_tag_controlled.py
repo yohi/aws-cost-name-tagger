@@ -29,6 +29,8 @@ from name_tag_approval import (
 )
 from name_tag_controlled import main, parse_cli
 from name_tag_review import prepare_name_payload
+from name_tag_batch_state import build_batch_review_projection
+from test_helpers import sample_population
 
 
 class ControlledCLITests(unittest.TestCase):
@@ -170,6 +172,45 @@ class ControlledCLITests(unittest.TestCase):
             result = execute_approved(args)
         self.assertNotEqual(result, 0)
         self.assertIn("AWS_WRITE_BLOCKED", output.getvalue())
+
+    def test_batch_dryrun_is_reachable_from_controlled_cli(self):
+        record={
+            'proposal_id':'batch-proposal','kind':'volume','locator':'vol-0123456789abcdef0',
+            'region':'us-east-1','resource_arn':'arn:aws:ec2:us-east-1:123456789012:volume/vol-0123456789abcdef0',
+            'aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high',
+            'name_state':'ABSENT','name_key_present':False,'name_raw_value':None,
+            'existing_name':'','proposed_name':'web-prd','effective_usage_cost_usd':'1',
+            'evidence':'test metadata evidence',
+        }
+        document={
+            'schema_version':3,'account':'123456789012','partition':'aws','count':1,
+            'records':[record],'cur_population':sample_population(cost='1'),
+            'execution_limits':{'max_send_attempts':1},
+            'scope_declarations':[{'writer_control_scope_id':'batch-scope',
+                'account':'123456789012','partition':'aws','region':'us-east-1',
+                'resource_arns':[record['resource_arn']]}],
+        }
+        plan=self.root/'batch-plan.json'
+        review=self.root/'batch-plan.review.csv'
+        report=self.root/'batch-preview.json'
+        plan_bytes=json.dumps(document,sort_keys=True).encode()
+        self._write_input(plan,plan_bytes)
+        self._write_input(review,build_batch_review_projection(plan_bytes))
+
+        previous_directory=Path.cwd()
+        os.chdir(self.root)
+        try:
+            with redirect_stdout(io.StringIO()):
+                result=main(['batch-dryrun','--plan',plan.name,'--review',review.name,
+                             '--report-out',report.name])
+        finally:
+            os.chdir(previous_directory)
+
+        self.assertEqual(result,0)
+        data=json.loads(report.read_bytes())
+        self.assertEqual(data['authentication_state'],'UNSIGNED_PREVIEW')
+        self.assertEqual(data['rows'][0]['resource_arn'],record['resource_arn'])
+        self.assertFalse(data['execution_allowed'])
 
     def test_prepare_name_writes_unsigned_payload_without_overwrite(self):
         output_path = self.root / "unsigned-name.json"

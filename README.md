@@ -34,6 +34,33 @@ The separate `name_tag_controlled.py` CLI supports these offline commands:
 - `simulate`: blocked unless invoked by an in-process test harness with the exact fake adapter.
 - `execute-approved`: always returns `AWS_WRITE_BLOCKED` in Phase A.
 
+## Batch Plan and Owner Review (Offline Execution Held)
+
+`aws_cost_name_tagger_v3.py batch-plan` uses the bounded CUR scan and existing
+read-only metadata resolver to produce a Batch Plan v3 and its 14-column review
+CSV. Unlike the Phase A Plan path, this Batch-only path retains exact decimal CUR
+totals, records pre-cap population counts, and treats `WHITESPACE_ONLY` as a
+candidate without changing Phase A Name behavior. The command accepts a local
+Scope-declaration JSON document; those declarations are signed intent only and
+do not prove a registered runtime Scope:
+
+```bash
+uv run --locked python aws_cost_name_tagger_v3.py batch-plan \
+  --cur /path/to/aws-resource-cost-detail.csv.gz \
+  --month 2026-10 --account 123456789012 --profile read-only \
+  --scope-declarations ./private-reports/scope-declarations.json \
+  --output ./private-reports/batch-plan.json
+```
+
+The Owner edits only the `approved` CSV column. `name_tag_controlled.py` exposes
+`prepare-batch`, `batch-dryrun`, and `verify-batch` for unsigned payload creation,
+row-level unsigned preview, and protected Owner signature verification. The
+verified report remains non-executing (`execution_allowed=false`).
+`batch-simulate` is synthetic-only: it creates a new, isolated fixture Ledger,
+refuses an existing Ledger path, uses only the in-memory fake adapter, and marks
+its report `execution_allowed=false`. It never opens the host-bound Ledger or
+contacts AWS/STS. No Batch command enables AWS writes or lifts the Safety Hold.
+
 Example payload preparation:
 
 ```bash
@@ -91,7 +118,12 @@ uv run --locked --no-build python -m unittest -q \
   test_name_tag_approval test_name_tag_review test_name_tag_scope \
   test_name_tag_ledger test_name_tag_execution test_name_tag_adapters \
   test_name_tag_controlled test_name_tag_ledger_anchor test_name_tag_ledger_provision \
-  test_name_tag_ledger_open test_name_tag_ledger_cli test_aws_cost_name_tagger_v3
+  test_name_tag_ledger_open test_name_tag_ledger_cli \
+  test_name_tag_batch_population test_name_tag_batch_state test_name_tag_batch_approval \
+  test_name_tag_batch_trust test_name_tag_batch_ledger test_name_tag_batch_iam \
+  test_name_tag_batch_executor test_name_tag_batch_report test_name_tag_batch_cli \
+  test_name_tag_batch_migration \
+  test_aws_cost_name_tagger_v3
 ```
 
 The test suite is offline and uses temporary OpenSSH keys, a local SQLite ledger, and fake adapters.
