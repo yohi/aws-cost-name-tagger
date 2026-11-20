@@ -205,8 +205,8 @@
     },
     {
       "path": "name_tag_batch_cli.py",
-      "sha256": "c4dddf0fe74ca22404821e20c97cda8c625d0ec5127376ebe66ce994050cf830",
-      "bytes": 13286
+      "sha256": "8de6439d534f534dd7aa72dda602e106e53e97f0ca9e829c059bce7897b0a823",
+      "bytes": 13430
     },
     {
       "path": "name_tag_batch_credentials.py",
@@ -220,8 +220,8 @@
     },
     {
       "path": "name_tag_batch_executor.py",
-      "sha256": "07e2bfc9122503743e7c5bd8a987129bb6f2cec8631524ec7c8d5478d2796f57",
-      "bytes": 10539
+      "sha256": "7526eaec9c0620c0c4665df57e29f566b3450c06ce084a9c1d6db3f58142fe24",
+      "bytes": 10890
     },
     {
       "path": "name_tag_batch_iam.py",
@@ -300,8 +300,8 @@
     },
     {
       "path": "test_name_tag_batch_migration.py",
-      "sha256": "167c619b2d01046b82aaa7b0d465f17760a494557e17c7f239f022fd9c7c731b",
-      "bytes": 36804
+      "sha256": "2fb5b8366cfdaa4c5f02232ba4b53c4821a89023b8656813732eb67fe0f94703",
+      "bytes": 36924
     },
     {
       "path": "test_name_tag_batch_population.py",
