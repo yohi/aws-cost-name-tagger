@@ -7,7 +7,7 @@ from name_tag_batch_approval import VerifiedBatchApproval
 
 class ReportTests(unittest.TestCase):
     def setUp(self):
-        row={'proposal_id':'p','kind':'volume','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890','locator':'vol-abcdef1234567890','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'Name-1','effective_usage_cost_usd':'1','evidence':'from metadata'}
+        row={'proposal_id':'p','kind':'volume','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901','locator':'vol-abcdef12345678901','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'app-prod-ebs-xvda-5678901','effective_usage_cost_usd':'1','evidence':'EBS vol-abcdef12345678901 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)'}
         p={'schema_version':3,'account':'123456789012','partition':'aws','count':1,'records':[row],'execution_limits':{'max_send_attempts':1},'scope_declarations':[{'writer_control_scope_id':'scope','account':'123456789012','partition':'aws','region':'ap-northeast-1','resource_arns':[row['resource_arn']]}], 'cur_population':{'schema_version':2,'accounting_complete':True,'cur_recognized':{'count':1,'cost_usd':'1'},'below_min_cost':{'count':0,'cost_usd':'0'},'above_min_cost':{'count':1,'cost_usd':'1'},'lookup_selected':{'count':1,'cost_usd':'1'},'max_resources_not_inspected':{'count':0,'cost_usd':'0'},'outside_requested_kinds':{'known':True,'billing_rows':0,'cost_usd':'0'},'unsupported_kind':{'known':True,'billing_rows':0,'cost_usd':'0'},'unattributable_cur':{'known':True,'billing_rows':0,'cost_usd':'0'}}}
         self.pb=json.dumps(p).encode();self.cb=build_batch_review_projection(self.pb)
     def test_dryrun_is_unsigned_and_no_sdk_or_ledger(self):
@@ -17,8 +17,8 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(out['coverage_complete'])
         self.assertFalse(out['writes_complete'])
         self.assertEqual(out['rows'][0]['resource_arn'],
-                         'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890')
-        self.assertEqual(out['rows'][0]['proposed_name'],'Name-1')
+                         'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901')
+        self.assertEqual(out['rows'][0]['proposed_name'],'app-prod-ebs-xvda-5678901')
         self.assertEqual(out['rows'][0]['outcome'],'UNAPPROVED')
         self.assertFalse(out['rows'][0]['execution_allowed'])
     def test_scope_declaration_is_not_reported_as_host_verified_scope(self):
@@ -92,7 +92,9 @@ class ReportTests(unittest.TestCase):
         for index,outcome in enumerate(outcomes):
             arn=f'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-{index:017x}'
             row=dict(original,proposal_id=f'p{index}',locator=f'vol-{index:017x}',
-                     resource_arn=arn,effective_usage_cost_usd=str(index+1))
+                     resource_arn=arn,effective_usage_cost_usd=str(index+1),
+                     proposed_name=f'app-prod-ebs-xvda-{index:017x}'[:18]+f'{index:017x}'[-7:],
+                     evidence=f'EBS vol-{index:017x} -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)')
             records.append(row)
             approved_cells.append(f'p{index}')
             scopes.append({'writer_control_scope_id':f'scope-{index}',
@@ -113,6 +115,8 @@ class ReportTests(unittest.TestCase):
                      effective_usage_cost_usd='8')
         no_scope=dict(original,proposal_id='p8',locator='vol-00000000000000008',
                       resource_arn='arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-00000000000000008',
+                      proposed_name='app-prod-ebs-xvda-0000008',
+                      evidence='EBS vol-00000000000000008 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)',
                       effective_usage_cost_usd='9')
         records.extend((unapproved,unsupported,no_name,no_scope))
         plan['records']=records

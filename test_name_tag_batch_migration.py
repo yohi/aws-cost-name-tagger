@@ -158,7 +158,7 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         region = "us-east-1"
         arns = [
             f"arn:aws:ec2:{region}:{account}:volume/vol-0123456789abcdef0",
-            f"arn:aws:ec2:{region}:{account}:volume/vol-abcdef0123456789",
+            f"arn:aws:ec2:{region}:{account}:volume/vol-abcdef01234567890",
         ]
         records = []
         for index, arn in enumerate(arns):
@@ -168,8 +168,8 @@ class BatchLedgerMigrationTests(unittest.TestCase):
                 "region": region, "resource_arn": arn, "aws_operation": "ec2:CreateTags",
                 "status": "proposed", "confidence": "high", "name_state": "ABSENT",
                 "name_key_present": False, "name_raw_value": None, "existing_name": "",
-                "proposed_name": f"web-prd-{index}", "effective_usage_cost_usd": "1",
-                "evidence": "offline evidence",
+                "proposed_name": f"web-prd-ebs-xvda-{locator[-7:]}", "effective_usage_cost_usd": "1",
+                "evidence": f"EBS {locator} -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=web-prd; Product(observed, not validated)=(unset)",
             })
         population = {
             "schema_version": 2, "accounting_complete": True,
@@ -589,6 +589,59 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(result.batch_state,'STOPPED')
         self.assertEqual(stored_state.state,'STOPPED')
 
+    def test_runtime_scope_evidence_must_match_signed_plan_or_fail_closed(self) -> None:
+        import dataclasses
+        from name_tag_batch_executor import (
+            BatchOfflineRuntime, BatchRuntimeEvidence, FakeBatchSDKAdapter,
+            execute_batch_offline,
+        )
+        decision=migration.verify_ledger_migration_decision(
+            self._envelope(),trust=self.trust,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+        with patch.object(migration_apply,"load_current_protected_owner_trust",return_value=self.trust):
+            migration.upgrade_ledger_v1_to_batch_v2(self.ledger_path,decision=decision)
+        plan_bytes,csv_bytes,envelope,signed_at=self._batch_inputs()
+        batch=verify_batch_approval(plan_bytes,csv_bytes,envelope,trust=self.trust,now_utc=signed_at)
+        arns=[row["resource_arn"] for row in batch.approved_rows]
+        past=datetime.now(timezone.utc)-timedelta(hours=1)
+        with closing(open_ledger(self.ledger_path,trusted_host=True,trust=self.trust)) as ledger:
+            scope,effects=self._initialize_batch_scope(ledger,arns)
+            mismatches={
+                "region":dataclasses.replace(scope,region="eu-west-1"),
+                "account":dataclasses.replace(scope,account="210987654321"),
+                "partition":dataclasses.replace(scope,partition="aws-cn"),
+                "arn_missing":dataclasses.replace(scope,controlled_arns=frozenset(arns[1:])),
+                "owner":dataclasses.replace(scope,responsible_owner="someone-else"),
+                "digest":dataclasses.replace(scope,writer_evidence_digest="not-a-digest"),
+                "expired":dataclasses.replace(scope,not_before_utc=past-timedelta(hours=1),not_after_utc=past),
+            }
+            # End-to-end: a self-consistent Ledger Scope does not prove the runtime
+            # evidence matches the signed Plan; the Batch stops before any write.
+            adapter=FakeBatchSDKAdapter({arn:{} for arn in arns})
+            runtime=BatchOfflineRuntime(
+                {"scope-1":BatchRuntimeEvidence(mismatches["region"],effects)},adapter)
+            with (
+                patch("name_tag_batch_trust.load_current_protected_owner_trust",return_value=self.trust),
+                patch("name_tag_batch_runtime.load_current_protected_owner_trust",return_value=self.trust),
+            ):
+                result=execute_batch_offline(
+                    batch,plan_bytes=plan_bytes,csv_bytes=csv_bytes,ledger=ledger,runtime=runtime)
+            self.assertEqual(adapter.write_calls,0)
+            self.assertEqual(result.batch_state,"STOPPED")
+            self.assertEqual(result.send_attempts_consumed,0)
+            from name_tag_batch_runtime import _evidence_for
+            from name_tag_ledger import LedgerError
+            for label,bad_scope in mismatches.items():
+                with self.subTest(f"direct-{label}"):
+                    runtime=BatchOfflineRuntime(
+                        {"scope-1":BatchRuntimeEvidence(bad_scope,effects)},
+                        FakeBatchSDKAdapter({}))
+                    with self.assertRaises(LedgerError):
+                        _evidence_for(batch,runtime,batch.approved_rows[0])
+            good=BatchOfflineRuntime({"scope-1":BatchRuntimeEvidence(scope,effects)},FakeBatchSDKAdapter({}))
+            for row in batch.approved_rows:
+                self.assertIs(_evidence_for(batch,good,row),good.evidence_by_scope["scope-1"])
+
     def test_fake_execution_skips_changed_name_and_sends_next_target_once(self) -> None:
         from name_tag_batch_executor import (
             BatchOfflineRuntime, BatchRuntimeEvidence, FakeBatchSDKAdapter,
@@ -826,7 +879,7 @@ class BatchLedgerMigrationTests(unittest.TestCase):
             with ledger._connection() as connection:
                 connection.execute(
                     "UPDATE batch_rows SET resource_arn=? WHERE batch_id=? AND row_index=?",
-                    ("arn:aws:ec2:us-east-1:123456789012:volume/vol-ffffffffffffffff",
+                    ("arn:aws:ec2:us-east-1:123456789012:volume/vol-fffffffffffffffff",
                      batch.batch_id,authority.row_index),
                 )
                 connection.commit()

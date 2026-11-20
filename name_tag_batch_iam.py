@@ -9,7 +9,7 @@ from hashlib import sha256
 from typing import Mapping
 import json, re
 from name_tag_batch_approval import VerifiedBatchApproval, _approved_tuples, canonical_bytes
-from name_tag_batch_state import validate_batch_draft
+from name_tag_batch_state import VOLUME_ID_PATTERN, validate_batch_draft
 
 class IAMPolicyBlocked(ValueError):pass
 
@@ -87,7 +87,7 @@ def _validate_policy_row(batch,row,kind_registry):
     if not all(isinstance(value,str) and value for value in (account,partition,region,arn)):
         raise IAMPolicyBlocked('Incomplete ARN scope')
     prefix=f'arn:{partition}:ec2:{region}:{account}:volume/'
-    if not arn.startswith(prefix) or not re.fullmatch(r'vol-[0-9a-f]{8,}',arn[len(prefix):]):
+    if not arn.startswith(prefix) or not re.fullmatch(VOLUME_ID_PATTERN,arn[len(prefix):],re.ASCII):
         raise IAMPolicyBlocked('Foreign or malformed volume ARN')
     if row.get('aws_operation')!=policy.write_action or not row.get('approved_name'):
         raise IAMPolicyBlocked('Operation/Name not authorized')

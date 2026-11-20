@@ -12,10 +12,10 @@ class PolicyTests(unittest.TestCase):
         self.plan=json.dumps({
             'schema_version':3,'account':'123456789012','partition':'aws',
             'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(count=2,cost='1.5'),'count':2,
-            'scope_declarations':[{'writer_control_scope_id':'s1','account':'123456789012','partition':'aws','region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890']}],
+            'scope_declarations':[{'writer_control_scope_id':'s1','account':'123456789012','partition':'aws','region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901']}],
             'records':[
-                {'proposal_id':'p0','kind':'volume','locator':'vol-0123456789abcdef0','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-0123456789abcdef0','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'Unused-Name','effective_usage_cost_usd':'0.75','evidence':'evidence-0'},
-                {'proposal_id':'p1','kind':'volume','locator':'vol-abcdef1234567890','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'Test-Name','effective_usage_cost_usd':'0.75','evidence':'evidence-1'}]}
+                {'proposal_id':'p0','kind':'volume','locator':'vol-0123456789abcdef0','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-0123456789abcdef0','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'app-prod-ebs-xvda-abcdef0','effective_usage_cost_usd':'0.75','evidence':'EBS vol-0123456789abcdef0 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)'},
+                {'proposal_id':'p1','kind':'volume','locator':'vol-abcdef12345678901','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'app-prod-ebs-xvda-5678901','effective_usage_cost_usd':'0.75','evidence':'EBS vol-abcdef12345678901 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)'}]}
         ).encode()
         self.csv=build_batch_review_projection(self.plan).replace(b',p1,',b'YES,p1,')
         draft=validate_batch_draft(self.plan,self.csv)
@@ -33,7 +33,7 @@ class PolicyTests(unittest.TestCase):
         spec=build_subset_session_policy(self.batch,(1,),kind_registry=self.kind)
         p=json.loads(spec.policy_bytes)
         self.assertEqual(len(p['Statement']),2)
-        self.assertEqual(p['Statement'][0]['Resource'],['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890'])
+        self.assertEqual(p['Statement'][0]['Resource'],['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901'])
         self.assertEqual(p['Statement'][0]['Condition']['ForAllValues:StringEquals']['aws:TagKeys'],['Name'])
         self.assertEqual(p['Statement'][1]['Resource'],'*')
         self.assertEqual(p['Statement'][1]['Action'],['ec2:DescribeVolumes'])

@@ -5,6 +5,7 @@ from typing import Literal
 import io, csv, json, re, hashlib
 
 CSV_COLUMNS=('approved','proposal_id','kind','locator','region','effective_usage_cost_usd','status','name_state','name_key_present','name_raw_value','existing_name','confidence','proposed_name','evidence')
+VOLUME_ID_PATTERN=r'vol-(?:[0-9a-f]{8}|[0-9a-f]{17})'
 _NAME_STATES=('ABSENT','EMPTY','WHITESPACE_ONLY','NONEMPTY','UNKNOWN')
 
 class BatchValidationError(ValueError):pass
@@ -101,7 +102,7 @@ def _valid_declared_arn(arn,scope):
             or not parts[5]):
         return False
     if parts[2]=='ec2' and parts[5].startswith('volume/'):
-        return re.fullmatch(r'volume/vol-[0-9a-f]{8,}',parts[5]) is not None
+        return re.fullmatch('volume/'+VOLUME_ID_PATTERN,parts[5],re.ASCII) is not None
     return True
 
 
@@ -165,7 +166,7 @@ def derive_declared_row_scope(plan:dict,row:dict)->str:
     if len(parts)!=6 or parts[:2]!=['arn',partition] or parts[3]!=region or parts[4]!=account:
         raise BatchValidationError('ARN/account/partition/region mismatch')
     if row.get('kind')=='volume':
-        match=re.fullmatch(r'volume/(vol-[0-9a-f]{8,})',parts[5]) if parts[2]=='ec2' else None
+        match=re.fullmatch('volume/('+VOLUME_ID_PATTERN+')',parts[5],re.ASCII) if parts[2]=='ec2' else None
         if match is None:
             raise BatchValidationError('Malformed volume ARN')
         if row.get('locator')!=match.group(1):
@@ -173,6 +174,22 @@ def derive_declared_row_scope(plan:dict,row:dict)->str:
     entries=[s for s in plan['scope_declarations'] if s['account']==account and s['partition']==partition and s['region']==region and arn in s['resource_arns']]
     if len(entries)!=1:raise BatchValidationError('No unique Scope declaration')
     return entries[0]['writer_control_scope_id']
+
+
+def _validate_name_eligibility(r,name):
+    """Re-check the v3 volume Name generation contract; never trust non-empty evidence alone."""
+    from aws_cost_name_tagger_v3 import meaningful
+    locator=r.get('locator')
+    if meaningful(name)!=name:
+        raise BatchValidationError('Proposed Name is not a meaningful generated Name')
+    evidence=r['evidence']
+    prefix=f'EBS {locator} -> attachment '
+    match=re.search(r'EC2 i-[0-9a-f]+ Name=(\S+?);',evidence) if evidence.startswith(prefix) else None
+    anchor=match.group(1) if match else None
+    if (anchor is None or meaningful(anchor)!=anchor
+            or not name.startswith(anchor+'-ebs-')
+            or not isinstance(locator,str) or not name.endswith('-'+locator[-7:])):
+        raise BatchValidationError('Evidence does not support the generated Name')
 
 
 def validate_approved_batch_row(p,r,approved:str):
@@ -186,6 +203,7 @@ def validate_approved_batch_row(p,r,approved:str):
     if not isinstance(name,str) or not name or len(name)>256 or name!=name.strip() or any(ord(c)<32 or ord(c)==127 for c in name):raise BatchValidationError('Invalid proposed Name')
     if not isinstance(r.get('proposal_id'),str) or not r['proposal_id'] or not isinstance(r.get('evidence'),str) or not r['evidence']:
         raise BatchValidationError('No proposal/evidence')
+    _validate_name_eligibility(r,name)
     if r.get('kind')!='volume' or r.get('aws_operation')!='ec2:CreateTags':
         raise BatchValidationError('Kind/API is not proven eligible')
     scope=derive_declared_row_scope(p,r)

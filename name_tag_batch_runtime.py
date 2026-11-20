@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+import json
+import re
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Final
@@ -29,7 +31,7 @@ from name_tag_batch_fake import (
     JsonValue,
 )
 from name_tag_ledger import BatchExecutionState, IntentLedger, LedgerError
-from name_tag_scope import SideEffectEvidence
+from name_tag_scope import ScopeEvidence, SideEffectEvidence
 
 
 _VOLUME_POLICY: Final = MappingProxyType({
@@ -38,15 +40,46 @@ _VOLUME_POLICY: Final = MappingProxyType({
 
 
 def _evidence_for(
-    runtime: BatchOfflineRuntime, row: Mapping[str, object]
+    batch: VerifiedBatchApproval,
+    runtime: BatchOfflineRuntime,
+    row: Mapping[str, object],
 ) -> BatchRuntimeEvidence:
+    """Bind runtime Scope evidence to the signed Plan row; fail closed on any doubt."""
     scope_id = row.get("writer_control_scope_id")
     if not isinstance(scope_id, str):
         raise LedgerError("BLOCKED_SCOPE_MISMATCH")
     evidence = runtime.evidence_by_scope.get(scope_id)
     if not isinstance(evidence, BatchRuntimeEvidence):
         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
-    if evidence.scope.writer_control_scope_id != scope_id:
+    scope = evidence.scope
+    try:
+        plan = json.loads(batch.plan_bytes)
+        account, partition = plan.get("account"), plan.get("partition")
+    except (ValueError, AttributeError):
+        raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from None
+    arn = row.get("resource_arn")
+    now = datetime.now(timezone.utc)
+    if (type(scope) is not ScopeEvidence
+            or not isinstance(arn, str) or not arn
+            or not isinstance(account, str) or not isinstance(partition, str)
+            or scope.writer_control_scope_id != scope_id
+            or scope.account != account
+            or scope.partition != partition
+            or scope.region != row.get("region")
+            or arn not in scope.controlled_arns
+            or scope.responsible_owner != batch.owner_principal_id
+            or re.fullmatch(r"[0-9a-f]{64}", scope.writer_evidence_digest) is None
+            or not scope.not_before_utc <= now <= scope.not_after_utc):
+        raise LedgerError("BLOCKED_SCOPE_MISMATCH")
+    effects = [e for e in evidence.side_effects
+               if isinstance(e, SideEffectEvidence) and e.target_arn == arn]
+    if (len(effects) != 1
+            or effects[0].iam_abac_resource_tag_assessment != "PASS"
+            or effects[0].iac_assessment != "PASS"
+            or effects[0].event_automation_assessment != "PASS"
+            or not effects[0].evidence_references
+            or any(not ref for ref in effects[0].evidence_references)
+            or not effects[0].not_before_utc <= now <= effects[0].not_after_utc):
         raise LedgerError("BLOCKED_SCOPE_MISMATCH")
     return evidence
 
@@ -85,7 +118,7 @@ def _record_cap_for_unclaimed(
             ledger.stop_batch(batch,reason_code="BLOCKED_OWNER_AUTHN")
             return True
         try:
-            evidence = _evidence_for(runtime, authority.row)
+            evidence = _evidence_for(batch, runtime, authority.row)
         except LedgerError as error:
             ledger.stop_batch(batch,reason_code=error.code)
             return True
@@ -112,7 +145,7 @@ def _execute_unclaimed_row(
         return True
     row = authority.row
     try:
-        evidence = _evidence_for(runtime, row)
+        evidence = _evidence_for(batch, runtime, row)
     except LedgerError as error:
         ledger.stop_batch(batch, reason_code=error.code)
         return True
@@ -155,6 +188,11 @@ def _execute_unclaimed_row(
             ledger.stop_batch(batch, reason_code=error.code)
             raise
         return False
+    try:
+        evidence = _evidence_for(batch, runtime, row)
+    except LedgerError as error:
+        ledger.stop_batch(batch, reason_code=error.code)
+        return True
     try:
         handle = ledger.create_batch_intent(
             authority, scope=evidence.scope, side_effects=evidence.side_effects

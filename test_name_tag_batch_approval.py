@@ -12,8 +12,8 @@ from name_tag_approval import EnrolledOwner, OwnerTrust
 class BatchApprovalTests(unittest.TestCase):
     def setUp(self):
         p={'schema_version':3,'account':'123456789012','partition':'aws', 'execution_limits':{'max_send_attempts':1},'cur_population':sample_population(cost='1.5'),'count':1,
-          'scope_declarations':[{'writer_control_scope_id':'scope-1','account':'123456789012','partition':'aws','region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890']}],
-          'records':[{'proposal_id':'pid','kind':'volume','locator':'vol-abcdef1234567890','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef1234567890','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'Test-Name','effective_usage_cost_usd':'1.5','evidence':'evidence'}]}
+          'scope_declarations':[{'writer_control_scope_id':'scope-1','account':'123456789012','partition':'aws','region':'ap-northeast-1','resource_arns':['arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901']}],
+          'records':[{'proposal_id':'pid','kind':'volume','locator':'vol-abcdef12345678901','region':'ap-northeast-1','resource_arn':'arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901','aws_operation':'ec2:CreateTags','status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'app-prod-ebs-xvda-5678901','effective_usage_cost_usd':'1.5','evidence':'EBS vol-abcdef12345678901 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)'}]}
         self.plan=json.dumps(p).encode();self.csv=build_batch_review_projection(self.plan).replace(b',pid,',b'YES,pid,')
         self.kw={'owner_principal_id':'owner','owner_key_fingerprint':'SHA256:key','authorized_role_arn':'arn:aws:iam::123456789012:role/batch','issued_at_utc':'2026-11-19T00:00:00Z','expires_at_utc':'2026-11-20T00:00:00Z','batch_nonce':'ab'*16}
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
@@ -108,7 +108,7 @@ class BatchApprovalTests(unittest.TestCase):
     def test_csv_change_after_signature_is_rejected(self):
         envelope=self._signed_envelope()
         now=datetime(2026,11,19,12,tzinfo=timezone.utc)
-        changed_csv=self.csv.replace(b'Test-Name',b'Other-Name')
+        changed_csv=self.csv.replace(b'app-prod-ebs-xvda-5678901',b'app-prod-ebs-xvda-0000000')
         with self.assertRaises(BatchAuthRejected):
             verify_batch_approval(self.plan,changed_csv,envelope,trust=self.trust,now_utc=now)
 
