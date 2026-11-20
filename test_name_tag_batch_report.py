@@ -154,4 +154,34 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report['outcome_reconciliation_total'],
                          {'count':9,'cost_usd':'45'})
 
+    def _plan_with_details(self,details,**classes):
+        plan=json.loads(self.pb)
+        plan['cur_population'].update(classes)
+        plan['cur_population_reason_details']=details
+        pb=json.dumps(plan).encode()
+        return pb,build_batch_review_projection(pb)
+
+    def test_reason_details_must_reconcile_with_cur_population_classes(self):
+        d=lambda rows,cost:{'billing_rows':rows,'cost_usd':cost}
+        known=lambda rows,cost:{'known':True,'billing_rows':rows,'cost_usd':cost}
+        ok_pb,ok_cb=self._plan_with_details(
+            {'UNSUPPORTED_KIND:a':d(1,'2'),'UNSUPPORTED_KIND:b':d(2,'-0.5')},
+            unsupported_kind=known(3,'1.5'))
+        self.assertEqual(build_batch_dry_run(ok_pb,ok_cb)['cur_population_reason_details']['UNSUPPORTED_KIND:a'],d(1,'2'))
+        zero_pb,zero_cb=self._plan_with_details({})
+        build_batch_dry_run(zero_pb,zero_cb)
+        bad=[
+            ({'UNSUPPORTED_KIND:a':d(2,'1')},{'unsupported_kind':known(3,'1')}),  # row mismatch
+            ({'UNSUPPORTED_KIND:a':d(3,'2')},{'unsupported_kind':known(3,'1')}),  # cost mismatch
+            ({},{'unsupported_kind':known(3,'1')}),                                # missing
+            ({'UNKNOWN_CLASS:a':d(0,'0')},{}),                                     # unknown class
+            ({'CUR_RECOGNIZED:a':d(0,'0')},{}),                                    # not a billing class
+            ({'UNSUPPORTED_KIND:a':d(-1,'1')},{'unsupported_kind':known(3,'1')}),  # negative rows
+            ({'UNSUPPORTED_KIND:a':d(1,'1.0')},{'unsupported_kind':known(1,'1')}), # non-canonical
+        ]
+        for details,classes in bad:
+            with self.subTest(details=details):
+                pb,cb=self._plan_with_details(details,**classes)
+                with self.assertRaises(ReportBlocked):build_batch_dry_run(pb,cb)
+
 if __name__=='__main__':unittest.main()

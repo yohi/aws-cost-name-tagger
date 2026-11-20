@@ -80,7 +80,7 @@ def _cost(s):
     return x
 
 
-def _validated_reason_details(plan):
+def _validated_reason_details(plan,population):
     details=plan.get('cur_population_reason_details',{})
     if type(details) is not dict:
         raise ReportBlocked('Malformed CUR classification reason details')
@@ -90,7 +90,25 @@ def _validated_reason_details(plan):
                 or type(value['billing_rows']) is not int or value['billing_rows']<0):
             raise ReportBlocked('Malformed CUR classification reason detail')
         _cost(value['cost_usd'])
+    if 'cur_population_reason_details' in plan:
+        _require_reason_details_reconcile(details,population)
     return details
+
+
+def _require_reason_details_reconcile(details,population):
+    from name_tag_batch_population import exact_add
+    for category in ('unattributable_cur','outside_requested_kinds','unsupported_kind'):
+        entries=[v for k,v in details.items() if k.partition(':')[0]==category.upper()]
+        total=population[category]
+        if not total['known']:
+            if entries:raise ReportBlocked('CUR reason details for unknown class')
+            continue
+        if (sum(v['billing_rows'] for v in entries)!=total['billing_rows']
+                or exact_add(_cost(v['cost_usd']) for v in entries)!=_cost(total['cost_usd'])):
+            raise ReportBlocked('CUR reason details mismatch class total')
+    classes={c.upper() for c in ('unattributable_cur','outside_requested_kinds','unsupported_kind')}
+    if any(k.partition(':')[0] not in classes for k in details):
+        raise ReportBlocked('Unknown CUR reason detail class')
 
 
 def _write_support(row):
@@ -159,7 +177,7 @@ def _report_row(row,row_index,plan):
 
 def _report(draft,authentication_state):
     c=validated_cur_population(draft.plan)
-    reason_details=_validated_reason_details(draft.plan)
+    reason_details=_validated_reason_details(draft.plan,c)
     coverage=bool(c['accounting_complete'] and c['max_resources_not_inspected']['count']==0 and all(c[k]['known'] for k in ('unattributable_cur','outside_requested_kinds','unsupported_kind')))
     rows=[]
     name_generation_unavailable=[]
