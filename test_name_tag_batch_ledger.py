@@ -77,4 +77,45 @@ class DurableFixtureTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(tables, [])
 
+    def test_admission_rejects_after_cap_without_creating_intent(self):
+        self.ledger.admit('batch-a',0,'scope-a','row-0')
+        self.ledger.consume('batch-a',0)
+        self.ledger.readback('batch-a',0,'APPLIED_VERIFIED')
+        with self.assertRaises(LedgerBlocked):
+            self.ledger.admit('batch-a',1,'scope-b','row-1')
+        self.assertIsNone(self.ledger.conn.execute(
+            'SELECT 1 FROM intents WHERE batch_id=? AND row_index=?',('batch-a',1)).fetchone())
+
+    def test_presend_skip_rejects_after_cap(self):
+        self.ledger.admit('batch-a',0,'scope-a','row-0')
+        self.ledger.consume('batch-a',0)
+        self.ledger.readback('batch-a',0,'APPLIED_VERIFIED')
+        with self.assertRaises(LedgerBlocked):
+            self.ledger.presend_skip('batch-a',1,'scope-b','row-1','SKIPPED_NAME_CHANGED')
+
+    def test_consume_rejects_unresolved_intent_in_another_batch_same_scope(self):
+        self.ledger.register('batch-b','nonce-b',max_send_attempts=1,row_count=1,scope_ids=['scope-a'])
+        self.ledger.admit('batch-b',0,'scope-a','row-b')
+        self.ledger.conn.execute(
+            "INSERT INTO intents VALUES(?,?,?,?,?)",
+            ('batch-a',0,'row-a','scope-a','SEND_ATTEMPT_CONSUMED'),
+        )
+        with self.assertRaises(LedgerBlocked):
+            self.ledger.consume('batch-b',0)
+
+    def test_admit_rejects_another_batch_admitted_intent_in_same_scope(self):
+        self.ledger.admit('batch-a',0,'scope-a','row-a')
+        self.ledger.register('batch-b','nonce-b',max_send_attempts=1,row_count=1,scope_ids=['scope-a'])
+        with self.assertRaises(LedgerBlocked):
+            self.ledger.admit('batch-b',0,'scope-a','row-b')
+
+    def test_reconcile_holds_all_scopes_before_stopping_related_batches(self):
+        self.ledger.register('batch-b','nonce-b',max_send_attempts=1,row_count=1,scope_ids=['scope-b'])
+        self.ledger.admit('batch-b',0,'scope-b','row-b')
+        self.ledger.consume('batch-b',0)
+        self.ledger.close()
+        self.ledger=OfflineFixtureBatchLedger.open_fixture(self.path)
+        self.assertEqual(self.ledger.state('batch-a'),'STOPPED')
+        self.assertEqual(self.ledger.state('batch-b'),'STOPPED')
+
 if __name__=='__main__':unittest.main()

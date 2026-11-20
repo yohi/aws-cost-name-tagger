@@ -43,10 +43,21 @@ def _write_new(path,bytes0):
     if path.exists() or path.is_symlink():raise ValueError('Refusing overwrite of existing output')
     flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|getattr(os,'O_CLOEXEC',0)
     fd=os.open(path,flags,0o600)
-    with os.fdopen(fd,'wb') as stream:
-        stream.write(bytes0)
-        stream.flush()
-        os.fsync(stream.fileno())
+    try:
+        with os.fdopen(fd,'wb') as stream:
+            stream.write(bytes0)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _validate_simulation_outputs(report_out:Path,ledger_path:Path)->None:
+    if report_out.exists() or report_out.is_symlink():
+        raise ValueError('Simulation report output already exists')
+    if os.path.abspath(report_out)==os.path.abspath(ledger_path):
+        raise ValueError('Simulation report output aliases the fixture Ledger')
 
 
 def _read_private(path):
@@ -248,6 +259,7 @@ def _run_command(args):
             now_utc=now)
         runtime=parse_offline_runtime(_read_private(args.runtime_evidence))
         validate_fixture_scope(batch,runtime)
+        _validate_simulation_outputs(args.report_out,args.ledger_path)
         result=simulate_on_fixture_ledger(
             batch.batch_id,batch.payload['batch_nonce'],batch.approved_rows,
             ledger_path=args.ledger_path,adapter=runtime.adapter,
@@ -257,6 +269,7 @@ def _run_command(args):
         report=reconcile_batch_outcomes(
             report,dict(zip(batch.approved_row_indexes,result['outcomes'],strict=True)))
         report['batch_state']=result['batch_state']
+        report['stop_reason']=result['stop_reason']
         report['send_attempts_consumed']=result['send_attempts_consumed']
         report['max_send_attempts']=result['max_send_attempts']
         report['remaining_unattempted_cap']=result['remaining_unattempted_cap']

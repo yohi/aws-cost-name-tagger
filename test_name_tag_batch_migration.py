@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 import hashlib
 import json
 import os
 import sqlite3
+import shutil
 import subprocess
 import tempfile
 import unittest
 import uuid
-from contextlib import closing
+from contextlib import closing,contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +25,7 @@ from name_tag_approval import NAMESPACES, approval_digest
 from name_tag_batch_approval import (
     BATCH_NAMESPACE,
     canonical_bytes,
+    BatchAuthRejected,
     derive_batch_row_authority,
     prepare_batch_approval,
     verify_batch_approval,
@@ -128,14 +131,7 @@ class BatchLedgerMigrationTests(unittest.TestCase):
             "migration_nonce": "a1" * 16,
         }
         payload_bytes = canonical_bytes(payload)
-        message_path = self.root / "migration-payload.json"
-        message_path.write_bytes(payload_bytes)
-        subprocess.run(
-            ["ssh-keygen", "-Y", "sign", "-f", str(self.key_path),
-             "-n", migration.MIGRATION_NAMESPACE, str(message_path)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        signature = message_path.with_suffix(".json.sig").read_bytes()
+        signature = self._sign(self.key_path, payload_bytes, migration.MIGRATION_NAMESPACE)
         decision_id = hashlib.sha256(payload_bytes).hexdigest()
         return json.dumps({
             "payload": payload,
@@ -284,12 +280,71 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(version, "2")
         self.assertEqual(history, "existing-decision")
         self.assertEqual(batch_tables, 5)
+        with closing(sqlite3.connect(self.ledger_path)) as connection:
+            receipt=connection.execute(
+                "SELECT migration_nonce,ledger_instance_id FROM ledger_migration_receipts"
+            ).fetchone()
+        self.assertEqual(receipt,("a1"*16,self.anchor_identity.ledger_instance_id))
         with patch.object(migration_apply, "load_current_protected_owner_trust", return_value=self.trust):
             with self.assertRaises(migration.BatchMigrationRejected) as replay:
                 migration.upgrade_ledger_v1_to_batch_v2(
                     self.ledger_path,decision=decision
                 )
         self.assertEqual(replay.exception.code,"BLOCKED_AUTH_REPLAY")
+
+    def test_migration_rechecks_locked_file_identity_before_writing_marker(self) -> None:
+        decision=migration.verify_ledger_migration_decision(
+            self._envelope(),trust=self.trust,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+        original_lock=migration_apply.IntentLedger._lock
+        def replace_path_before_lock(ledger):
+            replacement=self.root/'replacement-ledger.db'
+            shutil.copy2(self.ledger_path,replacement)
+            os.replace(replacement,self.ledger_path)
+            original_lock(ledger)
+        with patch.object(migration_apply,"load_current_protected_owner_trust",return_value=self.trust), \
+             patch.object(migration_apply.IntentLedger,"_lock",replace_path_before_lock):
+            with self.assertRaises(LedgerError) as rejected:
+                migration.upgrade_ledger_v1_to_batch_v2(self.ledger_path,decision=decision)
+        self.assertEqual(rejected.exception.code,"BLOCKED_SCOPE_STATE_UNKNOWN")
+        with closing(sqlite3.connect(self.ledger_path)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM ledger_meta WHERE key='schema_version'"
+            ).fetchone(),('1',))
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM ledger_meta WHERE key LIKE 'migration_attempt:%'"
+            ).fetchone(),(0,))
+
+    def test_integrity_check_failure_rolls_back_schema_and_receipt_transaction(self) -> None:
+        decision=migration.verify_ledger_migration_decision(
+            self._envelope(),trust=self.trust,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+        original_connection=migration_apply.IntentLedger._connection
+        class IntegrityFailingConnection:
+            def __init__(self,connection):self.connection=connection
+            def execute(self,sql,*args):
+                if sql=='PRAGMA integrity_check':
+                    return type('Result',(),{'fetchone':lambda _self:('corrupt',)})()
+                return self.connection.execute(sql,*args)
+            @property
+            def in_transaction(self):return self.connection.in_transaction
+            def commit(self):return self.connection.commit()
+            def rollback(self):return self.connection.rollback()
+        @contextmanager
+        def connection_with_failed_integrity_check(ledger):
+            with original_connection(ledger) as connection:
+                yield IntegrityFailingConnection(connection)
+        with patch.object(migration_apply,"load_current_protected_owner_trust",return_value=self.trust), \
+             patch.object(migration_apply.IntentLedger,"_connection",connection_with_failed_integrity_check):
+            with self.assertRaises(LedgerError):
+                migration.upgrade_ledger_v1_to_batch_v2(self.ledger_path,decision=decision)
+        with closing(sqlite3.connect(self.ledger_path)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM ledger_meta WHERE key='schema_version'"
+            ).fetchone(),('1',))
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ledger_migration_receipts'"
+            ).fetchone(),(0,))
 
     def test_expired_or_wrong_role_migration_decision_is_rejected(self) -> None:
         expired = self._envelope(expires_in=timedelta(seconds=-1))
@@ -298,7 +353,6 @@ class BatchLedgerMigrationTests(unittest.TestCase):
                 expired, trust=self.trust,
                 now_utc=datetime.now(timezone.utc).replace(microsecond=0),
             )
-
         wrong_role = OwnerTrust.from_allowed_signers(
             self.allowed_signers,
             pinned_sha256=hashlib.sha256(self.allowed_signers.read_bytes()).hexdigest(),
@@ -312,6 +366,30 @@ class BatchLedgerMigrationTests(unittest.TestCase):
                 self._envelope(), trust=wrong_role,
                 now_utc=datetime.now(timezone.utc).replace(microsecond=0),
             )
+
+    def test_exact_expiry_boundary_is_rejected_as_expired(self) -> None:
+        envelope=self._envelope(expires_in=timedelta(hours=1))
+        expires=migration._timestamp(json.loads(envelope)["payload"]["expires_at_utc"])
+        with self.assertRaises(migration.BatchMigrationRejected):
+            migration.verify_ledger_migration_decision(
+                envelope,trust=self.trust,now_utc=expires)
+
+    def test_signed_payload_unicode_encoding_error_is_a_migration_rejection(self) -> None:
+        with patch.object(migration,"canonical_bytes",side_effect=UnicodeEncodeError(
+                'utf-8','\ud800',0,1,'surrogate')):
+            with self.assertRaises(migration.BatchMigrationRejected):
+                migration.verify_ledger_migration_decision(
+                    self._envelope(),trust=self.trust,
+                    now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+
+    def test_schema_metadata_ledger_error_is_normalized_but_replay_is_preserved(self) -> None:
+        envelope=self._envelope()
+        with patch.object(migration,"_ledger_metadata_value",
+                          side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")):
+            with self.assertRaises(migration.BatchMigrationRejected):
+                migration.verify_ledger_migration_decision(
+                    envelope,trust=self.trust,
+                    now_utc=datetime.now(timezone.utc).replace(microsecond=0))
 
     def test_real_ledger_batch_intent_and_send_cap_survive_restart(self) -> None:
         migration_decision = migration.verify_ledger_migration_decision(
@@ -370,10 +448,42 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(state.send_attempts_consumed,1)
         self.assertEqual(state.max_send_attempts,1)
         self.assertEqual(state.outcomes,("APPLIED_VERIFIED","NOT_ATTEMPTED_CAP"))
+        altered=replace(batch,approved_row_indexes=(1,0),
+                        approved_rows=tuple(reversed(batch.approved_rows)))
+        with patch("name_tag_batch_trust.load_current_protected_owner_trust",
+                   side_effect=BatchAuthRejected()):
+            recovered=ledger.batch_execution_state(altered)
+        self.assertEqual(recovered.outcomes,("APPLIED_VERIFIED","NOT_ATTEMPTED_CAP"))
         ledger.close()
         with closing(open_ledger(self.ledger_path, trusted_host=True, trust=self.trust)) as reopened:
             with patch("name_tag_batch_trust.load_current_protected_owner_trust", return_value=self.trust):
                 self.assertEqual(reopened.batch_execution_state(batch).state,"COMPLETED")
+
+    def test_send_authority_expiring_under_lock_is_not_consumed(self) -> None:
+        migration_decision=migration.verify_ledger_migration_decision(
+            self._envelope(),trust=self.trust,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+        with patch.object(migration_apply,"load_current_protected_owner_trust",return_value=self.trust):
+            migration.upgrade_ledger_v1_to_batch_v2(self.ledger_path,decision=migration_decision)
+        plan_bytes,csv_bytes,envelope,signed_at=self._batch_inputs()
+        batch=verify_batch_approval(plan_bytes,csv_bytes,envelope,trust=self.trust,now_utc=signed_at)
+        arn=batch.approved_rows[0]["resource_arn"]
+        with closing(open_ledger(self.ledger_path,trusted_host=True,trust=self.trust)) as ledger:
+            scope,effects=self._initialize_batch_scope(ledger,[arn])
+            authority=derive_batch_row_authority(
+                batch,batch.approved_row_indexes[0],trust=self.trust,now_utc=signed_at)
+            with patch("name_tag_batch_trust.load_current_protected_owner_trust",return_value=self.trust):
+                handle=ledger.create_batch_intent(authority,scope=scope,side_effects=effects)
+            expiry=datetime.fromisoformat(batch.payload['expires_at_utc'].replace('Z','+00:00'))
+            with patch.object(ledger,"_now",side_effect=[signed_at,expiry]):
+                with self.assertRaises(LedgerError) as rejected:
+                    ledger.consume_first_send(handle)
+            self.assertEqual(rejected.exception.code,'BLOCKED_OWNER_AUTHN')
+            with ledger._connection() as connection:
+                state=connection.execute('SELECT state FROM intents WHERE intent_id=?',(handle.intent_id,)).fetchone()
+                counter=connection.execute('SELECT send_attempts_consumed FROM batch_registry WHERE batch_id=?',(batch.batch_id,)).fetchone()
+            self.assertEqual(state,('WRITE_INTENT_RECORDED',))
+            self.assertEqual(counter,(0,))
 
     def test_unknown_batch_readback_stops_batch_and_holds_scope(self) -> None:
         migration_decision = migration.verify_ledger_migration_decision(
@@ -444,6 +554,41 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(result.report["outcome_reconciliation_total"],
                          {"count":2,"cost_usd":"2"})
 
+    def test_missing_scope_evidence_at_cap_stops_and_reports_unattempted_row(self) -> None:
+        from name_tag_batch_executor import (
+            BatchOfflineRuntime, BatchRuntimeEvidence, FakeBatchSDKAdapter,
+            execute_batch_offline,
+        )
+        decision=migration.verify_ledger_migration_decision(
+            self._envelope(),trust=self.trust,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+        with patch.object(migration_apply,"load_current_protected_owner_trust",return_value=self.trust):
+            migration.upgrade_ledger_v1_to_batch_v2(self.ledger_path,decision=decision)
+        plan_bytes,csv_bytes,envelope,signed_at=self._batch_inputs()
+        batch=verify_batch_approval(plan_bytes,csv_bytes,envelope,trust=self.trust,now_utc=signed_at)
+        arns=[row['resource_arn'] for row in batch.approved_rows]
+        with closing(open_ledger(self.ledger_path,trusted_host=True,trust=self.trust)) as ledger:
+            scope,effects=self._initialize_batch_scope(ledger,arns)
+            evidence={'scope-1':BatchRuntimeEvidence(scope,effects)}
+            adapter=FakeBatchSDKAdapter({arn:{} for arn in arns})
+            write_once=adapter.write_once
+            def write_then_remove_scope(arn,name,*,session=None):
+                write_once(arn,name,session=session)
+                evidence.clear()
+            adapter.write_once=write_then_remove_scope
+            runtime=BatchOfflineRuntime(evidence,adapter)
+            with (
+                patch('name_tag_batch_trust.load_current_protected_owner_trust',return_value=self.trust),
+                patch('name_tag_batch_runtime.load_current_protected_owner_trust',return_value=self.trust),
+            ):
+                result=execute_batch_offline(batch,plan_bytes=plan_bytes,csv_bytes=csv_bytes,
+                                             ledger=ledger,runtime=runtime)
+            stored_state=ledger.batch_execution_state(batch)
+        self.assertEqual(adapter.write_calls,1)
+        self.assertEqual(result.outcomes,('APPLIED_VERIFIED','NOT_ATTEMPTED_BATCH_STOP'))
+        self.assertEqual(result.batch_state,'STOPPED')
+        self.assertEqual(stored_state.state,'STOPPED')
+
     def test_fake_execution_skips_changed_name_and_sends_next_target_once(self) -> None:
         from name_tag_batch_executor import (
             BatchOfflineRuntime, BatchRuntimeEvidence, FakeBatchSDKAdapter,
@@ -505,6 +650,45 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(result.outcomes,("OUTCOME_UNKNOWN","NOT_ATTEMPTED_BATCH_STOP"))
         self.assertEqual(result.batch_state,"STOPPED")
         self.assertEqual(scope_state,"HOLD")
+
+    def test_second_execution_does_not_stop_a_batch_with_an_unresolved_send_owner(self) -> None:
+        from name_tag_batch_executor import (
+            BatchOfflineRuntime, BatchRuntimeEvidence, FakeBatchSDKAdapter,
+            execute_batch_offline,
+        )
+        decision=migration.verify_ledger_migration_decision(
+            self._envelope(),trust=self.trust,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0))
+        with patch.object(migration_apply,"load_current_protected_owner_trust",return_value=self.trust):
+            migration.upgrade_ledger_v1_to_batch_v2(self.ledger_path,decision=decision)
+        plan_bytes,csv_bytes,envelope,signed_at=self._batch_inputs()
+        batch=verify_batch_approval(plan_bytes,csv_bytes,envelope,trust=self.trust,now_utc=signed_at)
+        arns=[row['resource_arn'] for row in batch.approved_rows]
+        with closing(open_ledger(self.ledger_path,trusted_host=True,trust=self.trust)) as owner_ledger:
+            scope,effects=self._initialize_batch_scope(owner_ledger,arns)
+            authority=derive_batch_row_authority(
+                batch,batch.approved_row_indexes[0],trust=self.trust,now_utc=signed_at)
+            with patch('name_tag_batch_trust.load_current_protected_owner_trust',return_value=self.trust):
+                handle=owner_ledger.create_batch_intent(authority,scope=scope,side_effects=effects)
+                owner_ledger.consume_first_send(handle)
+            self.assertTrue(owner_ledger.batch_intent_owned_by_current_execution(
+                batch,authority.row_index))
+            with closing(open_ledger(self.ledger_path,trusted_host=True,trust=self.trust)) as ledger:
+                self.assertFalse(ledger.batch_intent_owned_by_current_execution(
+                    batch,authority.row_index))
+                adapter=FakeBatchSDKAdapter({arn:{} for arn in arns})
+                runtime=BatchOfflineRuntime({'scope-1':BatchRuntimeEvidence(scope,effects)},adapter)
+                with (
+                    patch('name_tag_batch_trust.load_current_protected_owner_trust',return_value=self.trust),
+                    patch('name_tag_batch_runtime.load_current_protected_owner_trust',return_value=self.trust),
+                ):
+                    result=execute_batch_offline(batch,plan_bytes=plan_bytes,csv_bytes=csv_bytes,
+                                                 ledger=ledger,runtime=runtime)
+                self.assertEqual(ledger.batch_execution_state(batch).state,'ACTIVE')
+        self.assertEqual(adapter.write_calls,0)
+        self.assertEqual(result.outcomes,('OUTCOME_UNKNOWN','NOT_ATTEMPTED_BATCH_STOP'))
+        self.assertEqual(result.batch_state,'ACTIVE')
+        self.assertEqual(result.report['unresolved_send_owner'],'OTHER_EXECUTION')
 
     def test_controlled_cli_runs_only_the_injected_fake_adapter(self) -> None:
         import io
@@ -690,7 +874,7 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         self.assertEqual(intents,0)
         self.assertEqual(result.send_attempts_consumed,0)
 
-    def test_unknown_presend_name_stops_batch_without_intent_or_skip(self) -> None:
+    def test_explicit_stop_marks_rows_unattempted_without_intent_or_skip(self) -> None:
         migration_decision=migration.verify_ledger_migration_decision(
             self._envelope(),trust=self.trust,
             now_utc=datetime.now(timezone.utc).replace(microsecond=0))

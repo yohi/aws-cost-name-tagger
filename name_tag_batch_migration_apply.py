@@ -68,7 +68,9 @@ def upgrade_ledger_v1_to_batch_v2(
         allowed_attempt_decision=None,
     )
     if (resolved_path != path.resolve(strict=True) or decision_id != decision.decision_id
-            or decision.ledger_path != resolved_path):
+            or decision.ledger_path != resolved_path
+            or decision.migration_nonce != payload["migration_nonce"]
+            or decision.ledger_instance_id != payload["ledger_instance_id"]):
         raise BatchMigrationRejected()
     host_binding = payload["host_binding"]
     ledger = IntentLedger(
@@ -76,9 +78,22 @@ def upgrade_ledger_v1_to_batch_v2(
         host_binding=host_binding, execution_id=uuid.uuid4().hex,
         _constructor_token=_LEDGER_CONSTRUCTOR_SENTINEL,
     )
-    marker = f"migration_attempt:{decision.migration_nonce}"
+    marker = f"migration_attempt:{payload['migration_nonce']}"
     ledger._lock()
     try:
+        lock_fd = ledger._lock_fd
+        if lock_fd is None:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        try:
+            locked_identity = os.fstat(lock_fd)
+            path_identity = resolved_path.stat(follow_symlinks=False)
+        except OSError as error:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from error
+        if ((locked_identity.st_dev, locked_identity.st_ino)
+                != (path_identity.st_dev, path_identity.st_ino)
+                or (locked_identity.st_dev, locked_identity.st_ino)
+                != (payload["ledger_device"], payload["ledger_inode"])):
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
         with ledger._connection() as connection:
             if _ledger_metadata_value(connection, "schema_version") != "1":
                 raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
@@ -89,9 +104,6 @@ def upgrade_ledger_v1_to_batch_v2(
                 "INSERT INTO ledger_meta(key,value) VALUES(?,?)", (marker, decision_id)
             )
             connection.commit()
-            lock_fd = ledger._lock_fd
-            if lock_fd is None:
-                raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
             os.fsync(lock_fd)
             latest_trust = load_current_protected_owner_trust()
             _verify_payload(
@@ -105,7 +117,7 @@ def upgrade_ledger_v1_to_batch_v2(
             timestamp = datetime.now(timezone.utc).isoformat()
             connection.execute(
                 "INSERT INTO ledger_migration_receipts VALUES(?,?,?,?)",
-                (decision_id, decision.migration_nonce, decision.ledger_instance_id, timestamp),
+                (decision_id, payload["migration_nonce"], payload["ledger_instance_id"], timestamp),
             )
             connection.execute(
                 "UPDATE ledger_meta SET value=? WHERE key=?",
@@ -114,10 +126,10 @@ def upgrade_ledger_v1_to_batch_v2(
             connection.execute(
                 "UPDATE ledger_meta SET value='2' WHERE key='schema_version'"
             )
-            connection.commit()
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             if integrity != ("ok",):
                 raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+            connection.commit()
             os.fsync(lock_fd)
     except sqlite3.Error as error:
         raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from error

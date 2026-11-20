@@ -1,11 +1,56 @@
 import unittest, tempfile, json, pathlib, os, io, contextlib
 import stat
-from name_tag_batch_cli import main, parse_offline_runtime
+from types import SimpleNamespace
+from unittest.mock import patch
+from name_tag_batch_cli import main, parse_offline_runtime, _write_new, _validate_simulation_outputs
 from name_tag_batch_state import build_batch_review_projection
 from name_tag_batch_executor import InMemoryNameAdapter,simulate_on_fixture_ledger
 from name_tag_batch_ledger import LedgerBlocked
 
 class CliTests(unittest.TestCase):
+    def test_output_write_failure_removes_only_new_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output=pathlib.Path(directory)/'report.json'
+            with patch('name_tag_batch_cli.os.fsync',side_effect=OSError('fsync failed')):
+                with self.assertRaisesRegex(OSError,'fsync failed'):
+                    _write_new(output,b'partial')
+            self.assertFalse(output.exists())
+
+    def test_simulation_output_preflight_rejects_collision_before_ledger_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory)
+            for name in ('plan.json','review.csv','envelope.json','runtime.json'):
+                (root/name).write_text('{}')
+                (root/name).chmod(0o600)
+            (root/'report.json').write_text('existing')
+            (root/'report.json').chmod(0o600)
+            prior=pathlib.Path.cwd()
+            os.chdir(root)
+            try:
+                with (
+                    patch('name_tag_batch_cli.load_current_protected_owner_trust',return_value=object()),
+                    patch('name_tag_batch_cli.verify_batch_approval',return_value=SimpleNamespace(
+                        batch_id='b',payload={'batch_nonce':'n'},approved_rows=[])),
+                    patch('name_tag_batch_cli.parse_offline_runtime',return_value=SimpleNamespace(adapter=object())),
+                    patch('name_tag_batch_cli.validate_fixture_scope'),
+                    patch('name_tag_batch_cli.simulate_on_fixture_ledger') as simulate,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(main(['batch-simulate','--plan','plan.json','--review','review.csv',
+                        '--envelope','envelope.json','--runtime-evidence','runtime.json',
+                        '--ledger-path','fixture.db','--report-out','report.json']),2)
+                simulate.assert_not_called()
+            finally:
+                os.chdir(prior)
+            with self.assertRaises(ValueError):
+                _validate_simulation_outputs(root/'fixture.db',root/'fixture.db')
+
+    def test_simulation_output_preflight_rejects_ledger_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=pathlib.Path(directory)/'fixture.db'
+            with self.assertRaises(ValueError):
+                _validate_simulation_outputs(path,path)
+
     def test_simulation_refuses_existing_host_ledger_path(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger_path = pathlib.Path(directory) / 'host-ledger.db'

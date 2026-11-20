@@ -1,4 +1,4 @@
-import hashlib,json,unittest
+import gc,hashlib,json,unittest,weakref
 from types import MappingProxyType
 from name_tag_batch_iam import build_subset_session_policy, KindPolicy, IAMPolicyBlocked, SessionPolicySpec
 from name_tag_batch_credentials import OfflineFakeIssuer, CredentialBlocked
@@ -51,7 +51,7 @@ class PolicyTests(unittest.TestCase):
 
         with self.assertRaises(IAMPolicyBlocked):
             _validate_policy_row(self.batch,malformed,self.kind)
-    def test_unsupported_or_overlong_scope_fails(self):
+    def test_unregistered_kind_duplicate_index_and_out_of_range_index_fail(self):
         with self.assertRaises(IAMPolicyBlocked):build_subset_session_policy(self.batch,(1,),kind_registry={})
         with self.assertRaises(IAMPolicyBlocked):build_subset_session_policy(self.batch,(1,1),kind_registry=self.kind)
         with self.assertRaises(IAMPolicyBlocked):build_subset_session_policy(self.batch,(10,),kind_registry=self.kind)
@@ -88,6 +88,8 @@ class PolicyTests(unittest.TestCase):
         adapter=FakeBatchSDKAdapter({arn0:{}},require_session=True)
         # Same session binds read, write and readback for its own subset.
         adapter.read_current(arn0,session=session)
+        adapter.write_once(arn0,'Test-Name',session=session)
+        self.assertEqual(adapter.readback(arn0,session=session)['Name'],'Test-Name')
         # Missing session, equal-valued external copy, tampered policy: all refused.
         with self.assertRaises(CredentialBlocked):adapter.read_current(arn0)
         copy=IssuedBatchSession(session.batch_id,session.policy_bytes,session.policy_sha256,session.row_indexes,session.role_arn)
@@ -100,6 +102,19 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(CredentialBlocked):adapter2.write_once(other,'X',session=session)
         self.assertEqual(adapter2.write_calls,0)
         with self.assertRaises(CredentialBlocked):adapter2.readback(other)
+
+    def test_issued_sessions_are_weakly_retained_until_caller_releases_them(self):
+        import name_tag_batch_credentials as credentials
+        session=OfflineFakeIssuer().issue(
+            self.batch,build_subset_session_policy(self.batch,(1,),kind_registry=self.kind),
+            kind_registry=self.kind)
+        issued_id=id(session)
+        reference=weakref.ref(session)
+        self.assertIn(issued_id,credentials._ISSUED)
+        del session
+        gc.collect()
+        self.assertIsNone(reference())
+        self.assertNotIn(issued_id,credentials._ISSUED)
 
     def test_issuer_rejects_self_hashed_wildcard_policy(self):
         policy=b'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:CreateTags","Resource":"*"}]}'

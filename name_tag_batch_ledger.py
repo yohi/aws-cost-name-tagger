@@ -92,6 +92,16 @@ class OfflineFixtureBatchLedger:
         unresolved=self.conn.execute("SELECT COUNT(*) FROM intents WHERE scope_id IN (SELECT scope_id FROM batch_scopes WHERE batch_id=?) AND state='SEND_ATTEMPT_CONSUMED'",(id,)).fetchone()[0]
         if unresolved:raise LedgerBlocked('Covered Scope has an unresolved send attempt')
         return cap,used,size
+    def _other_pending_scope_intent(self,id,scope,*,row_index=None):
+        query="SELECT 1 FROM intents WHERE scope_id=? AND state IN ('ADMITTED','SEND_ATTEMPT_CONSUMED')"
+        parameters=[scope]
+        if row_index is not None:
+            query+=" AND NOT (batch_id=? AND row_index=?)"
+            parameters.extend((id,row_index))
+        else:
+            query+=" AND batch_id<>?"
+            parameters.append(id)
+        return self.conn.execute(query,parameters).fetchone() is not None
     def _claimed(self,id,index,authority):
         r=self.conn.execute('SELECT 1 FROM intents WHERE (batch_id=? AND row_index=?) OR row_authority_id=?',(id,index,authority)).fetchone()
         r2=self.conn.execute('SELECT 1 FROM batch_row_dispositions WHERE (batch_id=? AND row_index=?) OR row_authority_id=?',(id,index,authority)).fetchone()
@@ -108,15 +118,18 @@ class OfflineFixtureBatchLedger:
                 self.conn.execute('INSERT INTO batch_scopes VALUES (?,?)',(id,scope))
     def admit(self,id,index,scope,authority):
         with self._tx():
-            _,_,size=self._safe(id)
+            cap,used,size=self._safe(id)
+            if used>=cap:raise LedgerBlocked('Cap reached')
             if not 0<=index<size or not self.conn.execute('SELECT 1 FROM batch_scopes WHERE batch_id=? AND scope_id=?',(id,scope)).fetchone():raise LedgerBlocked('Invalid row/scope')
+            if self._other_pending_scope_intent(id,scope):raise LedgerBlocked('Another Batch has an incomplete Scope Intent')
             self._claimed(id,index,authority)
             self.conn.execute('INSERT INTO intents VALUES(?,?,?,?,?)',(id,index,authority,scope,'ADMITTED'))
     def presend_skip(self,id,index,scope,authority,decision):
         if decision not in ('SKIPPED_NAME_CHANGED','SKIPPED_IAM_UNSUPPORTED'):
             raise LedgerBlocked('Invalid skip')
         with self._tx():
-            _,_,size=self._safe(id)
+            cap,used,size=self._safe(id)
+            if used>=cap:raise LedgerBlocked('Cap reached')
             if not 0<=index<size or not self.conn.execute('SELECT 1 FROM batch_scopes WHERE batch_id=? AND scope_id=?',(id,scope)).fetchone():raise LedgerBlocked('Invalid row/scope')
             self._claimed(id,index,authority)
             self.conn.execute('INSERT INTO batch_row_dispositions VALUES (?,?,?,?)',(id,index,authority,decision))
@@ -127,6 +140,8 @@ class OfflineFixtureBatchLedger:
             if self.conn.execute("SELECT COUNT(*) FROM batch_scopes bs JOIN scopes s USING(scope_id) WHERE bs.batch_id=? AND s.state!='CLEARED'",(id,)).fetchone()[0]:raise LedgerBlocked('Scope HOLD')
             r=self.conn.execute('SELECT state FROM intents WHERE batch_id=? AND row_index=?',(id,index)).fetchone()
             if r!=('ADMITTED',):raise LedgerBlocked('No fresh admitted Intent')
+            scope=self.conn.execute('SELECT scope_id FROM intents WHERE batch_id=? AND row_index=?',(id,index)).fetchone()[0]
+            if self._other_pending_scope_intent(id,scope,row_index=index):raise LedgerBlocked('Another Intent has an incomplete Scope operation')
             self.conn.execute("UPDATE intents SET state='SEND_ATTEMPT_CONSUMED' WHERE batch_id=? AND row_index=?",(id,index))
             self.conn.execute('UPDATE batch_registry SET send_attempts_consumed=send_attempts_consumed+1 WHERE batch_id=?',(id,))
             self.conn.execute('INSERT INTO batch_events(batch_id,event) VALUES (?,?)',(id,'SEND_ATTEMPT_CONSUMED'))
@@ -182,13 +197,13 @@ class OfflineFixtureBatchLedger:
     def _reconcile(self):
         with self._tx():
             if self.conn.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise LedgerBlocked('SQLite corrupt')
+            unresolved_scopes=self.conn.execute("SELECT DISTINCT scope_id FROM intents WHERE state='SEND_ATTEMPT_CONSUMED'").fetchall()
+            for (scope_id,) in unresolved_scopes:
+                self.conn.execute(_HOLD_SCOPE_SQL,(scope_id,))
             for (id,stored,state) in self.conn.execute('SELECT batch_id,send_attempts_consumed,state FROM batch_registry'):
                 counted=self.conn.execute("SELECT COUNT(*) FROM intents WHERE batch_id=? AND state IN ('SEND_ATTEMPT_CONSUMED','APPLIED_VERIFIED','OUTCOME_UNKNOWN')",(id,)).fetchone()[0]
                 if counted!=stored:raise LedgerBlocked('Counter/history mismatch')
                 dangling=self.conn.execute("SELECT COUNT(*) FROM intents WHERE batch_id=? AND state IN ('ADMITTED','SEND_ATTEMPT_CONSUMED')",(id,)).fetchone()[0]
-                unresolved_scopes=self.conn.execute("SELECT DISTINCT scope_id FROM intents WHERE batch_id=? AND state='SEND_ATTEMPT_CONSUMED'",(id,)).fetchall()
-                for (scope_id,) in unresolved_scopes:
-                    self.conn.execute(_HOLD_SCOPE_SQL,(scope_id,))
                 held=self.conn.execute("SELECT COUNT(*) FROM batch_scopes b JOIN scopes s USING(scope_id) WHERE b.batch_id=? AND s.state='HOLD'",(id,)).fetchone()[0]
                 if state=='ACTIVE' and (dangling or held):
                     self.conn.execute("UPDATE batch_registry SET state='STOPPED',stop_reason='CRASH_OR_SCOPE_HOLD',stopped_at_utc='fixture' WHERE batch_id=?",(id,))

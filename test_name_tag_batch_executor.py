@@ -38,6 +38,32 @@ class ExecutorFixtureTests(unittest.TestCase):
             result=simulate_untrusted_fixture('batch-stop','nonce-stop',self.rows,ledger=self.ledger,adapter=a,cap=2)
         self.assertEqual(result['outcomes'],['NOT_ATTEMPTED_BATCH_STOP','NOT_ATTEMPTED_BATCH_STOP'])
         self.assertEqual(a.write_calls,0)
+
+    def test_unknown_presend_name_is_reported_as_stopped_row_outcome(self):
+        adapter=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
+        adapter.read_current=lambda _arn:None
+        result=simulate_untrusted_fixture('batch-unknown-name','nonce-unknown-name',self.rows,
+            ledger=self.ledger,adapter=adapter,cap=2)
+        self.assertEqual(result['outcomes'],['NOT_ATTEMPTED_BATCH_STOP','NOT_ATTEMPTED_BATCH_STOP'])
+        self.assertEqual(self.ledger.state('batch-unknown-name'),'STOPPED')
+        self.assertEqual(self.ledger.conn.execute(
+            "SELECT stop_reason FROM batch_registry WHERE batch_id='batch-unknown-name'"
+        ).fetchone(),('BLOCKED_NAME_UNKNOWN',))
+        self.assertEqual(result['stop_reason'],'BLOCKED_NAME_UNKNOWN')
+
+    def test_state_read_failure_in_loop_still_returns_batch_stop_outcomes(self):
+        original_state=self.ledger.state
+        calls=[0]
+        def fail_first_read(batch_id):
+            calls[0]+=1
+            if calls[0]==1:
+                raise sqlite3.OperationalError('temporary state read failure')
+            return original_state(batch_id)
+        with patch.object(self.ledger,'state',side_effect=fail_first_read):
+            result=simulate_untrusted_fixture('batch-state-read-failure','nonce-state-read-failure',self.rows,
+                ledger=self.ledger,adapter=InMemoryNameAdapter({'volume-1':{},'volume-2':{}}),cap=2)
+        self.assertEqual(result['outcomes'],['NOT_ATTEMPTED_BATCH_STOP','NOT_ATTEMPTED_BATCH_STOP'])
+        self.assertEqual(result['batch_state'],'STOPPED')
     def test_readback_ledger_failure_after_send_is_outcome_unknown(self):
         a=InMemoryNameAdapter({'volume-1':{},'volume-2':{}})
         with patch.object(self.ledger,'readback',side_effect=LedgerBlocked('fixture readback persistence failed')):
@@ -63,7 +89,7 @@ class ExecutorFixtureTests(unittest.TestCase):
         self.assertEqual(result['batch_state'],'ACTIVE')
 
         later=simulate_untrusted_fixture('batch-after-stop-write-failure','nonce-after-stop-write-failure',self.rows[:1],ledger=self.ledger,adapter=a,cap=1)
-        self.assertEqual(later['outcomes'],['BLOCKED_SCOPE_STATE_UNKNOWN'])
+        self.assertEqual(later['outcomes'],['NOT_ATTEMPTED_BATCH_STOP'])
         self.assertEqual(a.write_calls,1)
 
         self.ledger.close();self.ledger=OfflineFixtureBatchLedger.open_fixture(Path(self.t.name)/'fixture.sqlite')

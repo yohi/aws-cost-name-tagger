@@ -18,9 +18,10 @@ import sqlite3
 import stat
 import uuid
 from contextlib import closing, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final, Literal, cast
 from collections.abc import Mapping, Sequence
 
@@ -1201,6 +1202,24 @@ class IntentLedger:
                 or batch.payload.get("csv_sha256") != csv_sha256):
             raise LedgerError("BLOCKED_OWNER_AUTHN")
 
+    def _restore_batch_source_rows(self,batch:VerifiedBatchApproval)->VerifiedBatchApproval:
+        from name_tag_batch_approval import _approved_tuples
+        from name_tag_batch_state import BatchValidationError,validate_batch_draft
+
+        try:
+            draft=validate_batch_draft(batch.plan_bytes,batch.csv_bytes)
+            approved_tuples=_approved_tuples(draft)
+            approved_digest=hashlib.sha256(canonical_bytes(approved_tuples)).hexdigest()
+            if approved_digest!=batch.payload.get("approved_rows_sha256"):
+                raise LedgerError("BLOCKED_OWNER_AUTHN")
+            return replace(
+                batch,
+                approved_rows=tuple(MappingProxyType(dict(row)) for row in draft.approved_rows),
+                approved_row_indexes=tuple(row[0] for row in approved_tuples),
+            )
+        except (BatchValidationError,BatchAuthRejected,TypeError,ValueError,KeyError) as error:
+            raise LedgerError("BLOCKED_OWNER_AUTHN") from error
+
     def _expected_batch_row_identity(
         self, batch: VerifiedBatchApproval, row_index: int
     ) -> tuple[str,str,str,str,str,str]:
@@ -1230,7 +1249,6 @@ class IntentLedger:
         connection: sqlite3.Connection,
         batch: VerifiedBatchApproval,
         *,
-        timestamp: str,
         current_intent_id: str | None = None,
         require_clear_scopes: bool = True,
     ) -> tuple[str, str, str, int, tuple[str, ...]]:
@@ -1322,7 +1340,7 @@ class IntentLedger:
                     if fresh is None:
                         raise LedgerError("BLOCKED_OWNER_AUTHN")
                     self._register_batch_in_transaction(
-                        connection,fresh,timestamp=timestamp,require_clear_scopes=False
+                        connection,fresh,require_clear_scopes=False
                     )
                 elif (state[0]!=batch.payload.get("batch_nonce")
                         or state[1]!=batch.payload.get("plan_sha256")
@@ -1390,7 +1408,7 @@ class IntentLedger:
             with self._connection() as connection:
                 self._validate_ledger_state(connection)
                 connection.execute("BEGIN IMMEDIATE")
-                self._register_batch_in_transaction(connection,batch,timestamp=timestamp)
+                self._register_batch_in_transaction(connection,batch)
                 self._assert_scope_evidence(connection,scope,side_effects)
                 if self._effective_scope_state(connection,scope_id) != "CLEARED":
                     raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
@@ -1477,7 +1495,8 @@ class IntentLedger:
             raise LedgerError("BLOCKED_INPUT_INVALID")
         if (not isinstance(reason_code,str) or re.fullmatch(r"[A-Z0-9_]{1,64}",reason_code) is None
                 or (observed_name_sha256 is not None
-                    and re.fullmatch(_SHA256_HEX_PATTERN,observed_name_sha256) is None)
+                    and (not isinstance(observed_name_sha256,str)
+                         or re.fullmatch(_SHA256_HEX_PATTERN,observed_name_sha256) is None))
                 or (decision=="SKIPPED_NAME_CHANGED" and observed_name_sha256 is None)):
             raise LedgerError("BLOCKED_INPUT_INVALID")
 
@@ -1536,7 +1555,7 @@ class IntentLedger:
             with self._connection() as connection:
                 self._validate_ledger_state(connection)
                 connection.execute("BEGIN IMMEDIATE")
-                self._register_batch_in_transaction(connection,batch,timestamp=timestamp)
+                self._register_batch_in_transaction(connection,batch)
                 self._assert_scope_evidence(connection,scope,side_effects)
                 if self._effective_scope_state(connection,scope_id) != "CLEARED":
                     raise LedgerError("BLOCKED_SCOPE_HOLD")
@@ -1610,9 +1629,7 @@ class IntentLedger:
             with self._connection() as connection:
                 self._validate_ledger_state(connection)
                 connection.execute("BEGIN IMMEDIATE")
-                self._register_batch_in_transaction(
-                    connection,fresh_batch,timestamp=self._iso(self._now())
-                )
+                self._register_batch_in_transaction(connection,fresh_batch)
                 for authority in row_authorities:
                     self._assert_batch_row_complete(connection,fresh_batch,authority)
                 active=connection.execute(
@@ -1677,7 +1694,7 @@ class IntentLedger:
             fresh_batch=revalidate_verified_batch(batch,trust=trust,now_utc=self._now())
         except BatchAuthRejected:
             self._assert_batch_source_identity(batch)
-            fresh_batch=batch
+            fresh_batch=self._restore_batch_source_rows(batch)
             trust_valid=False
         self._lock()
         try:
@@ -1727,6 +1744,28 @@ class IntentLedger:
                     registry[3],registry[5],registry[4],
                     tuple(result_by_row[index] for index in fresh_batch.approved_row_indexes),
                 )
+        except sqlite3.Error as error:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from error
+        finally:
+            self._unlock()
+
+    def batch_intent_owned_by_current_execution(
+        self,batch:VerifiedBatchApproval,row_index:int
+    )->bool:
+        if type(batch) is not VerifiedBatchApproval or type(row_index) is not int:
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        self._assert_batch_source_identity(batch)
+        self._lock()
+        try:
+            with self._connection() as connection:
+                self._validate_ledger_state(connection)
+                row=connection.execute(
+                    "SELECT i.execution_id,i.state FROM batch_rows br "
+                    "JOIN intents i ON i.intent_id=br.intent_id "
+                    "WHERE br.batch_id=? AND br.row_index=?",
+                    (batch.batch_id,row_index),
+                ).fetchone()
+                return row is not None and row[1]=="SEND_ATTEMPT_CONSUMED" and row[0]==self._execution_id
         except sqlite3.Error as error:
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from error
         finally:
@@ -1876,7 +1915,7 @@ class IntentLedger:
         if tuple(record)!=expected or handle.batch_scope is None or handle.batch_side_effects is None:
             raise LedgerError("BLOCKED_INTENT_REPLAY")
         self._register_batch_in_transaction(
-            conn,batch,timestamp=self._iso(self._now()),current_intent_id=handle.intent_id
+            conn,batch,current_intent_id=handle.intent_id
         )
         self._assert_scope_evidence(conn,handle.batch_scope,handle.batch_side_effects)
         batch_state=conn.execute(
@@ -1910,6 +1949,9 @@ class IntentLedger:
 
         self._lock()
         try:
+            # Approval freshness is checked again while holding the ledger lock,
+            # immediately before the durable send counter and history change.
+            fresh_batch_authority=self._fresh_send_authority(handle)
             with self._connection() as conn:
                 self._validate_ledger_state(conn)
                 conn.execute("BEGIN IMMEDIATE")

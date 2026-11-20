@@ -10,6 +10,7 @@ from name_tag_batch_approval import VerifiedBatchApproval
 from hashlib import sha256
 from typing import Mapping
 import json
+from weakref import WeakValueDictionary
 
 class CredentialBlocked(RuntimeError):pass
 
@@ -24,7 +25,7 @@ class IssuedBatchSession:
 
 # Identity registry: only sessions minted by OfflineFakeIssuer.issue are accepted
 # by the offline adapter (an equal-valued externally built copy is not).
-_ISSUED:dict[int,'IssuedBatchSession']={}
+_ISSUED:WeakValueDictionary[int,IssuedBatchSession]=WeakValueDictionary()
 
 class OfflineFakeIssuer:
     """No real STS client can be supplied; no network/API methods exist."""

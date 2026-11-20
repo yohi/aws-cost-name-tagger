@@ -84,7 +84,11 @@ def _record_cap_for_unclaimed(
         except BatchAuthRejected:
             ledger.stop_batch(batch,reason_code="BLOCKED_OWNER_AUTHN")
             return True
-        evidence = _evidence_for(runtime, authority.row)
+        try:
+            evidence = _evidence_for(runtime, authority.row)
+        except LedgerError as error:
+            ledger.stop_batch(batch,reason_code=error.code)
+            return True
         ledger.record_batch_presend_disposition(
             authority, scope=evidence.scope, side_effects=evidence.side_effects,
             decision="NOT_ATTEMPTED_CAP", reason_code="SIGNED_CAP_REACHED",
@@ -187,7 +191,17 @@ def _advance_batch_row(
 ) -> bool:
     outcome=state.outcomes[position]
     if outcome!="UNCLAIMED":
-        if outcome in ("WRITE_INTENT_RECORDED","SEND_ATTEMPT_CONSUMED"):
+        if outcome=="SEND_ATTEMPT_CONSUMED":
+            try:
+                owned=ledger.batch_intent_owned_by_current_execution(batch,row_index)
+            except LedgerError:
+                owned=None
+            report["unresolved_send_owner"]=(
+                "CURRENT_EXECUTION" if owned is True else
+                "OTHER_EXECUTION" if owned is False else "UNKNOWN"
+            )
+            return True
+        if outcome=="WRITE_INTENT_RECORDED":
             ledger.stop_batch(batch,reason_code="BLOCKED_INCOMPLETE_INTENT")
             return True
         return state.state=="STOPPED"
@@ -205,6 +219,7 @@ def _row_outcomes_by_index(
     state: BatchExecutionState,
 ) -> dict[int,str]:
     outcomes_by_row:dict[int,str]={}
+    has_unresolved_send=any(outcome=="SEND_ATTEMPT_CONSUMED" for outcome in state.outcomes)
     for position,row_index in enumerate(batch.approved_row_indexes):
         outcome=state.outcomes[position]
         if outcome=="WRITE_INTENT_RECORDED":
@@ -212,7 +227,7 @@ def _row_outcomes_by_index(
         elif outcome=="SEND_ATTEMPT_CONSUMED":
             outcome="OUTCOME_UNKNOWN"
         elif outcome=="UNCLAIMED":
-            if state.state!="STOPPED":
+            if state.state!="STOPPED" and not has_unresolved_send:
                 raise ReportBlocked("Active Batch has an unclaimed approved row")
             outcome="NOT_ATTEMPTED_BATCH_STOP"
         outcomes_by_row[row_index]=outcome
@@ -223,6 +238,7 @@ def _complete_run_result(
     report: dict[str, JsonValue],
     state: BatchExecutionState,
     outcomes_by_row: dict[int,str],
+    approved_row_indexes: tuple[int,...],
 ) -> BatchRunResult:
     report=reconcile_batch_outcomes(report,outcomes_by_row)
     report["batch_state"]=state.state
@@ -239,7 +255,8 @@ def _complete_run_result(
     report["execution_mode"]="OFFLINE_FAKE_ONLY"
     return BatchRunResult(
         state.state,state.send_attempts_consumed,state.max_send_attempts,
-        remaining,state.outcomes,writes_complete,MappingProxyType(report),
+        remaining,tuple(outcomes_by_row[index] for index in approved_row_indexes),
+        writes_complete,MappingProxyType(report),
     )
 
 
@@ -283,4 +300,4 @@ def execute_batch_offline(
         ledger.complete_batch(batch)
         state = ledger.batch_execution_state(batch)
     outcomes_by_row=_row_outcomes_by_index(batch,state)
-    return _complete_run_result(report,state,outcomes_by_row)
+    return _complete_run_result(report,state,outcomes_by_row,batch.approved_row_indexes)

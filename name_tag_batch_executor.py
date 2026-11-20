@@ -54,6 +54,7 @@ class FixtureSimulationResult(TypedDict):
     authentication_state:str
     execution_allowed:bool
     batch_state:str
+    stop_reason:str|None
     send_attempts_consumed:int
     max_send_attempts:int
     remaining_unattempted_cap:int
@@ -82,8 +83,18 @@ def simulate_untrusted_fixture(
     ledger.register(batch_id,nonce,max_send_attempts=cap,row_count=len(approved_rows),scope_ids=scopes)
     initial_consumed=ledger.counter(batch_id)
     outcomes=[]
+    state_recovery_required=False
     for i,row in enumerate(approved_rows):
-        if ledger.state(batch_id)!='ACTIVE':
+        try:
+            active=ledger.state(batch_id)=='ACTIVE'
+        except (LedgerBlocked,sqlite3.Error):
+            try:
+                ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
+            except (LedgerBlocked,sqlite3.Error):
+                state_recovery_required=True
+            outcomes.extend(['NOT_ATTEMPTED_BATCH_STOP']*(len(approved_rows)-i))
+            break
+        if not active:
             outcomes.extend(['NOT_ATTEMPTED_BATCH_STOP']*(len(approved_rows)-i))
             break
         if ledger.counter(batch_id)>=cap:
@@ -97,16 +108,23 @@ def simulate_untrusted_fixture(
             break
     _finish_fixture_batch(batch_id,approved_rows,outcomes,ledger)
     try:
-        batch_state=ledger.state(batch_id)
+        batch_state,stop_reason=ledger.conn.execute(
+            'SELECT state,stop_reason FROM batch_registry WHERE batch_id=?',(batch_id,)
+        ).fetchone()
         send_attempts_consumed=ledger.counter(batch_id)
         remaining_unattempted_cap=sum(
             decision=='NOT_ATTEMPTED_CAP' for _,decision in ledger.dispositions(batch_id))
-    except sqlite3.Error:
+    except (LedgerBlocked,sqlite3.Error):
         batch_state='RECOVERY_REQUIRED'
+        stop_reason='BLOCKED_SCOPE_STATE_UNKNOWN'
         send_attempts_consumed=initial_consumed+sum(outcome in ('APPLIED_VERIFIED','OUTCOME_UNKNOWN') for outcome in outcomes)
         remaining_unattempted_cap=outcomes.count('NOT_ATTEMPTED_CAP')
+    if state_recovery_required:
+        batch_state='RECOVERY_REQUIRED'
+        stop_reason='BLOCKED_SCOPE_STATE_UNKNOWN'
     return {'authentication_state':'SYNTHETIC_TEST_ONLY','execution_allowed':False,
-            'batch_state':batch_state,'send_attempts_consumed':send_attempts_consumed,
+            'batch_state':batch_state,'stop_reason':stop_reason,
+            'send_attempts_consumed':send_attempts_consumed,
             'max_send_attempts':cap,'remaining_unattempted_cap':remaining_unattempted_cap,
             'outcomes':outcomes,
             'writes_complete':batch_state=='COMPLETED' and len(outcomes)==len(approved_rows) and all(o=='APPLIED_VERIFIED' for o in outcomes)}
@@ -194,7 +212,7 @@ def _execute_fixture_row(batch_id,index,row,ledger,adapter):
         observation=classify_batch_name(adapter.read_current(arn))
         if observation.state=='UNKNOWN':
             ledger.stop(batch_id,'BLOCKED_NAME_UNKNOWN')
-            return 'BLOCKED_NAME_UNKNOWN',True
+            return 'NOT_ATTEMPTED_BATCH_STOP',True
         changed=(observation.state!=row['name_state'] or observation.name_raw_value!=row['name_raw_value'])
         if changed:
             ledger.presend_skip(batch_id,index,scope,authority,'SKIPPED_NAME_CHANGED')
@@ -213,8 +231,12 @@ def _execute_fixture_row(batch_id,index,row,ledger,adapter):
                 # Keep the consumed intent as a restart-recovery barrier; never resend.
                 return 'OUTCOME_UNKNOWN',True
             return 'OUTCOME_UNKNOWN',True
-        if ledger.state(batch_id)=='ACTIVE':ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
-        return 'BLOCKED_SCOPE_STATE_UNKNOWN',True
+        try:
+            if ledger.state(batch_id)=='ACTIVE':
+                ledger.stop(batch_id,'BLOCKED_SCOPE_STATE_UNKNOWN')
+        except (LedgerBlocked,sqlite3.Error):
+            return 'NOT_ATTEMPTED_BATCH_STOP',True
+        return 'NOT_ATTEMPTED_BATCH_STOP',True
 
 
 def _write_and_readback(arn,name,adapter):
@@ -228,9 +250,15 @@ def _write_and_readback(arn,name,adapter):
 
 def _finish_fixture_batch(batch_id,approved_rows,outcomes,ledger):
     if 'OUTCOME_UNKNOWN' in outcomes:return
-    if ledger.state(batch_id)!='ACTIVE':return
+    try:
+        if ledger.state(batch_id)!='ACTIVE':return
+    except (LedgerBlocked,sqlite3.Error):
+        return
     if len(outcomes)==len(approved_rows):
-        ledger.complete(batch_id)
+        try:
+            ledger.complete(batch_id)
+        except (LedgerBlocked,sqlite3.Error):
+            return
 
 
 def execute_batch_offline(

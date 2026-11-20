@@ -187,6 +187,10 @@ def _verify_migration_ledger(path,payload,allowed_attempt_decision):
                 raise BatchMigrationRejected()
             marker_value=connection.execute("SELECT value FROM ledger_meta WHERE key=?",(marker,)).fetchone()
             _validate_migration_attempt_marker(marker_value,allowed_attempt_decision)
+    except LedgerError as error:
+        if error.code == "BLOCKED_AUTH_REPLAY":
+            raise
+        raise BatchMigrationRejected() from error
     except sqlite3.Error as error:
         raise BatchMigrationRejected() from error
     _schema_version_one(path,host_binding,anchor_identity.ledger_instance_id)
@@ -231,7 +235,10 @@ def _verify_payload(
     envelope=_decode_migration_envelope(raw_envelope_json,trust,now_utc)
     payload=envelope["payload"]
     _validate_migration_payload_fields(payload)
-    canonical=canonical_bytes(payload)
+    try:
+        canonical=canonical_bytes(payload)
+    except UnicodeEncodeError as error:
+        raise BatchMigrationRejected() from error
     decision_id=sha256(canonical).hexdigest()
     if envelope["decision_id"]!=decision_id or not isinstance(envelope["signature_ref"],str):
         raise BatchMigrationRejected()
