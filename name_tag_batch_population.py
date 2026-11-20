@@ -133,6 +133,45 @@ def partition_cur_population(aggregates: Mapping[tuple[str,str,str],CurCostAggre
     return out
 
 
+_BILLING_CLASSES=('unattributable_cur','outside_requested_kinds','unsupported_kind')
+
+
+def _canonical_cost(value):
+    if (type(value) is not str or len(value)>MAX_COST_DIGITS+2
+            or _PLAIN_DECIMAL.fullmatch(value) is None):
+        raise ValueError('Expected exact decimal text')
+    try:d=Decimal(value)
+    except InvalidOperation as e:raise ValueError('Nondecimal cost') from e
+    if not d.is_finite() or _canonical_decimal(d)!=value:
+        raise ValueError('Noncanonical decimal cost')
+    return d
+
+
+def validate_reason_details(details,population)->dict:
+    """Shared rule: reason details must reconcile exactly with billing-class totals."""
+    if type(details) is not dict:
+        raise ValueError('Malformed CUR classification reason details')
+    for key,value in details.items():
+        if (type(key) is not str or ':' not in key or type(value) is not dict
+                or set(value)!={'billing_rows','cost_usd'}
+                or type(value['billing_rows']) is not int or value['billing_rows']<0):
+            raise ValueError('Malformed CUR classification reason detail')
+        _canonical_cost(value['cost_usd'])
+    classes={name.upper() for name in _BILLING_CLASSES}
+    if any(key.partition(':')[0] not in classes for key in details):
+        raise ValueError('Unknown CUR reason detail class')
+    for name in _BILLING_CLASSES:
+        entries=[v for k,v in details.items() if k.partition(':')[0]==name.upper()]
+        total=population[name]
+        if not total['known']:
+            if entries:raise ValueError('CUR reason details for unknown class')
+            continue
+        if (sum(v['billing_rows'] for v in entries)!=total['billing_rows']
+                or exact_add(_canonical_cost(v['cost_usd']) for v in entries)!=_canonical_cost(total['cost_usd'])):
+            raise ValueError('CUR reason details mismatch class total')
+    return details
+
+
 def validate_signed_population(plan:dict)->dict:
     """Validate required schema-2 summaries before an approvable Batch draft exists."""
     c=plan.get('cur_population')
@@ -141,19 +180,13 @@ def validate_signed_population(plan:dict)->dict:
         raise ValueError('Incomplete or unknown Batch CUR accounting')
     kind_counts=('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')
     billing=('unattributable_cur','outside_requested_kinds','unsupported_kind')
-    def cost(value):
-        if (type(value) is not str or len(value)>MAX_COST_DIGITS+2
-                or _PLAIN_DECIMAL.fullmatch(value) is None):
-            raise ValueError('Expected exact decimal text')
-        try:d=Decimal(value)
-        except InvalidOperation as e:raise ValueError('Nondecimal cost') from e
-        if not d.is_finite() or _canonical_decimal(d)!=value:
-            raise ValueError('Noncanonical decimal cost')
-        return d
+    cost=_canonical_cost
     _validate_resource_summaries(c,kind_counts,cost)
     _validate_billing_summaries(c,billing,cost)
     if not _population_is_conserved(c,cost):
         raise ValueError('Inexact CUR population conservation')
+    if 'cur_population_reason_details' in plan:
+        validate_reason_details(plan['cur_population_reason_details'],c)
     if type(plan.get('count')) is not int or plan['count']!=len(plan.get('records',[])) or plan['count']!=c['lookup_selected']['count']:
         raise ValueError('Selected records contradict signed population')
     if exact_add(record['effective_usage_cost_usd'] for record in plan['records']) != cost(c['lookup_selected']['cost_usd']):

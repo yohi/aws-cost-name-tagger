@@ -237,5 +237,51 @@ class VolumeIdSpecTests(unittest.TestCase):
                 self.assertEqual(iam,vid in self.GOOD)
                 self.assertEqual(adapter,vid in self.GOOD)
 
+class ReasonDetailsDraftValidationTests(unittest.TestCase):
+    """cur_population_reason_details must reconcile at Draft validation, before signing."""
+    @staticmethod
+    def _plan(details=None,**classes):
+        arn='arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901'
+        population=sample_population(cost='1');population.update(classes)
+        plan={'schema_version':3,'account':'123456789012','partition':'aws','count':1,
+          'execution_limits':{'max_send_attempts':1},'cur_population':population,
+          'scope_declarations':[{'writer_control_scope_id':'s','account':'123456789012','partition':'aws','region':'ap-northeast-1','resource_arns':[arn]}],
+          'records':[{'proposal_id':'p','kind':'volume','locator':'vol-abcdef12345678901','region':'ap-northeast-1','resource_arn':arn,'status':'proposed','confidence':'high','name_state':'ABSENT','name_key_present':False,'name_raw_value':None,'existing_name':'','proposed_name':'app-prod-ebs-xvda-5678901','effective_usage_cost_usd':'1','evidence':'EBS vol-abcdef12345678901 -> attachment i-0123456789abcdef0 xvda -> EC2 i-0123456789abcdef0 Name=app-prod; Product(observed, not validated)=(unset)','aws_operation':'ec2:CreateTags'}]}
+        if details is not None:plan['cur_population_reason_details']=details
+        # The review CSV depends only on records, so derive it from the detail-free plan.
+        base=dict(plan);base.pop('cur_population_reason_details',None)
+        base['cur_population']=sample_population(cost='1')
+        csv_bytes=build_batch_review_projection(json.dumps(base).encode())
+        return json.dumps(plan).encode(),csv_bytes.replace(b',p,',b'YES,p,',1)
+    def test_consistent_and_absent_details_are_accepted(self):
+        d=lambda r,c:{'billing_rows':r,'cost_usd':c}
+        known=lambda r,c:{'known':True,'billing_rows':r,'cost_usd':c}
+        for details,classes in (
+            (None,{}),({},{}),
+            ({'UNSUPPORTED_KIND:a':d(1,'0.1'),'UNSUPPORTED_KIND:b':d(2,'0.2')},{'unsupported_kind':known(3,'0.3')}),
+        ):
+            with self.subTest(details=details):
+                pb,cb=self._plan(details,**classes)
+                self.assertEqual(len(validate_batch_draft(pb,cb).approved_rows),1)
+    def test_inconsistent_details_rejected_by_draft_and_prepare(self):
+        from name_tag_batch_approval import prepare_batch_approval,BatchAuthRejected
+        d=lambda r,c:{'billing_rows':r,'cost_usd':c}
+        known=lambda r,c:{'known':True,'billing_rows':r,'cost_usd':c}
+        bad=[
+            ({'UNSUPPORTED_KIND:a':d(2,'1')},{'unsupported_kind':known(3,'1')}),   # rows
+            ({'UNSUPPORTED_KIND:a':d(3,'0.3')},{'unsupported_kind':known(3,'0.4')}),# exact cost
+            ({'UNKNOWN_CLASS:a':d(0,'0')},{}),                                     # unknown class
+            ({'UNSUPPORTED_KIND:a':d(1,'1')},{}),                                  # class total is 0 rows
+            ({'UNSUPPORTED_KIND:a':d(1,'1.0')},{'unsupported_kind':known(1,'1')}), # invalid value
+        ]
+        for details,classes in bad:
+            with self.subTest(details=details):
+                pb,cb=self._plan(details,**classes)
+                with self.assertRaises(BatchValidationError):validate_batch_draft(pb,cb)
+                with self.assertRaises(BatchAuthRejected):
+                    prepare_batch_approval(pb,cb,owner_principal_id='o',owner_key_fingerprint='SHA256:x',
+                        authorized_role_arn='arn:aws:iam::123456789012:role/r',
+                        issued_at_utc='2026-11-21T00:00:00Z',expires_at_utc='2026-11-22T00:00:00Z',batch_nonce='a'*32)
+
 
 if __name__=='__main__':unittest.main()

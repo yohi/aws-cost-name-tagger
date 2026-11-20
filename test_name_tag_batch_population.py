@@ -74,5 +74,11 @@ class PopulationTests(unittest.TestCase):
     def test_aggregate_sum_allows_input_bound_times_maximum_rows(self):
         total=exact_add(['9' * 100, '9' * 100])
         self.assertEqual(total,Decimal('1' + '9' * 99 + '8'))
+    def test_reason_details_rejected_for_unknown_billing_class(self):
+        from name_tag_batch_population import validate_reason_details
+        population=sample_population()
+        population['unsupported_kind']={'known':False,'billing_rows':None,'cost_usd':None}
+        with self.assertRaises(ValueError):
+            validate_reason_details({'UNSUPPORTED_KIND:a':{'billing_rows':0,'cost_usd':'0'}},population)
 
 if __name__=='__main__':unittest.main()

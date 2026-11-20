@@ -81,34 +81,12 @@ def _cost(s):
 
 
 def _validated_reason_details(plan,population):
+    from name_tag_batch_population import validate_reason_details
     details=plan.get('cur_population_reason_details',{})
-    if type(details) is not dict:
-        raise ReportBlocked('Malformed CUR classification reason details')
-    for key,value in details.items():
-        if (type(key) is not str or ':' not in key or type(value) is not dict
-                or set(value)!={'billing_rows','cost_usd'}
-                or type(value['billing_rows']) is not int or value['billing_rows']<0):
-            raise ReportBlocked('Malformed CUR classification reason detail')
-        _cost(value['cost_usd'])
-    if 'cur_population_reason_details' in plan:
-        _require_reason_details_reconcile(details,population)
-    return details
-
-
-def _require_reason_details_reconcile(details,population):
-    from name_tag_batch_population import exact_add
-    for category in ('unattributable_cur','outside_requested_kinds','unsupported_kind'):
-        entries=[v for k,v in details.items() if k.partition(':')[0]==category.upper()]
-        total=population[category]
-        if not total['known']:
-            if entries:raise ReportBlocked('CUR reason details for unknown class')
-            continue
-        if (sum(v['billing_rows'] for v in entries)!=total['billing_rows']
-                or exact_add(_cost(v['cost_usd']) for v in entries)!=_cost(total['cost_usd'])):
-            raise ReportBlocked('CUR reason details mismatch class total')
-    classes={c.upper() for c in ('unattributable_cur','outside_requested_kinds','unsupported_kind')}
-    if any(k.partition(':')[0] not in classes for k in details):
-        raise ReportBlocked('Unknown CUR reason detail class')
+    if 'cur_population_reason_details' not in plan:
+        return details
+    try:return validate_reason_details(details,population)
+    except ValueError as error:raise ReportBlocked(str(error)) from error
 
 
 def _write_support(row):

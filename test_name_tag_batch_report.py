@@ -159,7 +159,8 @@ class ReportTests(unittest.TestCase):
         plan['cur_population'].update(classes)
         plan['cur_population_reason_details']=details
         pb=json.dumps(plan).encode()
-        return pb,build_batch_review_projection(pb)
+        # The review CSV depends only on records, so derive it from the original valid Plan.
+        return pb,self.cb
 
     def test_reason_details_must_reconcile_with_cur_population_classes(self):
         d=lambda rows,cost:{'billing_rows':rows,'cost_usd':cost}
