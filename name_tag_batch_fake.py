@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from name_tag_batch_credentials import IssuedBatchSession, authorize_offline_session_operation
+from name_tag_batch_credentials import (
+    BatchCredentialIssuer,
+    IssuedBatchSession,
+    OfflineFakeIssuer,
+    authorize_offline_session_operation,
+)
 from name_tag_batch_state import classify_batch_name
 from name_tag_scope import ScopeEvidence, SideEffectEvidence
 
@@ -72,6 +77,7 @@ class FakeBatchSDKAdapter:
 class BatchOfflineRuntime:
     evidence_by_scope: Mapping[str, BatchRuntimeEvidence]
     adapter: FakeBatchSDKAdapter
+    credential_issuer: BatchCredentialIssuer = field(default_factory=OfflineFakeIssuer)
 
 
 @dataclass(frozen=True, slots=True)

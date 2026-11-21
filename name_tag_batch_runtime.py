@@ -16,7 +16,7 @@ from name_tag_batch_approval import (
     derive_batch_row_authority,
     revalidate_verified_batch,
 )
-from name_tag_batch_credentials import CredentialBlocked, OfflineFakeIssuer
+from name_tag_batch_credentials import CredentialBlocked
 from name_tag_batch_credentials import validate_issued_batch_session
 from name_tag_batch_iam import IAMPolicyBlocked, KindPolicy, build_subset_session_policy
 from name_tag_batch_report import ReportBlocked, make_authenticated_batch_report
@@ -162,7 +162,9 @@ def _execute_unclaimed_row(
         subset = build_subset_session_policy(
             batch, (row_index,), kind_registry=_VOLUME_POLICY
         )
-        issued = OfflineFakeIssuer().issue(batch, subset, kind_registry=_VOLUME_POLICY)
+        issued = runtime.credential_issuer.issue(
+            batch, subset, kind_registry=_VOLUME_POLICY
+        )
         validate_issued_batch_session(batch, subset, issued)
     except (IAMPolicyBlocked, CredentialBlocked):
         ledger.stop_batch(batch, reason_code="AWS_WRITE_BLOCKED")
@@ -215,7 +217,7 @@ def _execute_unclaimed_row(
             else "OUTCOME_UNKNOWN"
         )
         name_after = readback.name_raw_value
-    except OSError:
+    except Exception:  # noqa: BLE001 - a consumed permit makes every send/readback error uncertain.
         outcome = "OUTCOME_UNKNOWN"
         name_after = None
     ledger.record_readback(handle, name_after=name_after, outcome=outcome)

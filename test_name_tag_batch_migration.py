@@ -520,6 +520,8 @@ class BatchLedgerMigrationTests(unittest.TestCase):
             BatchOfflineRuntime, BatchRuntimeEvidence, FakeBatchSDKAdapter,
             execute_batch_offline,
         )
+        from name_tag_batch_credentials import OfflineFakeIssuer
+        from unittest.mock import Mock
 
         migration_decision=migration.verify_ledger_migration_decision(
             self._envelope(),trust=self.trust,
@@ -532,8 +534,10 @@ class BatchLedgerMigrationTests(unittest.TestCase):
         with closing(open_ledger(self.ledger_path,trusted_host=True,trust=self.trust)) as ledger:
             scope,effects=self._initialize_batch_scope(ledger,arns)
             adapter=FakeBatchSDKAdapter({arn:{} for arn in arns})
+            credential_issuer=Mock(wraps=OfflineFakeIssuer())
             runtime=BatchOfflineRuntime(
-                {"scope-1":BatchRuntimeEvidence(scope,effects)},adapter
+                {"scope-1":BatchRuntimeEvidence(scope,effects)},adapter,
+                credential_issuer=credential_issuer,
             )
             with (
                 patch("name_tag_batch_trust.load_current_protected_owner_trust",return_value=self.trust),
@@ -544,6 +548,13 @@ class BatchLedgerMigrationTests(unittest.TestCase):
                     runtime=runtime)
 
         self.assertEqual(adapter.write_calls,1)
+        credential_issuer.issue.assert_called_once()
+        issued_batch, issued_subset = credential_issuer.issue.call_args.args
+        self.assertEqual(issued_batch.batch_id, batch.batch_id)
+        self.assertEqual(issued_batch.plan_bytes, plan_bytes)
+        self.assertEqual(issued_batch.csv_bytes, csv_bytes)
+        self.assertEqual(issued_subset.batch_id, batch.batch_id)
+        self.assertEqual(issued_subset.row_indexes, batch.approved_row_indexes[:1])
         self.assertEqual(result.outcomes,("APPLIED_VERIFIED","NOT_ATTEMPTED_CAP"))
         self.assertEqual(result.batch_state,"COMPLETED")
         self.assertTrue(result.report["rows"][0]["execution_allowed"] is False)
@@ -913,7 +924,7 @@ class BatchLedgerMigrationTests(unittest.TestCase):
             with (
                 patch("name_tag_batch_trust.load_current_protected_owner_trust",return_value=self.trust),
                 patch("name_tag_batch_runtime.load_current_protected_owner_trust",return_value=self.trust),
-                patch("name_tag_batch_runtime.OfflineFakeIssuer.issue",
+                patch("name_tag_batch_credentials.OfflineFakeIssuer.issue",
                       side_effect=CredentialBlocked("forced")),
             ):
                 result=execute_batch_offline(
