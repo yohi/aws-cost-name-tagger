@@ -1,7 +1,6 @@
 """Fail-closed EC2 volume Name write boundary for future verified host runtimes."""
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 import re
 from typing import Final, Protocol, TypedDict
