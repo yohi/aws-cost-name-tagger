@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import ExitStack
 from types import MappingProxyType
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,6 +17,35 @@ from name_tag_batch_live import (
 from name_tag_batch_runtime import _execute_unclaimed_row
 from name_tag_batch_state import NameObservation
 from name_tag_ledger import FirstSendPermit
+
+
+def _run_unclaimed_row(ledger: Mock, runtime: SimpleNamespace) -> bool:
+    row = {
+        "resource_arn": "arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901",
+        "approved_name": "app-prod-ebs-xvda-5678901",
+        "name_state": "ABSENT",
+        "name_key_present": False,
+        "name_raw_value": None,
+    }
+    with ExitStack() as patches:
+        patches.enter_context(
+            patch("name_tag_batch_runtime._current_authority", return_value=SimpleNamespace(row=row))
+        )
+        patches.enter_context(
+            patch("name_tag_batch_runtime._evidence_for", return_value=SimpleNamespace(scope=object(), side_effects=()))
+        )
+        patches.enter_context(
+            patch("name_tag_batch_runtime.build_subset_session_policy", return_value=object())
+        )
+        patches.enter_context(patch("name_tag_batch_credentials.OfflineFakeIssuer.issue", return_value=object()))
+        patches.enter_context(patch("name_tag_batch_runtime.validate_issued_batch_session"))
+        patches.enter_context(
+            patch(
+                "name_tag_batch_runtime.classify_batch_name",
+                return_value=NameObservation("ABSENT", False, None),
+            )
+        )
+        return _execute_unclaimed_row(SimpleNamespace(), 0, ledger, runtime, {})
 
 
 class VolumeRequestTests(unittest.TestCase):
@@ -124,31 +154,13 @@ class VolumeRequestTests(unittest.TestCase):
         )
 
     def test_readback_failure_stops_after_one_write(self) -> None:
-        row = {
-            "resource_arn": "arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901",
-            "approved_name": "app-prod-ebs-xvda-5678901",
-            "name_state": "ABSENT",
-            "name_key_present": False,
-            "name_raw_value": None,
-        }
         ledger = Mock()
         adapter = Mock()
         adapter.read_current.return_value = {}
         adapter.readback.side_effect = OSError("readback unavailable")
         runtime = SimpleNamespace(adapter=adapter, credential_issuer=OfflineFakeIssuer())
 
-        with (
-            patch("name_tag_batch_runtime._current_authority", return_value=SimpleNamespace(row=row)),
-            patch("name_tag_batch_runtime._evidence_for", return_value=SimpleNamespace(scope=object(), side_effects=())),
-            patch("name_tag_batch_runtime.build_subset_session_policy", return_value=object()),
-            patch("name_tag_batch_credentials.OfflineFakeIssuer.issue", return_value=object()),
-            patch("name_tag_batch_runtime.validate_issued_batch_session"),
-            patch(
-                "name_tag_batch_runtime.classify_batch_name",
-                return_value=NameObservation("ABSENT", False, None),
-            ),
-        ):
-            must_stop = _execute_unclaimed_row(SimpleNamespace(), 0, ledger, runtime, {})
+        must_stop = _run_unclaimed_row(ledger, runtime)
 
         self.assertTrue(must_stop)
         adapter.write_once.assert_called_once()
@@ -160,13 +172,6 @@ class VolumeRequestTests(unittest.TestCase):
         )
 
     def test_failed_unknown_persistence_keeps_permit_spent(self) -> None:
-        row = {
-            "resource_arn": "arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-abcdef12345678901",
-            "approved_name": "app-prod-ebs-xvda-5678901",
-            "name_state": "ABSENT",
-            "name_key_present": False,
-            "name_raw_value": None,
-        }
         ledger = Mock()
         ledger.record_readback.side_effect = RuntimeError("ledger unavailable")
         adapter = Mock()
@@ -174,19 +179,8 @@ class VolumeRequestTests(unittest.TestCase):
         adapter.readback.side_effect = OSError("readback unavailable")
         runtime = SimpleNamespace(adapter=adapter, credential_issuer=OfflineFakeIssuer())
 
-        with (
-            patch("name_tag_batch_runtime._current_authority", return_value=SimpleNamespace(row=row)),
-            patch("name_tag_batch_runtime._evidence_for", return_value=SimpleNamespace(scope=object(), side_effects=())),
-            patch("name_tag_batch_runtime.build_subset_session_policy", return_value=object()),
-            patch("name_tag_batch_credentials.OfflineFakeIssuer.issue", return_value=object()),
-            patch("name_tag_batch_runtime.validate_issued_batch_session"),
-            patch(
-                "name_tag_batch_runtime.classify_batch_name",
-                return_value=NameObservation("ABSENT", False, None),
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "ledger unavailable"):
-                _execute_unclaimed_row(SimpleNamespace(), 0, ledger, runtime, {})
+        with self.assertRaisesRegex(RuntimeError, "ledger unavailable"):
+            _run_unclaimed_row(ledger, runtime)
 
         ledger.consume_first_send.assert_called_once()
         adapter.write_once.assert_called_once()
