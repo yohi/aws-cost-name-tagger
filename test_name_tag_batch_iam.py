@@ -1,4 +1,5 @@
 import gc,hashlib,json,unittest,weakref
+from dataclasses import replace
 from types import MappingProxyType
 from name_tag_batch_iam import build_subset_session_policy, KindPolicy, IAMPolicyBlocked, SessionPolicySpec
 from name_tag_batch_credentials import OfflineFakeIssuer, CredentialBlocked
@@ -64,6 +65,22 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(sess.row_indexes,spec.row_indexes)
         self.assertEqual(sess.role_arn,self.batch.payload['authorized_role_arn'])
         self.assertEqual(sess.provenance,'OFFLINE_SYNTHETIC_NOT_STS')
+        self.assertEqual(sess.owner_principal_id,self.batch.owner_principal_id)
+        subset_identity=[[1,self.row['proposal_id'],self.row['resource_arn'],
+                          self.row['approved_name'],self.row['aws_operation'],
+                          self.row['writer_control_scope_id']]]
+        expected_subset_sha256=hashlib.sha256(json.dumps(
+            subset_identity,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+        self.assertEqual(sess.subset_sha256,expected_subset_sha256)
+        self.assertEqual(sess.allowed_arns,spec.write_arns)
+        self.assertEqual(sess.allowed_actions,spec.write_actions)
+        self.assertEqual(sess.issuer_identity,'OFFLINE_FAKE_ISSUER')
+        self.assertTrue(sess.request_id)
+        self.assertTrue(sess.response_id)
+        self.assertEqual(sess.expiration_utc,self.batch.payload['expires_at_utc'])
+        self.assertTrue(sess.client_identity)
+        self.assertEqual(hashlib.sha256(sess.request_bytes).hexdigest(),sess.request_id)
+        self.assertEqual(hashlib.sha256(sess.response_bytes).hexdigest(),sess.response_id)
         self.assertIn(b'aws:TagKeys',sess.policy_bytes)
         with self.assertRaises(CredentialBlocked):fake.issue(self.batch,build_subset_session_policy(self.batch,(1,),kind_registry=self.kind),kind_registry=self.kind,tamper_policy=True)
 
@@ -80,6 +97,10 @@ class PolicyTests(unittest.TestCase):
             role_arn=session.role_arn)
         with self.assertRaises(CredentialBlocked):
             validate_issued_batch_session(self.batch,spec,counterfeit)
+
+        equal_copy=replace(session)
+        with self.assertRaises(CredentialBlocked):
+            validate_issued_batch_session(self.batch,spec,equal_copy)
     def test_offline_adapter_operations_require_issuer_minted_bound_session(self):
         from name_tag_batch_fake import FakeBatchSDKAdapter
         arn0=self.batch.approved_rows[0]['resource_arn']
