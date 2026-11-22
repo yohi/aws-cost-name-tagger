@@ -538,5 +538,110 @@ class RealLedgerPermitIdentityTests(RealLedgerV2Case):
         self.assertIsNone(after)
 
 
+
+class NoSendFinalizerLedgerTests(RealLedgerV2Case):
+    """Refusal window B on the real Ledger: Intent exists, Permit never consumed."""
+
+    def _intent(self, records=None, cap=1):
+        batch = self.make_batch(records or [volume_record(0)], cap=cap)
+        ledger = self.open()
+        scope, effects = self.init_scope(ledger, [r["resource_arn"] for r in
+                                                  (records or [volume_record(0)])])
+        handle = ledger.create_batch_intent(self.authority(batch), scope=scope,
+                                            side_effects=effects)
+        return batch, ledger, handle
+
+    def test_finalizer_atomically_marks_terminal_stops_batch_and_holds_scope(self):
+        with self.trusted():
+            batch, ledger, handle = self._intent()
+            ledger._host_finalize_unsent_batch_intent(
+                handle, reason_code="G2_NOT_VERIFIED", sdk_dispatches=0)
+            state = ledger.batch_execution_state(batch)
+            with self.assertRaises(_LedgerError):
+                ledger.consume_first_send(handle)
+        self.assertEqual((state.state, state.send_attempts_consumed, state.outcomes),
+                         ("STOPPED", 0, ("NOT_ATTEMPTED_BATCH_STOP",)))
+        self.assertEqual(self.intents(), [("TERMINAL", "NOT_ATTEMPTED_BATCH_STOP", "ec2:CreateTags")])
+        self.assertEqual(self.sql("SELECT state FROM scopes WHERE scope_id='scope-1'"), [("HOLD",)])
+        self.assertEqual(self.sql("SELECT event FROM intent_history ORDER BY id"),
+                         [("WRITE_INTENT_RECORDED",), ("TERMINAL:NOT_ATTEMPTED_BATCH_STOP",)])
+
+    def test_finalizer_refuses_consumed_permit_or_dispatch_and_changes_nothing(self):
+        with self.trusted():
+            batch, ledger, handle = self._intent()
+            with self.assertRaises(_LedgerError):
+                ledger._host_finalize_unsent_batch_intent(handle, reason_code="X", sdk_dispatches=1)
+            ledger.consume_first_send(handle)
+            with self.assertRaises(_LedgerError):
+                ledger._host_finalize_unsent_batch_intent(handle, reason_code="X", sdk_dispatches=0)
+            state = ledger.batch_execution_state(batch)
+        self.assertEqual(self.intents(), [("SEND_ATTEMPT_CONSUMED", None, "ec2:CreateTags")])
+        self.assertEqual((state.state, state.send_attempts_consumed), ("ACTIVE", 1))
+        self.assertEqual(self.sql("SELECT state FROM scopes WHERE scope_id='scope-1'"),
+                         [("CLEARED",)])
+
+    def test_finalizer_owner_revoked_cannot_prove_and_leaves_intent_unresolved(self):
+        from name_tag_batch_approval import BatchAuthRejected
+        with self.trusted():
+            batch, ledger, handle = self._intent()
+        with mock.patch("name_tag_batch_trust.load_current_protected_owner_trust",
+                        side_effect=BatchAuthRejected()):
+            with self.assertRaises(_LedgerError) as caught:
+                ledger._host_finalize_unsent_batch_intent(
+                    handle, reason_code="BLOCKED_OWNER_AUTHN", sdk_dispatches=0)
+        self.assertEqual(caught.exception.code, "BLOCKED_OWNER_AUTHN")
+        self.assertEqual(self.intents(), [("WRITE_INTENT_RECORDED", None, "ec2:CreateTags")])
+
+    def test_finalizer_transaction_failure_rolls_back_everything(self):
+        with self.trusted():
+            batch, ledger, handle = self._intent()
+            real = ledger._connection
+
+            class Failing:
+                def __init__(self, inner):
+                    self.inner = inner
+
+                def __enter__(self):
+                    conn = self.inner.__enter__()
+                    outer = self
+
+                    class Proxy:
+                        def execute(self, sql, params=()):
+                            if sql.startswith("UPDATE scopes SET state='HOLD'"):
+                                raise sqlite3.OperationalError("disk I/O error")
+                            return conn.execute(sql, params)
+
+                        def commit(self):
+                            return conn.commit()
+                    return Proxy()
+
+                def __exit__(self, *exc):
+                    return self.inner.__exit__(*exc)
+            with mock.patch.object(ledger, "_connection", lambda: Failing(real())):
+                with self.assertRaises(_LedgerError) as caught:
+                    ledger._host_finalize_unsent_batch_intent(
+                        handle, reason_code="G2_NOT_VERIFIED", sdk_dispatches=0)
+            state = ledger.batch_execution_state(batch)
+        self.assertEqual(caught.exception.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        self.assertEqual(self.intents(), [("WRITE_INTENT_RECORDED", None, "ec2:CreateTags")])
+        self.assertEqual(state.state, "ACTIVE")
+        self.assertEqual(self.sql("SELECT state FROM scopes WHERE scope_id='scope-1'"),
+                         [("CLEARED",)])
+
+    def test_finalizer_foreign_execution_handle_refused(self):
+        with self.trusted():
+            batch, ledger, handle = self._intent()
+            other = _open_ledger(self.ledger_path, trusted_host=True, trust=self.trust)
+            self.addCleanup(other.close)
+            with self.assertRaises(_LedgerError):
+                other._host_finalize_unsent_batch_intent(
+                    handle, reason_code="X", sdk_dispatches=0)
+            forged = _dataclasses.replace(handle, ownership_token="f" * 32)
+            with self.assertRaises(_LedgerError):
+                ledger._host_finalize_unsent_batch_intent(forged, reason_code="X",
+                                                          sdk_dispatches=0)
+        self.assertEqual(self.intents(), [("WRITE_INTENT_RECORDED", None, "ec2:CreateTags")])
+
+
 if __name__ == '__main__':
     unittest.main()
