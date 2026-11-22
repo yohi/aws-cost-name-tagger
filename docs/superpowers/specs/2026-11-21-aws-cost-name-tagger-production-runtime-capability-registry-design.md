@@ -1,200 +1,239 @@
 # AWS Cost Name Tagger — Production Runtime Completion Design R0.1
 
 - Date: 2026-11-21 (JST)
-- Repository: \`yohi/aws-cost-name-tagger\`
-- Base: \`master@bffc5d97e5ccd53bc094785bcda70476b2be2fd7\`
-- Status: **PROPOSED — Human Owner Design Adoption Pending**
-- Development approach: Superpowers First / TDD / Single Implementation Phase
-- Authority: This document records the brainstorming design proposal. Commit/Push does **not** authorize implementation, Trust enrollment, IAM modifications, STS calls, live AWS mutation, Safety Hold release, or operational Gate approval.
+- Repository: `yohi/aws-cost-name-tagger`
+- Base: `master@bffc5d97e5ccd53bc094785bcda70476b2be2fd7`
+- Status: **PROPOSED — Human Owner Design Approval Pending**
+- Development: Superpowers First / TDD / Single Implementation Phase
+- Authority: Brainstormingの設計案。文書のCommit・Pushは設計採択、実装、AWS操作、Safety Hold解除の承認ではない。
 
 ## 1. Project Goal
 
-Identify chargeable resources from AWS CUR and enable meaningful \`Name\` tag assignments where service APIs and independently proven least-privilege boundaries permit, while preserving existing meaningful \`Name\` tags.
+AWS CURで認識する課金対象リソースについて、既存の意味あるNameタグを保護しながら、サービスごとの安全条件を満たす範囲で、実際のNameタグ付与を可能にする。
 
-All **18 recognized kinds** are in the assessment and implementation scope. Implement an eligible live write adapter for a kind only when its API, IAM, tag-preservation, and Readback safety contract can be established. For every unsupported or unverified kind, report a reason, affected resource count, and exact Decimal cost. Do not treat an unsafe or unproven kind as authorized.
+対象18種類すべてについて、書き込み対応可否を根拠付きで判定する。安全な書き込みを成立させられない種別については、無理に対応させず、理由・対象件数・費用を報告する。
 
-Original success remains actual, safely controlled AWS tagging, **not** mere completion of design, offline tests, or code. This implementation phase deliberately stops before real-host/live-AWS acceptance.
+最終GOALは安全な実AWSタグ付与であり、コードやオフラインテストの完成だけで達成とは扱わない。
 
-## 2. Scope and Boundaries
+## 2. Scope
 
-Kinds:
+対象種別:
 
-- EC2: \`instance\`, \`volume\`, \`snapshot\`, \`eni\`, \`eip\`, \`nat\`, \`endpoint\`
-- Databases: \`rds_cluster\`, \`rds_instance\`
-- Other: \`opensearch\`, \`elbv2\`, \`apigw_stage\`, \`cloudfront\`, \`athena_workgroup\`, \`log_group\`, \`lambda\`, \`wafv2\`, \`s3_bucket\`
+- EC2: `instance`, `volume`, `snapshot`, `eni`, `eip`, `nat`, `endpoint`
+- データベース: `rds_cluster`, `rds_instance`
+- その他: `opensearch`, `elbv2`, `apigw_stage`, `cloudfront`, `athena_workgroup`, `log_group`, `lambda`, `wafv2`, `s3_bucket`
 
-In scope: production-oriented source code, registration and classification of each kind's capability, per-kind adapters where safety is supportable, runtime enforcement, Host/Issuer/STS interfaces, IAM and G1/G2 evidence gates, CLI opt-in control, audit/report paths, and offline TDD/integration regression tests.
+今回の工程は、本番用コード、実行時安全ゲート、CLI、レポート、オフライン統合テストまでを含む。
 
-Out of scope for this phase: live Host acceptance, actual STS issuance, enrollment of Trust Anchors, IAM deployment/change, real AWS tag mutation, permission to clear Safety Hold, automatic PR/Merge, and operational Owner approval. These are separate authorizations.
+実Hostでの運用受入、実STS発行、実IAM変更、実AWSへの書き込みは含まない。Phase A、Batch Tasks 1–7の既存安全契約を維持する。
 
-Existing Phase A and Batch Tasks 1–7 must retain their safety contracts, known boundaries, and fail-closed behavior.
+## 3. Approaches and Selected Architecture
 
-## 3. Selected Approach and Alternatives
+**選択：A — Capability Registry方式。** 18種類それぞれのAPI、IAM制約、Name保護、Readbackを宣言し、共通Runtimeから実行する。共通のOwner認証・STS・Ledger・G1/G2安全機構を再実装せず、対応不能・未検証の理由を明示できるため採用。
 
-**Selected: A — Kind Capability Registry.** Keep one common execution/authentication/ledger runtime and declare per-kind capability constraints and service-specific adapters. This maximizes reuse and makes unsupported/unverified kinds visible.
+比較した代替案:
 
-Considered but not selected:
+- B — Resource Groups Tagging API優先方式: 共通化しやすいが、実際のサービス対応、サービス固有IAM権限、副作用の判定が複雑。
+- C — サービス別独立Writer方式: 局所的には明快だが、認証・Ledger・STSの重複が増える。
 
-- **B — Resource Groups Tagging API first:** fewer apparent API variants, but actual service coverage, required service-specific IAM permissions, and write side effects vary; not an automatic safety shortcut.
-- **C — Independent writer per service:** simpler local implementations but repeats Owner/Scope/Ledger/STS safety logic and increases divergence risk.
+```text
+CUR Discovery
+    ↓
+Batch Plan / Review CSV
+    ↓
+Owner Signature / Verification
+    ↓
+Host-only Batch Runtime
+    ├── OwnerTrust
+    ├── Scope / SideEffect Evidence
+    ├── Host-bound Ledger / Permit
+    ├── Credential Issuer
+    └── Runtime Policy Gate
+              ↓
+       Kind Capability Registry
+              ↓
+      ┌───────┴────────┐
+      │                │
+ Supported Adapter   Unsupported / Unverified
+      │                │
+ Pre-send Read       Reason + Count + Cost
+      ↓
+ Consume Permit
+      ↓
+ Single Name-only Write
+      ↓
+ Readback / Durable Outcome
+      ↓
+ Batch Report
+```
 
-No new web approval service or separate Ledger is required by the selected approach.
+## 4. Kind Capability Registry
 
-## 4. Architecture
+18種類すべてについて、以下の情報を持つRegistryを実装する。
 
-\`\`\`text
-CUR discovery
-  -> Batch Plan + Review CSV
-  -> Owner signed approval
-  -> Host-only Batch Runtime / Coordinator
-       OwnerTrust / current Batch authority
-       Protected Scope + SideEffect evidence
-       Host-bound Ledger + Intent + FirstSendPermit + signed attempt cap
-       Host-only Credential Issuer + protected issuance receipt
-       Effective IAM + G1/G2 evidence gates
-       -> Kind Capability Registry
-            -> eligible adapter: Pre-send Read -> single Write -> Readback
-            -> unsupported/unverified: reason + count + exact cost
-  -> Durable outcomes + auditable Batch Report
-\`\`\`
+- Kindとサービス識別子
+- ARN形式とAccount / Partition / Region検証規則
+- 対象リソースの識別方法
+- Pre-send Read API
+- Nameタグ書き込みAPI
+- Readback API
+- IAM write action
+- IAM resource ARN制約
+- `Name`以外のタグ変更を禁止できる条件
+- APIが単一タグ更新か、タグ集合置換か
+- 必要な証拠と残余リスク
+- 書き込み対応状態と理由コード
 
-The Registry **describes capabilities**; it cannot independently grant a write. Eligibility must also be revalidated against the approved row, current Host/Scope/Owner/Issuer/IAM evidence and the consumed Ledger Permit.
+Capability状態:
 
-## 5. Kind Capability Registry Contract
+- `IMPLEMENTED_OFFLINE`: 書き込み契約とMockテストが完成。実AWS許可ではない。
+- `UNSUPPORTED_BY_POLICY`: プロジェクトの安全条件に適合しない。
+- `UNSUPPORTED_API`: 対応する安全なAPIがない。
+- `CAPABILITY_NOT_PROVEN`: API/IAM/副作用の証拠不足。不可能と断定しない。
+- `LIVE_GATE_PENDING`: コード実装済みだが実環境の承認・証拠が不足。
 
-For each of the 18 kinds, record:
+不明と不可能、コード実装済みと運用許可済みを混同しない。
 
-- Kind/service and canonical resource identity
-- ARN/account/partition/region constraints and resource-ID normalization
-- Pre-send Read API and identity verification
-- Exact update API, write action and request shape
-- Readback API, identity verification and result semantics
-- Actual IAM ARN-level enforcement and supported tag-key/value conditions
-- Whether the update is **key-scoped** or **entire tag-set replacement**
-- Name preservation, side effects and race exposure
-- Required Host/IAM/G1/G2 evidence and their freshness
-- Offline implementation state, live evidence state and explicit reason code
+Native APIを原則とし、Resource Groups Tagging APIは、サービス固有権限を含め安全条件を証明できる場合に限って採用する。
 
-Separate these capability states:
+Capabilityの存在だけで書き込みを許可しない。
 
-- \`IMPLEMENTED_OFFLINE\`: adapter and offline safety tests complete; **not live-authorized**
-- \`UNSUPPORTED_BY_POLICY\`: project safety requirements cannot be met by the candidate API
-- \`UNSUPPORTED_API\`: no safe supported write operation identified
-- \`CAPABILITY_NOT_PROVEN\`: evidence insufficient; do not claim impossibility
-- \`LIVE_GATE_PENDING\`: code exists, but runtime Host/Owner/IAM/G1/G2 proof is outstanding
+S3 Bucketのようにタグ集合全体を置換するAPIについては、他のタグを変更しないことを保証できなければ、書き込み禁止とする。Read→Merge→Writeだけで原子的な既存タグ保護が成立するとは見なさない。
 
-Avoid treating absence of evidence as actual observed API failure. A registry row or a static documentation claim never lifts any runtime HOLD.
+## 5. Shared Security Runtime
 
-Prefer native service APIs. Resource Groups Tagging API is permissible only if its service-specific permission, exact-ARN scope, tag preservation and Readback have the same proven safety bounds.
+OwnerTrust、Batch Approval、Scope、Ledger、Permit、Issuerは共通化する。
 
-For instance, S3 \`PutBucketTagging\` replaces the bucket's tag set: do **not** use it as a Name-only mutation without a provably safe contract for all unrelated existing tags and concurrent changes. A read/merge/write sequence alone is not atomic preservation evidence.
+Host-only Credential Issuerは、実STSの要求・応答、正確なPolicy bytes/hash、対象ARN、Session identity、期限、資格情報の来歴を保護された同一Host境界内で束縛する。
 
-## 6. Shared Security Runtime
+Pre-send Read、Write、Readbackには同じIssuedBatchSessionを使用する。
 
-Reuse current \`OwnerTrust\`, \`VerifiedBatchApproval\`, \`VerifiedBatchRowAuthority\`, \`ScopeEvidence\`, \`SideEffectEvidence\`, the Host-bound \`IntentLedger\`, \`FirstSendPermit\`, and signed attempt caps.
+Ambient credentials、未検証のSession、コピーしたreceipt、任意に生成したRuntime Policyは拒否する。
 
-The Host-only issuer must bind the **actual** STS request to its **actual** response: Batch ID, approved row subset, exact policy bytes/hash, role, issuer identity, ARN/operation bounds, assumed-role identity, credential/client identity, expiration, and protected request/response receipt. Same issued credential triplet is used for Pre-send Read, Write and Readback. The production implementation can be offline-tested using an injected mock transport, but real issuance is not claimed.
+Runtime Policyは信頼済みHostの検証処理からのみ発行可能にする。実効IAMの証拠がない場合、発行・書き込みを拒否する。
 
-Never use ambient credentials, caller-created session receipts, copied fake identities, Boolean allow flags, or arbitrary user-provided dataclasses as authorization. Do not persist raw AWS secrets in the Ledger or logs. Missing or ambiguous issuer lineage is \`AWS_WRITE_BLOCKED\`.
+Session Policyだけを実効IAMの完全な証明としない。Python上のオブジェクト識別子、dataclass、Booleanだけで実Host信頼を証明しない。
 
-A trusted Host Runtime Policy is derived only by the protected verifier after fresh Owner/Scope/Ledger/Issuer/effective-IAM checks. Python object identity or a constructor token is insufficient to prove the OS/Host trust boundary.
+資格情報の生値をLedgerやログに永続化しない。
 
-## 7. Writer Execution Contract
+## 6. Write Execution Contract
 
-For each approved eligible row:
+書き込み対象の各行で以下を保証する。
 
-1. Revalidate current Owner signature, signer role, expiry and revocation.
-2. Bind exact signed Plan/CSV bytes and row, Name, Account/Partition/Region, ARN, API and Scope.
-3. Recheck capability, row eligibility, G1/G2 and independent effective IAM evidence.
-4. Recheck protected issuer/session provenance and issued-policy/subset/client identity.
-5. Pre-send Read using that issued session; reject unknown, changed or meaningful existing Name.
-6. Persist the one-shot Intent, then consume the Ledger Permit and signed attempt budget durably.
-7. Send exactly one Name-only request through the allowlisted adapter and issued client.
-8. Read back with the **same** issued session.
-9. Durably record verified, skipped, failed or unknown outcome with per-kind reason.
+1. 最新のOwner署名・失効状態を再検証する。
+2. Plan/CSV、対象ARN、Name、API、Scopeを照合する。
+3. 署名済み行のEligibilityを検証する。
+4. CapabilityとIAM証拠を検証する。
+5. 同一Issuer Sessionで直前のName状態を再取得する。
+6. 既存の意味あるNameがあれば書き込まない。
+7. LedgerでIntentを永続化する。
+8. FirstSendPermitを一度だけ消費する。
+9. 許可済みAPIへName-only要求を一度だけ送信する。
+10. 同じSessionでReadbackする。
+11. 成功・拒否・不明を耐久化して報告する。
 
-After Permit consumption, uncertain SDK results, non-\`OSError\` exceptions, credential loss, failed Readback or Ledger persistence errors must **never** permit an automatic replay. Record \`OUTCOME_UNKNOWN\` and STOP/HOLD where possible; if persistence cannot be trusted, apply Host-wide Fail-Closed.
+送信結果不明、Readback失敗、Session失効、Ledger障害では再送しない。Permit消費後の非`OSError`例外も `OUTCOME_UNKNOWN` として扱い、STOP/HOLDを耐久化できない場合はHost-wide Fail-Closedとする。
 
-If an AWS API lacks atomic conditional Name update, the Pre-send Read/Write race is a residual G1 risk. A scoped, explicit G1 decision is required for live entry; the code must not claim atomic protection or silently accept this risk.
+APIに原子的な条件付き更新がない場合、Pre-send ReadとWriteの間の競合を完全に解消したと主張しない。対応するG1リスク判断が成立しなければ書き込み禁止とする。
 
-## 8. IAM and Operational Gates
+## 7. IAM / Runtime Gates
 
-Required proof before live dispatch:
+実行時には少なくとも以下を要求する。
 
-- Current cryptographically valid Owner-approved Batch/row
-- Exact authorized Account/Region/ARN, Name, API and allowlisted kind
-- Protected Scope and SideEffect evidence; current Ledger state and consumed Permit
-- Scoped G1 risk decision and genuine G2 real-Host evidence
-- Host-only issuer, actual STS request/response lineage and SDK client identity
-- Independent effective IAM denial evidence for foreign ARNs, other tag keys and alternate APIs
-- Bounded attempts, logging, explicit stop and recovery procedures
+- Ownerの有効な署名済みBatch
+- 正確なAccount / Region / ARN / Operation
+- 保護されたScopeとSideEffect Evidence
+- G1の対象限定判断
+- G2の実Host証拠
+- Host-only Issuerの保護された来歴
+- 実STS SessionとClient Identity
+- 対象外ARN、他Tag Key、別APIに対する実効IAM拒否証拠
+- Ledger Permitと署名済みattempt cap
+- 停止・監査・結果不明時の安全処理
 
-Account for inherited policies, boundaries, SCPs, trust paths, resource policies and grants directed at assumed-role sessions. STS session policy or a simulator alone is not proof of an absolute deny.
+IAMの継承Policy、Permission Boundary、SCP、Resource-based Policy、Assumed-role Sessionへの権限付与による迂回を考慮する。
 
-Any missing, stale, inconsistent or inapplicable gate means **zero live mutation calls**. A capability alone, synthetic session or green CI result is not authorization.
+証拠欠落・不一致・期限切れはFail-Closed。コード上のGate実装と、実環境でのGate成立証明を別々に扱う。
 
-## 9. Reporting and Coverage
+## 8. Reporting
 
-For all 18 kinds, preserve the pre-cap CUR-recognized population, selected/inspected/approved/capped portions, exact Decimal cost and classification. Each row/outcome is counted without overlap; totals reconcile to original CUR input.
+全18種類について、CUR母集団、対象件数、Decimal費用、Capability状態を集計する。
 
-At minimum distinguish:
+結果は相互排他的に分類し、既存の費用・件数照合と整合させる。
 
-- Applied and Readback-verified
-- Meaningful Name already present or changed before send
-- Name not generatable
-- Owner unapproved
-- Scope mismatch or blocked
-- Unsupported due to IAM/policy constraints
-- Unsupported due to API/tag-set semantics
-- Capability not proven / live evidence pending
-- Not attempted because of signed caps
-- Unknown after an attempted send
-- Other authenticated STOP reasons
+特に次を区別する。
 
-Do not label capped, uninspected, unsupported or unverifiable rows as completed writes. Reporting must not lift Safety Hold or cause an execution side effect.
+- Name付与成功・Readback確認済み
+- Name既存・変更済み
+- Name生成不可
+- Owner未承認
+- Scope不一致
+- IAM制約による未対応
+- API・タグ集合置換による未対応
+- 証拠不足による未検証
+- 上限到達による未実行
+- 送信結果不明
+- その他の安全停止
 
-## 10. TDD in One Implementation Phase
+未検証のものを成功・完全対応として表示しない。
 
-Work sequentially using RED -> GREEN -> minimal REFACTOR:
+## 9. TDD Strategy
 
-1. Registry shape, full 18-kind coverage, negative capability decisions
-2. Batch Plan/Approval/Report handling of all recognized kinds without broadening executable eligibility
-3. Safe per-kind request, read/readback adapters and service-specific IAM rules
-4. Host-only credential issuance, exact STS mock-request/response binding and runtime gates
-5. Shared Writer and failure/rollback-stop behavior
-6. Explicit opt-in CLI with default fail-closed; audit recording
-7. Fake STS/SDK end-to-end success, rejection, timeout and uncertainty tests
-8. Full regression, manifest integrity and safety-hold assertions
+1工程内で小さなRED → GREEN → REFACTORを繰り返す。
 
-Use existing code wherever possible; do not create an independent review task after each slice. An inability to prove one service kind should not stop independently safe work on other kinds.
+実装順序:
 
-## 11. Implementation Completion Criteria
+1. Registryと18種類の判定テスト
+2. Batch Plan / Approval / Reportの全Kind対応
+3. サービス別AdapterとIAM契約
+4. Host Issuer / Runtime Policy / STS境界
+5. 共通Live WriterとPre-send Read / Readback
+6. CLIの明示Opt-in・監査・停止制御
+7. Fake STS / Fake SDKによるオフラインE2E
+8. 全体回帰・Manifest整合性
 
-1. Registry explicitly handles all 18 recognized kinds.
-2. For each kind, the candidate API/IAM/Readback/side-effect decision has evidence or is honestly \`CAPABILITY_NOT_PROVEN\`. Unproven kinds remain blocked.
-3. Safe candidate kinds have production-oriented adapters, protected runtime paths and offline tests; unsafe kinds return explicit reason/cost/count.
-4. Host/Issuer/STS/Runtime Policy/CLI production code and offline enforceable gates are implemented without enabling live execution.
-5. Missing, expired or forged evidence yields zero mutation calls.
-6. Mock/Fake positive, negative, replay and fault-injection E2E tests pass; legacy Phase A and Batch regressions pass.
-7. Manifest hashes/bytes reconcile for all registered files and \`git diff --check\` passes.
-8. Full 18-kind report reconciles counts/Decimal costs and separates offline implementation from live proof.
-9. No actual AWS/STS/IAM/Trust/Host mutation occurs in the implementation phase; Safety Hold remains active.
-10. Outstanding environmental evidence and operational Owner approval are reported explicitly.
+各段階で独立レビューや新しいTaskを作らない。既存Phase AのSafety Holdを変更しない。
 
-Completion label if all conditions hold: \`PRODUCTION_IMPLEMENTATION_COMPLETE / OFFLINE_TDD_PASS / LIVE_ACCEPTANCE_NOT_VERIFIED\`.
+## 10. Completion Criteria
 
-## 12. Stop Conditions and Human Owner Checkpoint
+次をすべて満たすこと。
 
-Stop the affected write path if satisfying it would require bypassing Owner approval, weakening IAM/Name protection, accepting an unproven tag-set overwrite, expanding privileges, trusting fabricated provenance, or assuming an unavailable Host guarantee. Independent safe kinds can still progress.
+1. 18種類すべてがRegistryで明示的に扱われる。
+2. 各KindのAPI・IAM・Name保護・Readback・副作用について、根拠付きの対応可否が確定する。証拠不足は未検証として正しく扱う。
+3. 安全条件が成立するKindについて、本番用Adapterが実装される。
+4. Host Issuer、STS、Runtime Policy、CLIの本番用コードが完成する。
+5. 不正・欠落・期限切れの証拠では実AWS呼出しを拒否する。
+6. Mock/Fakeでの正常・拒否・障害系E2EがPASSする。
+7. 全体回帰テストとManifest検証がPASSする。
+8. 全18種類の結果を件数・費用・理由付きで報告できる。
+9. 実AWS操作は未実施であり、Safety Holdは維持される。
+10. 実Host受入に必要な環境依存証拠・未承認事項が明示される。
 
-Implementation completion is **not** live acceptance, Gate clearance, release approval, or permission to mutate any AWS target. The following remain operationally active until their distinct evidence and Owner authorization exist:
+不足した実環境証拠を理由に、本番実装コードの完成判定を無制限に延期しない。ただし、実装すべきAdapterや安全ゲートが未完成の場合は、単なる文書上の説明で完了扱いしない。
 
-\`\`\`text
+## 11. Stop Conditions
+
+安全ゲートの迂回、既存Name保護の破壊、署名の弱体化、無制限権限、意図しないタグ集合の置換が必要となる場合は、その経路を停止する。
+
+その他の独立した安全なKindの実装は継続できる。
+
+## 12. Final Deliverable / Human Owner Checkpoint
+
+```text
+PRODUCTION_IMPLEMENTATION_COMPLETE
+OFFLINE_TDD_PASS
+LIVE_ACCEPTANCE_NOT_VERIFIED
 SAFETY_HOLD_ACTIVE
 AWS_WRITE_BLOCKED
 G1_NOT_PROVEN
 G2_NOT_VERIFIED
 AWS_RUNTIME_NOT_AUTHORIZED
-\`\`\`
+```
 
-Do not automatically start follow-on review, remediation, implementation, Commit, Push, PR, Merge or AWS activity. Stop at a Human Owner decision checkpoint. The scope of this document ends at the Design R0.1 proposal.
+実装完了後はHuman Owner Checkpointで停止する。
+
+Commit、Push、PR、Merge、実AWS受入、IAM/Trust変更、Safety Hold解除はそれぞれ別途承認を必要とする。
+
+新規Findingだけを理由に設計・訂正・独立レビューの循環を開始しない。
+
+この文書はDesign R0.1案を記録するものであり、未承認の実装Taskを開始するものではない。
