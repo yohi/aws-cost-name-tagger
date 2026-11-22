@@ -164,6 +164,51 @@ class LiveCase(unittest.TestCase):
         frame = self.sockets[index].sent
         return json.loads(frame[4:])
 
+    @contextlib.contextmanager
+    def forbid_owner_ledger_and_sdk(self):
+        """Any batch-live call into an Owner verifier, trust loader, Ledger or SDK fails.
+
+        Patches both the CLI-namespace bindings (bound at import time) and the defining
+        modules, so a call through any helper or alias is detected.
+        """
+        import name_tag_approval
+        import name_tag_ledger
+        reached: list[str] = []
+
+        def forbidden(label):
+            def fail(*_args, **_kwargs):
+                reached.append(label)  # recorded even if a caller swallows the error
+                raise AssertionError(f"batch-live must not reach {label}")
+            return fail
+        targets = (
+            (cli, "verify_batch_approval"), (cli, "load_current_protected_owner_trust"),
+            (cli, "simulate_on_fixture_ledger"), (cli, "make_authenticated_batch_report"),
+            ("name_tag_batch_approval", "verify_batch_approval"),
+            ("name_tag_batch_approval", "_verify_batch_owner_signature"),
+            ("name_tag_batch_trust", "load_current_protected_owner_trust"),
+            ("name_tag_controlled", "_load_owner_trust"),
+            ("name_tag_approval", "_verify_signature"),
+            ("name_tag_ledger", "open_ledger"),
+            ("name_tag_batch_runtime", "execute_batch_live"),
+            (host_runtime, "open_verified_host_runtime"))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(sys.modules, {"boto3": None, "botocore": None}))
+            for owner, name in targets:
+                label = f"{owner if isinstance(owner, str) else owner.__name__}.{name}"
+                if isinstance(owner, str):
+                    stack.enter_context(mock.patch(label, side_effect=forbidden(label)))
+                else:
+                    stack.enter_context(mock.patch.object(owner, name,
+                                                          side_effect=forbidden(label)))
+            stack.enter_context(mock.patch.object(
+                name_tag_ledger.IntentLedger, "__init__",
+                side_effect=forbidden("IntentLedger.__init__")))
+            stack.enter_context(mock.patch.object(
+                name_tag_approval.OwnerTrust, "from_allowed_signers",
+                side_effect=forbidden("OwnerTrust.from_allowed_signers")))
+            yield
+        self.assertEqual(reached, [])
+
     def assert_never_success_claim(self, doc):
         self.assertIs(doc["zero_writes_implied"], False)
         self.assertIs(doc["all_rows_applied_implied"], False)
@@ -305,16 +350,9 @@ class ClientWiringTests(LiveCase):
                      "load_current_protected_owner_trust", "verify_batch_approval",
                      "execute_batch_live", "HostBatchCredentialIssuer", "OwnerTrust"):
             self.assertNotIn(name, names)
-        # Behavioural: no Owner verifier, Ledger, Host runtime or SDK is touched on this path.
+        # Behavioural: no Owner verifier, trust loader, Ledger, Host runtime or SDK is touched.
         self.endpoint.result = run_result({"batch_id": self.batch_id, "report_sha256": REPORT})
-        boom = AssertionError("batch-live must not reach this")
-        with mock.patch.dict(sys.modules, {"boto3": None, "botocore": None}), \
-                mock.patch("name_tag_batch_trust.load_current_protected_owner_trust",
-                           side_effect=boom), \
-                mock.patch("name_tag_batch_approval.verify_batch_approval", side_effect=boom), \
-                mock.patch("name_tag_ledger.open_ledger", side_effect=boom), \
-                mock.patch("name_tag_batch_runtime.execute_batch_live", side_effect=boom), \
-                mock.patch.object(host_runtime, "open_verified_host_runtime", side_effect=boom):
+        with self.forbid_owner_ledger_and_sdk():
             self.assertEqual(self.run_cli(), 0)
 
     def test_cli_cannot_choose_socket_or_env_grant(self):
@@ -495,6 +533,22 @@ class StatusSemanticsTests(LiveCase):
             self.assertNotIn("no write", doc["status_meaning"].lower())
         self.assertNotIn("zero", self.stdout.lower())
 
+    def test_summary_write_failure_after_reply_reports_real_status(self):
+        cases = (("COMPLETE", 0, {}, ValueError("Refusing overwrite of existing output")),
+                 ("UNKNOWN", 3, {"reply_mode": "lost"}, OSError("disk full")))
+        for status, exit_code, kwargs, error in cases:
+            with self.subTest(status=status):
+                self.endpoint.seen_batches.clear()
+                self.endpoint.result = run_result({"batch_id": self.batch_id,
+                                                   "report_sha256": REPORT})
+                self.socket_kwargs = kwargs
+                with mock.patch.object(cli, "_write_new", side_effect=error):
+                    self.assertEqual(self.run_cli(out=f"{status}.json"), exit_code)
+                self.assertIn(f"status={status}", self.stdout)
+                self.assertIn(f"status={status}", self.stderr)
+                self.assertNotIn("BLOCKED (offline)", self.stderr)
+                self.assertFalse((self.root / f"{status}.json").exists())
+
     def test_cli_complete_not_all_rows_applied(self):
         self.endpoint.result = run_result({"batch_id": self.batch_id, "report_sha256": REPORT},
                                           outcomes=("APPLIED_VERIFIED", "NOT_ATTEMPTED_CAP"))
@@ -552,8 +606,7 @@ class HostAuthorityTests(LiveCase):
         self.endpoint.result = run_result({"batch_id": self.batch_id, "report_sha256": REPORT})
         boom = AssertionError("no grant/SDK on the client")
         with mock.patch("name_tag_batch_host_issuer.HostBatchCredentialIssuer.issue",
-                        side_effect=boom), \
-                mock.patch.dict(sys.modules, {"boto3": None, "botocore": None}):
+                        side_effect=boom), self.forbid_owner_ledger_and_sdk():
             self.assertEqual(self.run_cli(), 0)
 
     def test_cli_supplied_host_runtime_path_ignored_and_rejected(self):

@@ -124,7 +124,10 @@ uv run --locked --no-build python name_tag_batch_report_reader.py \
 2. The reader checks that signature against the current OwnerTrust, role
    (`batch-approver`) and revocation. The Owner key must be enrolled for this
    namespace in the root-managed allowed-signers file. It also re-verifies the
-   original Batch envelope.
+   original Batch envelope. Namespace separation relies on the
+   allowed-signers `namespaces=` option: an Owner line without it accepts
+   signatures in any namespace, so give every Owner line an explicit
+   `namespaces="..."` list.
 3. It finds the Host StateDirectory from the root-pinned Host manifest, reads
    `batch-reports/<batch_id>/index.json`, and opens only the report that index
    names. It checks the exact stored-bytes digest, the embedded Batch ID and the

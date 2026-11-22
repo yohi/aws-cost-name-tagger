@@ -318,8 +318,9 @@ def _batch_live(args):
     print(summary['status_meaning'])
     try:
         _write_new(args.report_out,_pretty(summary))
-    except OSError as error:
-        print(f'Local summary was NOT written ({error}); the Host reply above stands.',
+    except (OSError,ValueError) as error:  # e.g. output created after the precheck
+        print(f'Local summary was NOT written ({error}); the Host reply status='
+              f'{response.status} code={response.code} above stands.',
               file=sys.stderr)
     return _LIVE_EXIT[response.status]
 

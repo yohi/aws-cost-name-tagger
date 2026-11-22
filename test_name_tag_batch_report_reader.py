@@ -200,6 +200,28 @@ class ReportRecoveryTests(ReaderHarness):
         with self.assertRaises(ReportReadDenied):
             self.recover(batch, auth, envelope=forged)
 
+    def test_read_namespace_signature_cannot_be_batch_envelope(self):
+        """Reverse of the batch_namespace_signature case: namespaces are not interchangeable."""
+        from name_tag_batch_approval import BatchAuthRejected, verify_batch_approval
+        batch = self.prepare(cap=1, records=[volume_record(0)])
+        envelope = json.loads(batch.raw_envelope_bytes)
+
+        def signed_with(namespace):
+            signature = self._sign(self.batch_key_path, batch.canonical_payload_bytes, namespace)
+            return json.dumps({**envelope, "signature_ref": base64.b64encode(signature).decode()},
+                              separators=(",", ":")).encode()
+        # The key is enrolled for both namespaces, so only the namespace check can deny.
+        verified = verify_batch_approval(batch.plan_bytes, batch.csv_bytes,
+                                         signed_with(BATCH_NAMESPACE), trust=self.read_trust,
+                                         now_utc=self.clock_now)
+        self.assertEqual(verified.batch_id, batch.batch_id)
+        with self.assertRaises(BatchAuthRejected):
+            verify_batch_approval(batch.plan_bytes, batch.csv_bytes, signed_with(READ_NAMESPACE),
+                                  trust=self.read_trust, now_utc=self.clock_now)
+        with self.assertRaises(ReportReadDenied):  # and the reader denies it as an envelope
+            self.recover(batch, self.read_auth(batch.batch_id),
+                         envelope=signed_with(READ_NAMESPACE))
+
     def test_read_only_report_command_never_calls_execution_ipc_or_sts(self):
         imported = set()
         for node in ast.walk(ast.parse(READER_SOURCE)):
