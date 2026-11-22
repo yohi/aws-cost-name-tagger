@@ -41,6 +41,12 @@ KIND_REGISTRY = MappingProxyType({"volume": KindPolicy("ec2:CreateTags", "ec2:De
 MACHINE_ID = "1" * 32
 BOOT_ID = "2" * 32
 INVOCATION_ID = "3" * 32
+_RUN_COUNTER = iter(range(1, 1 << 30))
+
+
+def next_invocation_id() -> str:
+    """Each Fake Host start (or restart) is a distinct systemd invocation, as on a real Host."""
+    return f"{next(_RUN_COUNTER):032x}"
 SVC_UID = os.getuid()
 SVC_GID = os.getgid()
 
@@ -179,6 +185,7 @@ class FakeLedger:
         self.scope_states: dict[str, str] = {"s1": "CLEARED"}
         self.calls: list[str] = []
         self.owned = False  # whether this execution durably consumed the row's Permit
+        self.permit_identity = None  # (authorization_id, execution_id, sha256(token))
 
     def batch_execution_state(self, batch):
         self.calls.append("batch_execution_state")
@@ -191,6 +198,9 @@ class FakeLedger:
 
     def batch_intent_owned_by_current_execution(self, batch, row_index):
         return self.owned
+
+    def batch_send_permit_identity(self, batch, row_index):
+        return self.permit_identity
 
     def create_batch_intent(self, *args, **kwargs):  # pragma: no cover - must never run
         self.calls.append("create_batch_intent")
@@ -236,7 +246,7 @@ def host_fixture(testcase: unittest.TestCase, *, restart_of: HostFixture | None 
         os.mkdir(state_dir, 0o700)
     else:
         tmp, state_dir = restart_of.tmp, restart_of.state_dir
-    fake_os = FakeHostOS(state_dir, INVOCATION_ID if restart_of is None else "4" * 32)
+    fake_os = FakeHostOS(state_dir, next_invocation_id())
     fixture = HostFixture(tmp, fake_os, FakeLedger())
     if restart_of is not None:
         fixture.events = restart_of.events
@@ -252,7 +262,7 @@ class HostBootstrapTests(unittest.TestCase):
         self.assertIs(type(host), VerifiedHostContext)
         self.assertIs(require_verified_host(host), host)
         self.assertEqual(host.service_unit, "aws-cnt-batch.service")
-        self.assertEqual(host.run_id, INVOCATION_ID)
+        self.assertEqual(host.run_id, fx.os.process.invocation_id)
         self.assertEqual(host.authorized_role_arn, ROLE_ARN)
         self.assertEqual(host.manifest_sha256, fx.os.manifest_sha256)
         self.assertEqual(host.live_status, "NOT_VERIFIED")

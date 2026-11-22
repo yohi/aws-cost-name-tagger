@@ -203,6 +203,26 @@ class SyntheticIamEvidenceProducer:
         return evidence
 
 
+_DENY_FIELDS: Final = ("row_authority_id", "evidence_sha256", "expires_at_utc", "provenance")
+
+
+def _field_digest(obj: object, names: tuple[str, ...]) -> str:
+    """Digest of a protected reference's scalar fields, recorded at mint time."""
+    values = []
+    for name in names:
+        value = getattr(obj, name)
+        values.append(value.isoformat() if isinstance(value, datetime) else value)
+    return sha256(canonical_bytes(values)).hexdigest()
+
+
+@dataclass(frozen=True, eq=False)
+class _DenyBinding:
+    issued: HostIssuedSession
+    scope: "VerifiedHostScope"
+    provenance: str
+    digest: str
+
+
 class VerifiedDenyEvidence(_Protected):
     __slots__ = ("issued", "row_authority_id", "scope", "evidence_sha256", "expires_at_utc",
                  "provenance", "__weakref__")
@@ -300,7 +320,8 @@ class _IamEvidenceVerifierBase:
             _MINT, issued=issued, row_authority_id=row.row_authority_id, scope=scope,
             evidence_sha256=digest, provenance=evidence.provenance,
             expires_at_utc=min(evidence.expires_at_utc, issued.expiration, scope.not_after_utc))
-        _DENIES[deny] = issued
+        _DENIES[deny] = _DenyBinding(issued, scope, deny.provenance,
+                                     _field_digest(deny, _DENY_FIELDS))
         return deny
 
 
@@ -317,14 +338,17 @@ class OfflineSyntheticIamEvidenceVerifier(_IamEvidenceVerifierBase):
 
 
 # ---------------------------------------------------------------- one-shot runtime grant
+_GRANT_FIELDS: Final = (
+    "host_id", "run_id", "batch_id", "row_authority_id", "row_tuple_sha256", "resource_arn",
+    "approved_name", "aws_operation", "scope_id", "ownership_proof_ref", "permit_sha256",
+    "receipt_sha256", "client_identity", "capability_version", "proof_sha256",
+    "expires_at_utc", "provenance")
+
+
 class VerifiedRuntimeGrant(_Protected):
     """Process-local, non-serializable, one-shot grant consumed at SDK dispatch."""
 
-    __slots__ = ("host_id", "run_id", "batch_id", "row_authority_id", "row_tuple_sha256",
-                 "resource_arn", "approved_name", "aws_operation", "scope_id",
-                 "ownership_proof_ref", "permit_sha256", "receipt_sha256", "client_identity",
-                 "capability_version", "proof_sha256", "expires_at_utc", "provenance",
-                 "__weakref__")
+    __slots__ = _GRANT_FIELDS + ("__weakref__",)
 
     def __init__(self, _mint: object = None, **values) -> None:
         _mint_guard(_mint)
@@ -340,10 +364,14 @@ class _GrantBinding:
     permit: FirstSendPermit
     issued: HostIssuedSession
     row: VerifiedBatchRowAuthority
+    provenance: str
+    digest: str
 
 
 _GRANTS: WeakKeyDictionary = WeakKeyDictionary()
-_USED_PERMITS: dict[int, FirstSendPermit] = {}
+# One grant per (Host run, Batch, row) for the life of the process: an equal-valued second
+# FirstSendPermit, a fresh deny bundle or a re-presented session can never mint another.
+_GRANTED_ROWS: set[tuple[str, str, int]] = set()
 
 
 def _permit_sha256(permit: FirstSendPermit) -> str:
@@ -368,14 +396,21 @@ class _RuntimeVerifierBase:
     def authorize_once(self, row, issued, scope, deny, permit) -> VerifiedRuntimeGrant:
         now = require_aware_utc(self._clock())
         issued, scope = _check_binding(issued, row, scope, now)
-        if (type(deny) is not VerifiedDenyEvidence or _DENIES.get(deny) is not issued
+        binding = _DENIES.get(deny) if type(deny) is VerifiedDenyEvidence else None
+        if (binding is None or binding.issued is not issued or binding.scope is not scope
                 or deny.issued is not issued or deny.scope is not scope
+                or binding.digest != _field_digest(deny, _DENY_FIELDS)
                 or deny.row_authority_id != row.row_authority_id or not now < deny.expires_at_utc):
-            raise _blocked("deny evidence missing, expired or not bound")
-        if deny.provenance != self._required_provenance:
+            raise _blocked("deny evidence missing, consumed, expired, altered or not bound")
+        if binding.provenance != self._required_provenance or deny.provenance != binding.provenance:
             raise _blocked("live effective-IAM evidence NOT_VERIFIED (G2_NOT_VERIFIED)")
+        receipt = issued.receipt
+        row_key = (receipt.run_id, receipt.batch_id, row.row_index)
+        if row_key in _GRANTED_ROWS:
+            raise _blocked("a runtime grant was already minted for this row/session",
+                           "BLOCKED_INTENT_REPLAY")
         fields = row.row
-        if (type(permit) is not FirstSendPermit or id(permit) in _USED_PERMITS
+        if (type(permit) is not FirstSendPermit
                 or permit.resource_arn != fields.get("resource_arn")
                 or permit.approved_name != fields.get("approved_name")
                 or permit.writer_control_scope_id != fields.get("writer_control_scope_id")
@@ -383,16 +418,18 @@ class _RuntimeVerifierBase:
             raise _blocked("FirstSendPermit missing, reused or mismatched")
         if scope.scope.responsible_owner != row.batch.owner_principal_id:
             raise _blocked("Scope owner differs from the signing Owner", "BLOCKED_SCOPE_MISMATCH")
+        ledger = bound_ledger(scope.host)
         try:
-            owned = bound_ledger(scope.host).batch_intent_owned_by_current_execution(
-                row.batch, row.row_index)
+            owned = ledger.batch_intent_owned_by_current_execution(row.batch, row.row_index)
+            recorded = ledger.batch_send_permit_identity(row.batch, row.row_index)
         except Exception as error:  # noqa: BLE001
             raise _blocked("Ledger Permit state unreadable",
                            "BLOCKED_SCOPE_STATE_UNKNOWN") from error
-        if owned is not True:
-            raise _blocked("Ledger shows no Permit consumed by this execution")
+        presented = (permit.authorization_id, permit.execution_id,
+                     sha256(permit.ownership_token.encode("utf-8")).hexdigest())
+        if owned is not True or recorded != presented:
+            raise _blocked("Permit is not the Ledger's consumed Intent for this execution")
         capability = caps.resolve_kind_capability(fields.get("kind"))
-        receipt = issued.receipt
         grant = VerifiedRuntimeGrant(
             _MINT, host_id=receipt.host_id, run_id=receipt.run_id, batch_id=receipt.batch_id,
             row_authority_id=row.row_authority_id,
@@ -404,8 +441,10 @@ class _RuntimeVerifierBase:
             client_identity=issued.client_identity(capability.service, fields["region"]),
             capability_version=capability.version, proof_sha256=deny.evidence_sha256,
             expires_at_utc=deny.expires_at_utc, provenance=deny.provenance)
-        _USED_PERMITS[id(permit)] = permit
-        _GRANTS[grant] = _GrantBinding(permit, issued, row)
+        _GRANTED_ROWS.add(row_key)
+        _DENIES.pop(deny, None)  # deny evidence is consumed by the single grant
+        _GRANTS[grant] = _GrantBinding(permit, issued, row, grant.provenance,
+                                       _field_digest(grant, _GRANT_FIELDS))
         return grant
 
 
@@ -421,16 +460,18 @@ class OfflineSyntheticRuntimeVerifier(_RuntimeVerifierBase):
     _required_provenance = SYNTHETIC_PROVENANCE
 
 
-def consume_runtime_grant(grant: object, *, row: VerifiedBatchRowAuthority,
-                          permit: FirstSendPermit, target: CanonicalTargetIdentity,
-                          now_utc: datetime, require_live: bool = True) -> None:
-    """Check and consume the grant at the SDK dispatch boundary (exactly once)."""
+def _consume_grant(grant: object, *, row: VerifiedBatchRowAuthority,
+                   permit: FirstSendPermit, target: CanonicalTargetIdentity,
+                   now_utc: datetime) -> _GrantBinding:
     now = require_aware_utc(now_utc)
     if type(grant) is not VerifiedRuntimeGrant:
         raise _blocked("no protected runtime grant")
     binding = _GRANTS.pop(grant, None)  # consumed even if a later check refuses
     if binding is None:
         raise _blocked("runtime grant unknown or already consumed")
+    if (binding.digest != _field_digest(grant, _GRANT_FIELDS)
+            or grant.provenance != binding.provenance):
+        raise _blocked("runtime grant was altered after minting")
     if (binding.permit is not permit or binding.row is not row
             or row.row_authority_id != grant.row_authority_id
             or type(target) is not CanonicalTargetIdentity
@@ -439,5 +480,22 @@ def consume_runtime_grant(grant: object, *, row: VerifiedBatchRowAuthority,
             or not now < grant.expires_at_utc):
         raise _blocked("runtime grant does not match the dispatch")
     require_issued_session(binding.issued, binding.issued.selection.host, now)
-    if require_live and grant.provenance != LIVE_PROVENANCE:
+    return binding
+
+
+def consume_runtime_grant(grant: object, *, row: VerifiedBatchRowAuthority,
+                          permit: FirstSendPermit, target: CanonicalTargetIdentity,
+                          now_utc: datetime) -> None:
+    """The SDK dispatch boundary: live-only, exactly once, no caller override."""
+    binding = _consume_grant(grant, row=row, permit=permit, target=target, now_utc=now_utc)
+    if binding.provenance != LIVE_PROVENANCE:
         raise _blocked("synthetic grant cannot authorize a live SDK dispatch")
+
+
+def consume_offline_synthetic_grant(grant: object, *, row: VerifiedBatchRowAuthority,
+                                    permit: FirstSendPermit, target: CanonicalTargetIdentity,
+                                    now_utc: datetime) -> None:
+    """OFFLINE tests only: consume a synthetic grant. Never a dispatch authorization."""
+    binding = _consume_grant(grant, row=row, permit=permit, target=target, now_utc=now_utc)
+    if binding.provenance != SYNTHETIC_PROVENANCE:
+        raise _blocked("only synthetic grants are consumed offline")
