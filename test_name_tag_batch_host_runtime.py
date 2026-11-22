@@ -178,6 +178,7 @@ class FakeLedger:
         self.error: Exception | None = None
         self.scope_states: dict[str, str] = {"s1": "CLEARED"}
         self.calls: list[str] = []
+        self.owned = False  # whether this execution durably consumed the row's Permit
 
     def batch_execution_state(self, batch):
         self.calls.append("batch_execution_state")
@@ -187,6 +188,9 @@ class FakeLedger:
 
     def effective_scope_state(self, scope_id):
         return self.scope_states.get(scope_id, "UNKNOWN")
+
+    def batch_intent_owned_by_current_execution(self, batch, row_index):
+        return self.owned
 
     def create_batch_intent(self, *args, **kwargs):  # pragma: no cover - must never run
         self.calls.append("create_batch_intent")

@@ -14,6 +14,16 @@ from weakref import WeakValueDictionary
 
 class CredentialBlocked(RuntimeError):pass
 
+# Provenance of every OfflineFakeIssuer session/receipt. It can never satisfy the protected
+# Host path: name_tag_batch_host_issuer.HostCredentialIssuer and the Task 6 runtime gates
+# accept only Host-issued protected references, and refuse this value outright.
+SYNTHETIC_PROVENANCE='OFFLINE_SYNTHETIC_NOT_STS'
+
+
+def is_offline_synthetic(value:object)->bool:
+    """True for any synthetic session/evidence marker; such values never authorize a Host."""
+    return type(value) is IssuedBatchSession or getattr(value,'provenance',None)==SYNTHETIC_PROVENANCE
+
 @dataclass(frozen=True)
 class IssuedBatchSession:
     batch_id:str

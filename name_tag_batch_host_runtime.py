@@ -227,6 +227,10 @@ def _strict_json(raw: bytes) -> dict:
     return value
 
 
+class HostBootstrapVerifier(Protocol):
+    def verify_process(self, *, now_utc: datetime) -> VerifiedHostContext: ...
+
+
 class SystemdHostBootstrapVerifier:
     """HostBootstrapVerifier for the single fixed ``aws-cnt-batch.service`` architecture."""
 
@@ -814,3 +818,57 @@ def select_next_sts_subset(batch, *, ledger, kind_registry: Mapping[str, object]
         signed_cap=cap, scope_id=row["writer_control_scope_id"], capability=capability,
         target=target, name_evidence_sha256=evidence.evidence_digest, selected_at_utc=now)
     return spec
+
+
+# ---------------------------------------------------------------- protected command endpoint
+class HostBatchCoordinator(Protocol):
+    """Task 7: the existing single name_tag_batch_runtime Coordinator over the Host Ledger."""
+
+    def run_signed_batch(self, batch, *, host: VerifiedHostContext, issuer: object,
+                         now_utc: datetime): ...
+
+
+class ProtectedHostCommandEndpoint(Protocol):
+    def execute_signed_batch(self, *, plan_bytes: bytes, csv_bytes: bytes,
+                             owner_envelope_bytes: bytes, host: VerifiedHostContext): ...
+
+
+class ProtectedBatchHostEndpoint:
+    """Host-only endpoint entered after formal IPC acceptance (Task 6B server calls it).
+
+    Re-verifies the Host context and the exact signed Plan/CSV/Owner envelope against the
+    current protected OwnerTrust, then delegates to the single Coordinator. Without a
+    protected Host issuer and Coordinator it refuses with AWS_RUNTIME_NOT_AUTHORIZED.
+    Raises HostRuntimeBlocked(code) for every refusal; it never returns a fabricated result.
+    """
+
+    def __init__(self, *, issuer: object = None, coordinator: HostBatchCoordinator | None = None,
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+        self._issuer = issuer
+        self._coordinator = coordinator
+        self._clock = clock
+
+    def execute_signed_batch(self, *, plan_bytes: bytes, csv_bytes: bytes,
+                             owner_envelope_bytes: bytes, host: VerifiedHostContext):
+        import name_tag_batch_approval as approval
+        from name_tag_batch_host_issuer import HostBatchCredentialIssuer
+
+        host = require_verified_host(host)
+        if any(type(v) is not bytes or not v for v in (plan_bytes, csv_bytes, owner_envelope_bytes)):
+            raise _blocked("signed inputs must be non-empty exact bytes", "BLOCKED_OWNER_AUTHN")
+        if type(self._issuer) is not HostBatchCredentialIssuer or self._coordinator is None:
+            raise _blocked("no protected Host issuer/Coordinator is wired")
+        now = require_aware_utc(self._clock())
+        try:
+            batch = approval.verify_batch_approval(
+                plan_bytes, csv_bytes, owner_envelope_bytes,
+                trust=load_current_protected_owner_trust(), now_utc=now)
+        except (approval.BatchAuthRejected, OSError, ValueError, TypeError) as error:
+            raise _blocked("Owner verification failed", "BLOCKED_OWNER_AUTHN") from error
+        return self._coordinator.run_signed_batch(batch, host=host, issuer=self._issuer,
+                                                  now_utc=now)
+
+
+def production_host_endpoint() -> ProtectedBatchHostEndpoint:
+    """Production wiring in this phase: no protected issuer/Coordinator -> fail closed."""
+    return ProtectedBatchHostEndpoint()
