@@ -73,11 +73,17 @@ def _validate_payload(payload):
     canonical_bytes(payload)
 
 
+def approved_row_tuple(row_index,row,*,account,partition):
+    """The exact Owner-signed tuple for one approved row (the approved_rows_sha256 element)."""
+    r=row
+    return [row_index,r['proposal_id'],account,partition,r['region'],r['resource_arn'],r['name_state'],r['name_key_present'],r['name_raw_value'],r['approved_name'],r['aws_operation'],r['writer_control_scope_id'],'YES']
+
+
 def _approved_tuples(draft):
     out=[]
     for i,r in enumerate(draft.rows):
         if r['approved']!='YES':continue
-        out.append([i,r['proposal_id'],draft.plan['account'],draft.plan['partition'],r['region'],r['resource_arn'],r['name_state'],r['name_key_present'],r['name_raw_value'],r['approved_name'],r['aws_operation'],r['writer_control_scope_id'],'YES'])
+        out.append(approved_row_tuple(i,r,account=draft.plan['account'],partition=draft.plan['partition']))
     return out
 
 @dataclass(frozen=True)

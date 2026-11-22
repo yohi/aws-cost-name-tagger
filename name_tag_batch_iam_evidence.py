@@ -18,7 +18,7 @@ from typing import Final, Protocol
 from weakref import WeakKeyDictionary
 
 import name_tag_kind_capabilities as caps
-from name_tag_batch_approval import VerifiedBatchRowAuthority, canonical_bytes
+from name_tag_batch_approval import VerifiedBatchRowAuthority, approved_row_tuple, canonical_bytes
 from name_tag_batch_credentials import SYNTHETIC_PROVENANCE, is_offline_synthetic
 from name_tag_batch_host_issuer import HostIssuedSession, require_issued_session
 from name_tag_batch_host_runtime import (
@@ -458,7 +458,11 @@ class _RuntimeVerifierBase:
         grant = VerifiedRuntimeGrant(
             _MINT, host_id=receipt.host_id, run_id=receipt.run_id, batch_id=receipt.batch_id,
             row_authority_id=row.row_authority_id,
-            row_tuple_sha256=sha256(canonical_bytes(dict(fields))).hexdigest(),
+            # Digest of the exact signed row tuple: the full Plan record may legitimately carry
+            # non-canonical fields (e.g. float legacy_rank_cost) that are not Owner-signed.
+            row_tuple_sha256=sha256(canonical_bytes(approved_row_tuple(
+                row.row_index, fields, account=row.batch.payload["account"],
+                partition=row.batch.payload["partition"]))).hexdigest(),
             resource_arn=fields["resource_arn"], approved_name=fields["approved_name"],
             aws_operation=fields["aws_operation"], scope_id=scope.scope_id,
             ownership_proof_ref=scope.target.ownership_proof_ref,
