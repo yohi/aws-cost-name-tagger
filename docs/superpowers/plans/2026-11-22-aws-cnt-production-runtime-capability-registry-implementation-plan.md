@@ -88,6 +88,14 @@ class KindCapabilityDecision:
     evidence_refs: tuple[str, ...]
     version: str
 
+# Design §5.1 uses KindCapability for the same vetted decision;
+# keep one type rather than two competing runtime representations.
+KindCapability = KindCapabilityDecision
+
+class KindCapabilityRegistry(Protocol):
+    def resolve(self, kind: str, arn: str,
+                operation: str) -> KindCapabilityDecision: ...
+
 def resolve_kind_capability(kind: str) -> KindCapabilityDecision: ...
 def canonical_target_identity(*, kind: str, locator: str, resource_arn: str,
                               partition: str, account: str, scope_region: str
