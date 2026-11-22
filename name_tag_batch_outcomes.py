@@ -89,6 +89,38 @@ def _row_outcome(row:BatchOutcomeRow,authentication_state:str)->str:
     return 'UNAPPROVED'
 
 
+def kind_outcome_partition(rows)->dict[str,dict[str,dict[str,str|int]]]:
+    """Per-Kind exact count/cost partition of row outcomes; each row counted exactly once."""
+    grouped:dict[str,dict[str,list[Decimal]]]={}
+    for row in rows:
+        kind=row.get('kind')
+        if type(kind) is not str:
+            raise BatchOutcomeError('Outcome row lacks a Kind')
+        grouped.setdefault(kind,{}).setdefault(row['outcome'],[]).append(
+            _cost(row['effective_usage_cost_usd']))
+    return {
+        kind:{category:{'count':len(costs),'cost_usd':_canonical_decimal(exact_add(costs))}
+              for category,costs in sorted(categories.items())}
+        for kind,categories in grouped.items()
+    }
+
+
+def _refresh_kind_coverage(report:BatchOutcomeReport,rows:list[BatchOutcomeRow])->None:
+    """Keep an attached Kind coverage's outcome axis in step with the final row outcomes."""
+    coverage=report.get('kind_capability_coverage')
+    if coverage is None:
+        return
+    kinds=coverage.get('kinds') if isinstance(coverage,dict) else None
+    partition=kind_outcome_partition(rows)
+    if type(kinds) is not dict or not set(partition)<=set(kinds):
+        raise BatchOutcomeError('Kind coverage does not match the signed rows')
+    for kind,entry in kinds.items():
+        categories=partition.get(kind,{})
+        if sum(item['count'] for item in categories.values())!=entry['selected']['count']:
+            raise BatchOutcomeError('Kind coverage selection does not match the signed rows')
+        entry['outcomes']=categories
+
+
 def reconcile_batch_outcomes(
     report:BatchOutcomeReport,
     ledger_outcomes:Mapping[int,str]|None=None,
@@ -125,6 +157,7 @@ def reconcile_batch_outcomes(
     selected=population['lookup_selected']
     if count!=len(rows) or cost!=_cost(selected['cost_usd']) or len(rows)!=selected['count']:
         raise BatchOutcomeError('Outcome categories do not reconcile to signed selected CUR costs')
+    _refresh_kind_coverage(report,rows)
     report['outcome_reconciliation']=reconciliation
     report['outcome_reconciliation_total']={
         'count':count,'cost_usd':_canonical_decimal(cost),

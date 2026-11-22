@@ -81,4 +81,59 @@ class PopulationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_reason_details({'UNSUPPORTED_KIND:a':{'billing_rows':0,'cost_usd':'0'}},population)
 
+
+class KindPrecapReportingTests(unittest.TestCase):
+    """Task 9: 18-Kind pre-cap stages reconcile exactly with the global schema-2 population."""
+
+    def test_precap_18_kind_sum_matches_global_decimal(self):
+        from name_tag_batch_population import KIND_PRECAP_STAGES, validate_kind_precap
+        from name_tag_kind_capabilities import REGISTRY_KINDS
+        from test_name_tag_batch_report_multikind import eighteen_kind_plan
+        plan=eighteen_kind_plan()
+        population=plan['cur_population']
+        kinds=plan['cur_population_by_kind']['kinds']
+        self.assertEqual(set(kinds),set(REGISTRY_KINDS))
+        validate_kind_precap(plan,population)
+        for stage in KIND_PRECAP_STAGES:
+            with self.subTest(stage=stage):
+                per_kind=[Decimal(kinds[kind][stage]['cost_usd']) for kind in REGISTRY_KINDS]
+                self.assertEqual(sum(kinds[kind][stage]['count'] for kind in REGISTRY_KINDS),
+                                 population[stage]['count'])
+                self.assertEqual(exact_add(per_kind),Decimal(population[stage]['cost_usd']))
+                # 32-place Decimals: a 28-digit context sum would round and disagree.
+                self.assertGreater(len(population['lookup_selected']['cost_usd']),28)
+        self.assertEqual(population['cur_recognized']['count'],54)
+        self.assertEqual(population['lookup_selected']['count'],18)
+
+    def test_below_threshold_and_uninspected_nonvolume_included(self):
+        from name_tag_batch_report import build_batch_dry_run
+        from name_tag_batch_state import build_batch_review_projection
+        from test_name_tag_batch_identity_projection import (
+            INSTANCE, PlanFixture, R, SNAP, VOL, VOL_ARN, cur_row, info_for)
+        fixture=PlanFixture('run_plan')
+        fixture.addCleanup=self.addCleanup
+        other_instance=INSTANCE[:-1]+'1'
+        rows=[cur_row(INSTANCE,'5'),cur_row(VOL,'4'),cur_row(SNAP,'3.125'),
+              cur_row(other_instance,'0.5')]
+        infos={INSTANCE:info_for('instance',INSTANCE),VOL:info_for('volume',VOL_ARN)}
+        doc=fixture.run_plan(rows,infos,fixture.scope(R,[VOL_ARN]),min_cost='1',max_resources='2')
+        kinds=doc['cur_population_by_kind']['kinds']
+        self.assertEqual(kinds['snapshot']['max_resources_not_inspected'],{'count':1,'cost_usd':'3.125'})
+        self.assertEqual(kinds['snapshot']['lookup_selected'],{'count':0,'cost_usd':'0'})
+        self.assertEqual(kinds['instance']['below_min_cost'],{'count':1,'cost_usd':'0.5'})
+        self.assertEqual(kinds['instance']['lookup_selected'],{'count':1,'cost_usd':'5'})
+        self.assertEqual(sorted(r['kind'] for r in doc['records']),['instance','volume'])
+        plan_bytes=fixture.out.read_bytes()
+        coverage=build_batch_dry_run(plan_bytes,build_batch_review_projection(plan_bytes))[
+            'kind_capability_coverage']
+        snapshot=coverage['kinds']['snapshot']
+        self.assertEqual(snapshot['precap']['max_resources_not_inspected'],
+                         {'count':1,'cost_usd':'3.125'})
+        self.assertEqual((snapshot['selected'],snapshot['outcomes']),({'count':0,'cost_usd':'0'},{}))
+        self.assertEqual(coverage['kinds']['instance']['precap']['below_min_cost'],
+                         {'count':1,'cost_usd':'0.5'})
+        self.assertEqual(coverage['precap_total']['cur_recognized'],{'count':4,'cost_usd':'12.625'})
+        self.assertEqual(coverage['precap_total']['max_resources_not_inspected'],
+                         {'count':1,'cost_usd':'3.125'})
+
 if __name__=='__main__':unittest.main()
