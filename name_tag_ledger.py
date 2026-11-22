@@ -1366,7 +1366,38 @@ class IntentLedger:
         finally:
             self._unlock()
 
-    def _validated_batch_intent_fields(self,row,scope,side_effects):
+    @staticmethod
+    def _vetted_batch_write_operation(batch,row)->str:
+        """RG-PRC-004: the signed row's exact operation from the current vetted Kind Registry.
+
+        Batch path only (the legacy VerifiedEnvelope SUPPORTED_OPERATIONS check is separate
+        and unchanged). Unknown, unproven (CNP), policy-blocked or tag-set-replacing Kinds,
+        a non-genuine Registry decision, a wrong operation or a non-canonical ARN all refuse.
+        """
+        import name_tag_kind_capabilities as caps
+        from name_tag_kind_adapters import _PROMOTION_BLOCKS
+
+        kind=row.get("kind")
+        try:
+            decision=caps.resolve_kind_capability(kind)
+            target=caps.canonical_target_identity(
+                kind=kind,locator=row.get("locator"),resource_arn=row.get("resource_arn"),
+                partition=batch.payload.get("partition"),account=batch.payload.get("account"),
+                scope_region=row.get("region"))
+        except (ValueError,TypeError,AttributeError) as error:
+            raise LedgerError("BLOCKED_OWNER_AUTHN") from error
+        if (type(decision) is not caps.KindCapabilityDecision
+                or decision.version!=caps.REGISTRY_VERSION
+                or decision.kind!=kind
+                or decision.status!="IMPLEMENTED_OFFLINE"
+                or decision.tag_set_replacement
+                or kind in _PROMOTION_BLOCKS
+                or row.get("aws_operation")!=decision.write_operation
+                or target.resource_arn!=row.get("resource_arn")):
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        return decision.write_operation
+
+    def _validated_batch_intent_fields(self,batch,row,scope,side_effects):
         scope_id=row.get("writer_control_scope_id")
         resource_arn=row.get("resource_arn")
         approved_name=row.get("approved_name")
@@ -1374,12 +1405,19 @@ class IntentLedger:
         proposal_id=row.get("proposal_id")
         fields=(scope_id,resource_arn,approved_name,aws_operation,proposal_id)
         if (not all(isinstance(value,str) and value for value in fields)
-                or aws_operation!="ec2:CreateTags"
                 or not isinstance(scope,ScopeEvidence)
                 or scope.writer_control_scope_id!=scope_id
                 or not isinstance(side_effects,Sequence) or not side_effects
                 or any(not isinstance(item,SideEffectEvidence) for item in side_effects)):
             raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+        if aws_operation!=self._vetted_batch_write_operation(batch,row):
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        if (scope.account!=batch.payload.get("account")
+                or scope.partition!=batch.payload.get("partition")
+                or scope.region!=row.get("region")
+                or resource_arn not in scope.controlled_arns
+                or sum(1 for item in side_effects if item.target_arn==resource_arn)!=1):
+            raise LedgerError("BLOCKED_SCOPE_MISMATCH")
         return scope_id,resource_arn,approved_name,aws_operation,proposal_id
 
     def create_batch_intent(
@@ -1396,7 +1434,7 @@ class IntentLedger:
         batch = fresh.batch
         row = fresh.row
         scope_id,resource_arn,approved_name,aws_operation,proposal_id=(
-            self._validated_batch_intent_fields(row,scope,side_effects)
+            self._validated_batch_intent_fields(batch,row,scope,side_effects)
         )
         now = self._now()
         intent_id = uuid.uuid4().hex
@@ -1968,6 +2006,10 @@ class IntentLedger:
         fresh=self._revalidate_batch_row(batch_authority) if batch_authority is not None else None
         if fresh is not None and fresh.row_authority_id!=handle.authorization_id:
             raise LedgerError("BLOCKED_INTENT_REPLAY")
+        if (fresh is not None
+                and fresh.row.get("aws_operation")!=self._vetted_batch_write_operation(
+                    fresh.batch,fresh.row)):
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
         return fresh
 
     def consume_first_send(self, handle: IntentHandle) -> FirstSendPermit:
