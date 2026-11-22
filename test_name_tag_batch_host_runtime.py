@@ -335,5 +335,128 @@ class HostBootstrapTests(unittest.TestCase):
             fx.verify()
 
 
+def state(name="UNREGISTERED", consumed=0, cap=2, outcomes=("UNCLAIMED", "UNCLAIMED")):
+    return BatchExecutionState(name, consumed, cap, tuple(outcomes))
+
+
+# ---------------------------------------------------------------- RG-PRC-005 selector
+class SelectorTests(unittest.TestCase):
+    def setUp(self):
+        self.fx = host_fixture(self)
+        self.host = self.fx.verify()
+        self.batch = build_batch()
+        self.fx.ledger.state = state()
+
+    def select(self, batch=None, *, ledger=None, registry=KIND_REGISTRY, host=None):
+        with owner_verified():
+            return host_runtime.select_next_sts_subset(
+                batch or self.batch, ledger=ledger or self.fx.ledger, kind_registry=registry,
+                host=host or self.host, now_utc=NOW)
+
+    def assertBlocked(self, code=None, **kwargs):
+        with self.assertRaises(HostRuntimeBlocked) as caught:
+            self.select(**kwargs)
+        if code is not None:
+            self.assertEqual(caught.exception.code, code)
+        self.assertNotIn("create_batch_intent", self.fx.ledger.calls)
+        return caught.exception
+
+    def test_first_unregistered_selects_signed_singleton(self):
+        from name_tag_batch_iam import build_subset_session_policy
+        spec = self.select()
+        self.assertEqual(spec.row_indexes, (0,))
+        expected = build_subset_session_policy(self.batch, (0,), kind_registry=KIND_REGISTRY)
+        self.assertEqual(spec, expected)
+        self.assertEqual(spec.policy_sha256, hashlib.sha256(spec.policy_bytes).hexdigest())
+        selection = host_runtime.peek_selection(spec, self.host)
+        self.assertEqual(selection.snapshot, state())
+        self.assertEqual(selection.row_authority.row_index, 0)
+        self.assertEqual(self.fx.ledger.calls, ["batch_execution_state"])  # read-only preflight
+
+    def test_unregistered_nonce_collision_or_claim_denied(self):
+        self.fx.ledger.error = LedgerError("BLOCKED_AUTH_REPLAY")
+        self.assertBlocked("BLOCKED_AUTH_REPLAY")
+
+    def test_unregistered_scope_hold_or_incomplete_intent_denied(self):
+        for scope_state in ("HOLD", "UNKNOWN"):  # Ledger reports HOLD for a pending Intent too
+            with self.subTest(scope_state=scope_state):
+                self.fx.ledger.scope_states["s1"] = scope_state
+                self.assertBlocked("BLOCKED_SCOPE_HOLD")
+
+    def test_corrupt_ledger_never_fabricates_unregistered(self):
+        fabricated = [
+            LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN"),
+            mock.Mock(state="UNREGISTERED", send_attempts_consumed=0, max_send_attempts=2,
+                      outcomes=("UNCLAIMED", "UNCLAIMED")),
+            None,
+            state(consumed=1),
+            state(cap=3),
+            state(outcomes=("UNCLAIMED",)),
+            state(outcomes=("UNCLAIMED", "APPLIED_VERIFIED")),
+            state(name="BOGUS"),
+        ]
+        for n, value in enumerate(fabricated):
+            with self.subTest(n=n):
+                if isinstance(value, Exception):
+                    self.fx.ledger.error, self.fx.ledger.state = value, None
+                else:
+                    self.fx.ledger.error, self.fx.ledger.state = None, value
+                self.assertBlocked()
+        self.fx.ledger.error, self.fx.ledger.state = None, state()
+        self.assertBlocked(ledger=FakeLedger())  # a Ledger not bound by the Host bootstrap
+
+    def test_active_batch_reconciles_cap_and_prior_rows(self):
+        self.fx.ledger.state = state("ACTIVE", 1, outcomes=("APPLIED_VERIFIED", "UNCLAIMED"))
+        self.assertEqual(self.select().row_indexes, (1,))
+        self.fx.ledger.state = state("ACTIVE", 0, outcomes=("SKIPPED_NAME_CHANGED", "UNCLAIMED"))
+        self.assertEqual(self.select().row_indexes, (1,))
+        self.fx.ledger.state = state("ACTIVE", 1, cap=1, outcomes=("APPLIED_VERIFIED", "UNCLAIMED"))
+        self.assertBlocked("SIGNED_CAP_REACHED", batch=build_batch(cap=1))  # no STS/new Intent
+        for unresolved in ("WRITE_INTENT_RECORDED", "SEND_ATTEMPT_CONSUMED", "OUTCOME_UNKNOWN"):
+            with self.subTest(unresolved=unresolved):
+                self.fx.ledger.state = state("ACTIVE", 1, outcomes=(unresolved, "UNCLAIMED"))
+                self.assertBlocked()  # never skip past an unresolved row
+        self.fx.ledger.state = state("ACTIVE", 1, cap=2, outcomes=("APPLIED_VERIFIED", "APPLIED_VERIFIED"))
+        self.assertBlocked()  # counter inconsistent with durable outcomes
+
+    def test_stopped_replay_batch_no_sts(self):
+        for name in ("STOPPED", "COMPLETED"):
+            with self.subTest(state=name):
+                self.fx.ledger.state = state(name, 1, outcomes=("APPLIED_VERIFIED", "NOT_ATTEMPTED_BATCH_STOP"))
+                self.assertBlocked("BLOCKED_AUTH_REPLAY")
+
+    def test_owner_revalidation_failure_blocks_before_ledger(self):
+        from name_tag_batch_approval import BatchAuthRejected
+        with mock.patch.object(host_runtime, "load_current_protected_owner_trust",
+                               return_value=object()), \
+                mock.patch("name_tag_batch_approval.revalidate_verified_batch",
+                           side_effect=BatchAuthRejected()):
+            with self.assertRaises(HostRuntimeBlocked) as caught:
+                host_runtime.select_next_sts_subset(
+                    self.batch, ledger=self.fx.ledger, kind_registry=KIND_REGISTRY,
+                    host=self.host, now_utc=NOW)
+        self.assertEqual(caught.exception.code, "BLOCKED_OWNER_AUTHN")
+        self.assertEqual(self.fx.ledger.calls, [])
+
+    def test_forged_indexes_registry_or_host_rejected(self):
+        forged = replace(self.batch, approved_row_indexes=(1, 0))
+        self.assertBlocked(batch=forged)
+        self.assertBlocked(registry={})
+        self.assertBlocked(registry={"volume": KindPolicy("ec2:*", "ec2:DescribeVolumes")})
+        self.assertBlocked(host=object())
+
+    def test_selection_is_host_bound_and_one_shot(self):
+        spec = self.select()
+        other = host_fixture(self).verify()
+        with self.assertRaises(HostRuntimeBlocked):
+            host_runtime.take_selection(spec, other)
+        copy_spec = replace(spec)
+        with self.assertRaises(HostRuntimeBlocked):
+            host_runtime.take_selection(copy_spec, self.host)
+        self.assertIsNotNone(host_runtime.take_selection(spec, self.host))
+        with self.assertRaises(HostRuntimeBlocked):
+            host_runtime.take_selection(spec, self.host)
+
+
 if __name__ == "__main__":
     unittest.main()

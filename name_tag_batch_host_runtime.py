@@ -618,3 +618,199 @@ class IssuanceAttemptJournal:
         while view:
             written = os.write(fd, view)
             view = view[written:]
+
+
+# ---------------------------------------------------------------- RG-PRC-005 selector
+_TERMINAL_ROW_OUTCOMES: Final = frozenset({
+    "APPLIED_VERIFIED", "SKIPPED_NAME_CHANGED", "SKIPPED_IAM_UNSUPPORTED", "NOT_ATTEMPTED_CAP"})
+_SEND_CONSUMING_TERMINALS: Final = frozenset({"APPLIED_VERIFIED"})
+_NONCE = re.compile(r"[0-9a-f]{32,128}")
+
+
+@dataclass(frozen=True, eq=False)
+class HostSelection:
+    """Host-protected singleton selection; one-shot input to HostCredentialIssuer.issue."""
+
+    host: VerifiedHostContext
+    batch: object  # freshly Owner-revalidated VerifiedBatchApproval
+    spec: object  # SessionPolicySpec
+    row_authority: object  # VerifiedBatchRowAuthority
+    snapshot: object  # BatchExecutionState read under the Coordinator lock
+    signed_cap: int
+    scope_id: str
+    capability: object  # KindCapabilityDecision
+    target: object  # CanonicalTargetIdentity
+    name_evidence_sha256: str
+    selected_at_utc: datetime
+
+
+_SELECTIONS: dict[int, HostSelection] = {}
+
+
+def _lookup_selection(spec: object, host: object, *, pop: bool) -> HostSelection:
+    host = require_verified_host(host)
+    selection = _SELECTIONS.get(id(spec))
+    if selection is None or selection.spec is not spec or selection.host is not host:
+        raise _blocked("subset was not selected by this protected Host")
+    if pop:
+        del _SELECTIONS[id(spec)]
+    return selection
+
+
+def peek_selection(spec: object, host: VerifiedHostContext) -> HostSelection:
+    return _lookup_selection(spec, host, pop=False)
+
+
+def take_selection(spec: object, host: VerifiedHostContext) -> HostSelection:
+    """Consume the Host selection exactly once (a copied/caller-built spec never matches)."""
+    return _lookup_selection(spec, host, pop=True)
+
+
+def _current_owner_batch(batch: object, now: datetime):
+    import name_tag_batch_approval as approval
+
+    if type(batch) is not approval.VerifiedBatchApproval:
+        raise _blocked("batch is not Owner-verified", "BLOCKED_OWNER_AUTHN")
+    try:
+        trust = load_current_protected_owner_trust()
+        return approval.revalidate_verified_batch(batch, trust=trust, now_utc=now)
+    except (approval.BatchAuthRejected, OSError, ValueError, TypeError) as error:
+        raise _blocked("current OwnerTrust rejects the batch", "BLOCKED_OWNER_AUTHN") from error
+
+
+def _current_row_authority(batch, row_index: int, now: datetime):
+    import name_tag_batch_approval as approval
+
+    try:
+        trust = load_current_protected_owner_trust()
+        return approval.derive_batch_row_authority(batch, row_index, trust=trust, now_utc=now)
+    except (approval.BatchAuthRejected, OSError, ValueError, TypeError, KeyError) as error:
+        raise _blocked("row authority rejected", "BLOCKED_OWNER_AUTHN") from error
+
+
+def _signed_shape(batch) -> tuple[tuple[int, ...], int]:
+    """Re-derive approved indexes and the signed cap from the exact signed bytes."""
+    from name_tag_batch_approval import _approved_tuples
+    from name_tag_batch_state import BatchValidationError, validate_batch_draft
+
+    try:
+        draft = validate_batch_draft(batch.plan_bytes, batch.csv_bytes)
+        indexes = tuple(row[0] for row in _approved_tuples(draft))
+        cap = draft.plan["execution_limits"]["max_send_attempts"]
+    except (BatchValidationError, KeyError, TypeError, ValueError) as error:
+        raise _blocked("signed Plan/CSV invalid", "BLOCKED_OWNER_AUTHN") from error
+    approved = batch.approved_row_indexes
+    if (type(approved) is not tuple or approved != indexes or not indexes
+            or list(indexes) != sorted(set(indexes))
+            or len(batch.approved_rows) != len(indexes)):
+        raise _blocked("approved row indexes do not match signed tuples", "BLOCKED_OWNER_AUTHN")
+    nonce = batch.payload.get("batch_nonce")
+    if not isinstance(nonce, str) or _NONCE.fullmatch(nonce) is None:
+        raise _blocked("signed batch nonce malformed", "BLOCKED_OWNER_AUTHN")
+    if type(cap) is not int or not 1 <= cap <= 20:
+        raise _blocked("signed max_send_attempts invalid", "BLOCKED_OWNER_AUTHN")
+    return indexes, cap
+
+
+def read_batch_snapshot(ledger: object, batch, *, signed_cap: int, row_count: int):
+    """Read the existing Ledger state and accept only real UNREGISTERED/ACTIVE shapes."""
+    from name_tag_ledger import BatchExecutionState
+    from name_tag_ledger_errors import LedgerError
+
+    try:
+        snapshot = ledger.batch_execution_state(batch)  # type: ignore[attr-defined]
+    except LedgerError as error:
+        raise HostRuntimeBlocked(error.code, "Ledger refused the batch state") from error
+    except Exception as error:  # noqa: BLE001 - unknown Ledger failure is never first-run
+        raise _blocked("Ledger state unreadable", "BLOCKED_SCOPE_STATE_UNKNOWN") from error
+    if (type(snapshot) is not BatchExecutionState
+            or type(snapshot.send_attempts_consumed) is not int
+            or type(snapshot.max_send_attempts) is not int
+            or type(snapshot.outcomes) is not tuple
+            or snapshot.max_send_attempts != signed_cap
+            or len(snapshot.outcomes) != row_count
+            or not 0 <= snapshot.send_attempts_consumed <= signed_cap):
+        raise _blocked("Ledger state inconsistent with signed batch", "BLOCKED_SCOPE_STATE_UNKNOWN")
+    if snapshot.state in ("STOPPED", "COMPLETED"):
+        raise _blocked("batch already stopped/completed", "BLOCKED_AUTH_REPLAY")
+    if snapshot.state == "UNREGISTERED":
+        if (snapshot.send_attempts_consumed != 0
+                or any(outcome != "UNCLAIMED" for outcome in snapshot.outcomes)):
+            raise _blocked("fabricated UNREGISTERED state", "BLOCKED_SCOPE_STATE_UNKNOWN")
+        return snapshot
+    if snapshot.state != "ACTIVE":
+        raise _blocked("unknown batch state", "BLOCKED_SCOPE_STATE_UNKNOWN")
+    if any(o != "UNCLAIMED" and o not in _TERMINAL_ROW_OUTCOMES for o in snapshot.outcomes):
+        raise _blocked("unresolved Intent/Permit/outcome in batch", "BLOCKED_INCOMPLETE_INTENT")
+    if snapshot.send_attempts_consumed != sum(
+            o in _SEND_CONSUMING_TERMINALS for o in snapshot.outcomes):
+        raise _blocked("send counter inconsistent with durable rows", "BLOCKED_SCOPE_STATE_UNKNOWN")
+    return snapshot
+
+
+def _select_position(snapshot) -> int:
+    for position, outcome in enumerate(snapshot.outcomes):
+        if outcome == "UNCLAIMED":
+            if snapshot.send_attempts_consumed >= snapshot.max_send_attempts:
+                raise HostRuntimeBlocked("SIGNED_CAP_REACHED",
+                                         "cap exhausted: only NOT_ATTEMPTED_CAP handling")
+            return position
+        if outcome not in _TERMINAL_ROW_OUTCOMES:
+            raise _blocked("earlier row unresolved", "BLOCKED_INCOMPLETE_INTENT")
+    raise _blocked("no eligible approved row", "BLOCKED_AUTH_REPLAY")
+
+
+def select_next_sts_subset(batch, *, ledger, kind_registry: Mapping[str, object],
+                           host: VerifiedHostContext, now_utc: datetime):
+    """RG-PRC-005: the lowest approved UNCLAIMED singleton, or fail before STS/Intent."""
+    import name_tag_kind_capabilities as caps
+    import name_tag_kind_name_evidence as name_evidence
+    from name_tag_batch_iam import (
+        IAMPolicyBlocked, SessionPolicySpec, build_subset_session_policy, verified_kind_policy)
+
+    host = require_verified_host(host)
+    now = require_aware_utc(now_utc)
+    if ledger is not bound_ledger(host):
+        raise _blocked("Ledger is not the Host-bound Ledger", "BLOCKED_SCOPE_STATE_UNKNOWN")
+    fresh = _current_owner_batch(batch, now)
+    indexes, cap = _signed_shape(fresh)
+    journal = bound_journal(host)
+    journal.scan()  # read-only reconciliation before every selection
+    snapshot = read_batch_snapshot(ledger, fresh, signed_cap=cap, row_count=len(indexes))
+    position = _select_position(snapshot)
+    row_index = indexes[position]
+    for scope_id in sorted({row["writer_control_scope_id"] for row in fresh.approved_rows}):
+        try:
+            scope_state = ledger.effective_scope_state(scope_id)
+        except Exception as error:  # noqa: BLE001
+            raise _blocked("Scope state unreadable", "BLOCKED_SCOPE_STATE_UNKNOWN") from error
+        if scope_state != "CLEARED":
+            raise _blocked(f"signed Scope not CLEARED: {scope_id}", "BLOCKED_SCOPE_HOLD")
+    journal.assert_row_unattempted(fresh.batch_id, row_index)
+    authority = _current_row_authority(fresh, row_index, now)
+    row = authority.row
+    if authority.row_index != row_index or authority.batch.batch_id != fresh.batch_id:
+        raise _blocked("row authority mismatch", "BLOCKED_OWNER_AUTHN")
+    try:
+        capability = caps.resolve_kind_capability(row["kind"])
+        if kind_registry.get(row["kind"]) != verified_kind_policy(capability):
+            raise IAMPolicyBlocked("unvetted Kind policy")
+        target = caps.canonical_target_identity(
+            kind=row["kind"], locator=row["locator"], resource_arn=row["resource_arn"],
+            partition=fresh.payload["partition"], account=fresh.payload["account"],
+            scope_region=row["region"])
+        evidence = name_evidence.verified_generated_name(row, target)
+        spec = build_subset_session_policy(fresh, (row_index,), kind_registry=kind_registry)
+    except (IAMPolicyBlocked, ValueError, KeyError, TypeError) as error:
+        raise _blocked("Kind/policy/Name evidence not proven", "AWS_WRITE_BLOCKED") from error
+    if (type(spec) is not SessionPolicySpec or spec.row_indexes != (row_index,)
+            or spec.batch_id != fresh.batch_id
+            or sha256(spec.policy_bytes).hexdigest() != spec.policy_sha256
+            or evidence.generated_name != row.get("approved_name")
+            or row.get("aws_operation") != capability.write_operation):
+        raise _blocked("selected policy is not the exact singleton", "AWS_WRITE_BLOCKED")
+    _SELECTIONS[id(spec)] = HostSelection(
+        host=host, batch=fresh, spec=spec, row_authority=authority, snapshot=snapshot,
+        signed_cap=cap, scope_id=row["writer_control_scope_id"], capability=capability,
+        target=target, name_evidence_sha256=evidence.evidence_digest, selected_at_utc=now)
+    return spec
