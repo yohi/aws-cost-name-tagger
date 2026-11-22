@@ -341,6 +341,24 @@ class KindCoverageTests(unittest.TestCase):
                 build_batch_dry_run(encode(forged), build_batch_review_projection(encode(plan)))
 
 
+    def test_write_support_follows_vetted_registry_not_kind_name(self):
+        import aws_cost_name_tagger_v3 as tagger
+        from test_name_tag_kind_name_evidence import proven_instance_fixture
+        row = _record("instance", "1")
+        row["aws_operation"] = "ec2:CreateTags"
+        fields = tagger._batch_plan_report_fields(row, [], ACCT)
+        self.assertEqual(fields["write_support"], "UNSUPPORTED_API")  # production: CNP
+        with proven_instance_fixture():
+            self.assertEqual(tagger._batch_plan_report_fields(row, [], ACCT)["write_support"],
+                             "SUPPORTED_API")
+            mismatch = dict(row, aws_operation="ec2:DeleteTags")
+            self.assertEqual(tagger._batch_plan_report_fields(mismatch, [], ACCT)["write_support"],
+                             "UNSUPPORTED_API")
+        volume = _record("volume", "1")
+        self.assertEqual(tagger._batch_plan_report_fields(volume, [], ACCT)["write_support"],
+                         "SUPPORTED_API")
+
+
 class SignedCoverageTests(unittest.TestCase):
     NOW = _evidence_tests.SignedNonVolumeTests.NOW
     setUp_owner = _evidence_tests.SignedNonVolumeTests.setUp

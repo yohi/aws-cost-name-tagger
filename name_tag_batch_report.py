@@ -241,7 +241,12 @@ def report_kind_capability_coverage(
 
 
 def _write_support(row):
-    operation=_WRITE_OPERATIONS.get(row.get('kind'))
+    kind=row.get('kind')
+    operation=_WRITE_OPERATIONS.get(kind)
+    if operation is None and kind in REGISTRY_KINDS:
+        decision=resolve_kind_capability(kind)
+        if decision.status=='IMPLEMENTED_OFFLINE':  # vetted Registry Kind, not a name guess
+            operation=decision.write_operation
     if operation is None:
         return 'UNSUPPORTED_API'
     if row.get('aws_operation')==operation:

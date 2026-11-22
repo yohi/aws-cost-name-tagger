@@ -359,9 +359,86 @@ class SignedNonVolumeTests(PlanFixture):
                 with self.subTest(label), self.assertRaises(BatchAuthRejected):
                     verify_batch_approval(plan, changed_csv, envelope, trust=self.trust, now_utc=self.NOW)
 
-    @unittest.skip("Integrated in Tasks 4/5 and 9: Kind IAM policy and Adapter do not exist at Task 3")
-    def test_nonvolume_fake_row_to_kind_iam_and_adapter_after_tasks4_5(self):
-        pass
+    def test_18_kind_presign_to_owner_verified_nonvolume_iam_adapter_trace(self):
+        """Task 9 closes the Task 3 deferral: signed instance row -> Kind IAM -> adapter (Fake)."""
+        from name_tag_batch_iam import IAMPolicyBlocked, build_subset_session_policy, verified_kind_policy
+        from name_tag_batch_report import make_authenticated_batch_report
+        from name_tag_kind_adapters import AdapterUnavailable, adapter_for_capability
+
+        class FakeEc2:
+            """Fake SDK client: in-memory tags, records every call; never networks."""
+
+            def __init__(self):
+                self.tags, self.calls = {}, []
+
+            def describe_instances(self, *, InstanceIds):
+                self.calls.append(("describe_instances", tuple(InstanceIds)))
+                (instance_id,) = InstanceIds
+                tags = [{"Key": k, "Value": v} for k, v in self.tags.items()]
+                return {"Reservations": [{"Instances": [{"InstanceId": instance_id, "Tags": tags}]}]}
+
+            def create_tags(self, *, Resources, Tags):
+                self.calls.append(("create_tags", tuple(Resources), tuple(map(tuple, (t.items() for t in Tags)))))
+                for tag in Tags:
+                    self.tags[tag["Key"]] = tag["Value"]
+
+        with proven_instance_fixture():
+            plan = self.build_instance_plan()
+            doc = json.loads(plan)
+            # Pre-sign: 18-Kind signed pre-cap breakdown and the frozen instance triplet.
+            self.assertEqual(set(doc["cur_population_by_kind"]["kinds"]), set(caps.REGISTRY_KINDS))
+            self.assertEqual(doc["cur_population_by_kind"]["kinds"]["instance"]["lookup_selected"],
+                             {"count": 1, "cost_usd": "1"})
+            record = doc["records"][0]
+            self.assertEqual((record["resource_arn"], record["region"], record["aws_operation"]),
+                             (INSTANCE_ARN, R, "ec2:CreateTags"))
+            pid = record["proposal_id"].encode()
+            csv = build_batch_review_projection(plan).replace(b",%s," % pid, b"YES,%s," % pid)
+            envelope = self.sign(plan, csv)
+            verified = verify_batch_approval(plan, csv, envelope, trust=self.trust, now_utc=self.NOW)
+            authority = derive_batch_row_authority(verified, 0, trust=self.trust, now_utc=self.NOW)
+            row = authority.row
+            # Task 4: the per-Kind bounded session policy for exactly this row.
+            decision = caps.resolve_kind_capability("instance")
+            spec = build_subset_session_policy(
+                verified, (0,), kind_registry={"instance": verified_kind_policy(decision)})
+            policy = json.loads(spec.policy_bytes)
+            writes = [st for st in policy["Statement"] if st["Effect"] == "Allow"
+                      and st["Action"] == ["ec2:CreateTags"]]
+            self.assertEqual(len(writes), 1)
+            self.assertEqual(writes[0]["Resource"], [INSTANCE_ARN])
+            self.assertEqual(writes[0]["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"], ["Name"])
+            self.assertNotIn("*", json.dumps(writes))
+            self.assertIn("ec2:DescribeInstances", spec.read_actions)
+            # Task 5: the vetted adapter issues exactly one single-Name request, then reads back.
+            adapter = adapter_for_capability(decision)
+            target = caps.canonical_target_identity(
+                kind="instance", locator=row["locator"], resource_arn=row["resource_arn"],
+                partition=doc["partition"], account=doc["account"], scope_region=row["region"])
+            client = FakeEc2()
+            self.assertEqual(adapter.read_current(client, target).state, "ABSENT")
+            adapter.write_once(client, target, row["approved_name"], grant=object())
+            observed = adapter.readback(client, target)
+            self.assertEqual((observed.state, observed.name_raw_value), ("NONEMPTY", INSTANCE_NAME))
+            self.assertEqual([c for c in client.calls if c[0] == "create_tags"],
+                             [("create_tags", (INSTANCE,), ((("Key", "Name"), ("Value", INSTANCE_NAME)),))])
+            # Report: the signed 18-Kind coverage carries the fixture capability for this row only.
+            report = make_authenticated_batch_report(verified, plan_bytes=plan, csv_bytes=csv,
+                                                     trust=self.trust, now_utc=self.NOW)
+            coverage = report["kind_capability_coverage"]
+            self.assertEqual(coverage["kinds"]["instance"]["capability"]["status"], "IMPLEMENTED_OFFLINE")
+            self.assertEqual(coverage["kinds"]["instance"]["outcomes"],
+                             {"NOT_ATTEMPTED_OWNER_VERIFIED": {"count": 1, "cost_usd": "1"}})
+            self.assertEqual(coverage["live_acceptance"], "NOT_RUN")
+        # Outside the TEST-ONLY fixture, production refuses at every layer.
+        production = caps.resolve_kind_capability("instance")
+        self.assertEqual(production.status, "CAPABILITY_NOT_PROVEN")
+        with self.assertRaises(IAMPolicyBlocked):
+            verified_kind_policy(production)
+        with self.assertRaises(AdapterUnavailable):
+            adapter_for_capability(production)
+        with self.assertRaises(BatchAuthRejected):
+            verify_batch_approval(plan, csv, envelope, trust=self.trust, now_utc=self.NOW)
 
 
 if __name__ == "__main__":
