@@ -645,7 +645,21 @@ class TombstoneTests(unittest.TestCase):
             self.assertNotIn(secret.encode(), raw)
         (record,) = h.records()
         self.assertFalse({k for k in record if "attempts" in k or "cap" in k or "permit" in k})
-        self.assertEqual(h.fx.ledger.calls, ["batch_execution_state"])
+        # Selection read + Task 7 pre-STS re-read; both read-only, no Intent/cap call.
+        self.assertEqual(h.fx.ledger.calls, ["batch_execution_state", "batch_execution_state"])
+
+    def test_stale_selection_refused_before_tombstone_or_sts(self):
+        """Task 7 obligation (d): issue() re-reads the Ledger/Scope before any tombstone."""
+        for mutate in (lambda led: setattr(led, "state", state("ACTIVE", outcomes=("SKIPPED_NAME_CHANGED", "UNCLAIMED"))),
+                       lambda led: led.scope_states.update(s1="HOLD")):
+            with self.subTest(mutate=mutate):
+                h = IssuerHarness(self)
+                subset = h.select()
+                mutate(h.fx.ledger)
+                with self.assertRaises(HostRuntimeBlocked):
+                    h.issue(subset)
+                self.assertEqual(h.sts.calls, [])
+                self.assertEqual(h.records(), ())
 
 
 def LedgerErrorFactory():

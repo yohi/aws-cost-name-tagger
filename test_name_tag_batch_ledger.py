@@ -207,7 +207,8 @@ def proven_lambda():
     """TEST-ONLY: promote the lambda Registry decision and its Name verifier for one test."""
     decision = _dataclasses.replace(
         _caps.resolve_kind_capability("lambda"), status="IMPLEMENTED_OFFLINE",
-        reason_code="OFFLINE_CONTRACT_COMPLETE", evidence_refs=("test-only fixture",))
+        reason_code="OFFLINE_CONTRACT_COMPLETE", evidence_refs=("test-only fixture",),
+        tag_key_conditions=("aws:TagKeys", "aws:RequestTag/Name"))
     with mock.patch.object(_caps, "_DECISIONS", _MPT({**_caps._DECISIONS, "lambda": decision})), \
             mock.patch.dict(_evidence_module._VERIFIERS, {"lambda": FixtureLambdaVerifier()}):
         yield decision

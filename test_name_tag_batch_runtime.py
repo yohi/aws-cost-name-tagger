@@ -55,5 +55,33 @@ class RuntimeCapTests(unittest.TestCase):
         self.assertEqual(self.ledger.stop_reasons,['BLOCKED_SCOPE_STATE_UNKNOWN'])
 
 
+
+class OfflineApiPreservedTests(unittest.TestCase):
+    """RG-PRC-004: execute_batch_offline keeps its exact API; execute_batch_live is separate."""
+
+    def test_offline_signature_unchanged_and_live_is_distinct(self):
+        import inspect
+        import name_tag_batch_runtime as runtime
+        offline = inspect.signature(runtime.execute_batch_offline)
+        self.assertEqual(
+            [(p.name, p.kind) for p in offline.parameters.values()],
+            [('batch', inspect.Parameter.POSITIONAL_OR_KEYWORD),
+             ('plan_bytes', inspect.Parameter.KEYWORD_ONLY),
+             ('csv_bytes', inspect.Parameter.KEYWORD_ONLY),
+             ('ledger', inspect.Parameter.KEYWORD_ONLY),
+             ('runtime', inspect.Parameter.KEYWORD_ONLY)])
+        self.assertEqual(list(inspect.signature(runtime.execute_batch_live).parameters),
+                         ['batch', 'ledger', 'runtime'])
+        source = inspect.getsource(runtime.execute_batch_offline)
+        self.assertIn('type(runtime.adapter) is not FakeBatchSDKAdapter', source)
+        self.assertNotIn('execute_batch_live', source)
+
+    def test_offline_runtime_never_accepted_by_live_api(self):
+        from name_tag_batch_host_runtime import HostRuntimeBlocked
+        import name_tag_batch_runtime as runtime
+        with self.assertRaises(HostRuntimeBlocked):
+            runtime.execute_batch_live(SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+
+
 if __name__=='__main__':
     unittest.main()

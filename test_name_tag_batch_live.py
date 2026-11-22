@@ -209,5 +209,56 @@ class VolumeRequestTests(unittest.TestCase):
         ledger.create_batch_intent.assert_called_once()
 
 
+
+class GrantGatedWritePortTests(unittest.TestCase):
+    """Task 7 obligation (a): the port dispatches only by consuming a live one-shot grant."""
+
+    def _grant(self, live=True):
+        import name_tag_batch_iam_evidence as iam_evidence
+        from name_tag_batch_iam_evidence import (
+            LIVE_PROVENANCE, ProtectedEffectiveIamEvidenceVerifier, ProtectedHostRuntimeVerifier)
+        from test_name_tag_batch_runtime_host import GrantHarness
+
+        g = GrantHarness(self)
+        if not live:
+            grant, scope, permit = g.grant()
+            return g, grant, scope, permit
+        scope = g.scope()
+        permit = g.permit()
+        synthetic = g.evidence()
+        fields = {name: getattr(synthetic, name) for name in iam_evidence._EVIDENCE_FIELDS}
+        # TEST-ONLY mock-proven live evidence; no production producer exists.
+        evidence = iam_evidence.ProtectedIamEvidence(
+            iam_evidence._MINT, provenance=LIVE_PROVENANCE, **fields)
+        iam_evidence._EVIDENCE[evidence] = LIVE_PROVENANCE
+        deny = ProtectedEffectiveIamEvidenceVerifier(clock=g.clock).verify(
+            g.issued, g.authority, g.capability, scope, evidence)
+        grant = ProtectedHostRuntimeVerifier(clock=g.clock).authorize_once(
+            g.authority, g.issued, scope, deny, permit)
+        return g, grant, scope, permit
+
+    def test_live_grant_consumed_once_at_dispatch(self):
+        g, grant, scope, permit = self._grant()
+        adapter = Mock()
+        port = AuthorizedBatchWritePort("client", adapter=adapter, target=scope.target,
+                                        clock=g.clock)
+        port.write_once(session=g.issued, row=g.authority, permit=permit, runtime=grant)
+        adapter.write_once.assert_called_once_with("client", scope.target,
+                                                   permit.approved_name, grant)
+        with self.assertRaises(LiveWriteBlocked):
+            port.write_once(session=g.issued, row=g.authority, permit=permit, runtime=grant)
+        adapter.write_once.assert_called_once()
+
+    def test_synthetic_grant_or_missing_binding_never_dispatches(self):
+        g, grant, scope, permit = self._grant(live=False)
+        adapter = Mock()
+        for port in (AuthorizedBatchWritePort("client", adapter=adapter, target=scope.target,
+                                              clock=g.clock),
+                     AuthorizedBatchWritePort("client")):
+            with self.assertRaises(LiveWriteBlocked):
+                port.write_once(session=g.issued, row=g.authority, permit=permit, runtime=grant)
+        adapter.write_once.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
