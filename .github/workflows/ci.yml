@@ -89,6 +89,9 @@ jobs:
           test_name_tag_batch_migration
           test_aws_cost_name_tagger_v3
 
+      - name: Unit tests (full offline discovery)
+        run: uv run --locked --no-build python -m unittest discover -s . -p 'test_*.py' -q
+
       - name: Unit tests (direct script runner)
         run: uv run --locked --no-build python test_aws_cost_name_tagger_v3.py
 
