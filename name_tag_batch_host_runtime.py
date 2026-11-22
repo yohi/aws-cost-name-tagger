@@ -67,6 +67,20 @@ class HostRuntimeBlocked(RuntimeError):
         self.report_sha256 = valid(report_sha256) if self.batch_id is not None else None
 
 
+class HostOutcomeUnknown(HostRuntimeBlocked):
+    """A possible send happened but its outcome/report is not durably verified.
+
+    Maps to IPC status UNKNOWN (never BLOCKED): the Owner must not read it as "nothing
+    happened". It never carries a report digest.
+    """
+
+    ipc_status = "UNKNOWN"
+
+    def __init__(self, code: str = "OUTCOME_UNKNOWN", detail: str = "", *,
+                 batch_id: str | None = None) -> None:
+        super().__init__(code, detail, batch_id=batch_id, report_sha256=None)
+
+
 def _blocked(detail: str, code: str = AWS_RUNTIME_NOT_AUTHORIZED) -> HostRuntimeBlocked:
     return HostRuntimeBlocked(code, detail)
 

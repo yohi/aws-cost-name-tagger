@@ -29,7 +29,8 @@ from name_tag_batch_executor import (
 from name_tag_batch_host_issuer import (
     HostBatchCredentialIssuer, StsExchange, SystemdEncryptedCredentialProvider)
 from name_tag_batch_host_runtime import (
-    HOST_PROTECTED_DISPATCH_OPT_IN, HostRuntimeBlocked, ProtectedBatchHostEndpoint,
+    HOST_PROTECTED_DISPATCH_OPT_IN, HostOutcomeUnknown, HostRuntimeBlocked,
+    ProtectedBatchHostEndpoint,
     open_verified_host_runtime)
 from name_tag_batch_host_server import (
     PeerPolicy, ProtectedHostIPCServer, UnavailableListenerOS, map_blocked, map_endpoint_result)
@@ -387,7 +388,12 @@ class LiveCoordinatorStepOneTests(LiveHarness):
                                     side_effect=sqlite3.OperationalError("disk I/O error"))
         with failing, no_stop, no_hold:
             blocked = self.run_blocked(batch)
-        self.assertEqual(blocked.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        # A consumed Permit whose disposition and STOP/HOLD are not durable is UNKNOWN.
+        self.assertIsInstance(blocked, HostOutcomeUnknown)
+        self.assertEqual(blocked.code, "OUTCOME_UNKNOWN")
+        response = map_blocked("1" * 32, blocked)
+        self.assertEqual((response.status, response.code, response.report_sha256),
+                         ("UNKNOWN", "OUTCOME_UNKNOWN", None))
         self.assertEqual(self.intents(), [("SEND_ATTEMPT_CONSUMED", None, "ec2:CreateTags")])
         self.assertEqual(len(self.cloud.writes), 1)
 
@@ -558,6 +564,7 @@ class LiveFirstRegistrationTests(LiveHarness):
                                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")):
             blocked = self.run_blocked(batch)
         self.assertEqual(blocked.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
+        self.assertNotIsInstance(blocked, HostOutcomeUnknown)  # pre-send: BLOCKED
         self.assertEqual((self.sts.calls, self.intents()), ([], []))
 
     def test_first_scope_hold_or_pending_intent_denied(self):
@@ -634,6 +641,22 @@ class LiveRefusalWindowTests(LiveHarness):
         self.run_live(batch, self.runtime())
         self.assertEqual((len(self.sts.calls), self.cloud.writes), (1, []))
 
+    def test_scope_proof_changed_before_permit_finalizes_no_send(self):
+        """m2: the Host-protected Scope is re-resolved and compared before the Permit."""
+        import dataclasses
+        batch = self.prepare()
+
+        def change_scope():
+            self.source.scope = dataclasses.replace(self.source.scope,
+                                                    writer_evidence_digest="e" * 64)
+        with self.after(self.ledger, "create_batch_intent", change_scope):
+            blocked = self.run_blocked(batch)
+        self.assertEqual(blocked.code, "BLOCKED_SCOPE_MISMATCH")
+        self.assertEqual(self.intents(), [("TERMINAL", "NOT_ATTEMPTED_BATCH_STOP", "ec2:CreateTags")])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM intent_history WHERE "
+                                  "event='SEND_ATTEMPT_CONSUMED'"), [(0,)])
+        self.assertEqual(self.cloud.writes, [])
+
     def test_stop_batch_alone_not_intent_terminal(self):
         batch = self.prepare()
         with self.trusted():
@@ -707,17 +730,56 @@ class LivePartialReportTests(LiveHarness):
         self.fail_evidence_on = {2}
         with mock.patch.object(batch_runtime, "_persist_host_report", return_value=None):
             blocked = self.run_blocked(batch)
+        # Row 1 was sent; without a verified report the answer is UNKNOWN, never BLOCKED.
+        self.assertIsInstance(blocked, HostOutcomeUnknown)
         response = map_blocked("1" * 32, blocked)
-        self.assertEqual((response.status, response.batch_id, response.report_sha256),
-                         ("BLOCKED", batch.batch_id, None))
+        self.assertEqual((response.status, response.code, response.batch_id,
+                          response.report_sha256),
+                         ("UNKNOWN", "REPORT_NOT_VERIFIED", batch.batch_id, None))
 
     def test_completed_report_unverifiable_is_never_complete(self):
         batch = self.prepare(cap=1, records=[volume_record(0)])
         with mock.patch.object(batch_runtime, "_persist_host_report", return_value=None):
-            result = self.run_live(batch)
-        self.assertNotIn("report_sha256", result.report)
-        response = map_endpoint_result("1" * 32, result)
+            blocked = self.run_blocked(batch)
+        response = map_blocked("1" * 32, blocked)
         self.assertEqual((response.status, response.code), ("UNKNOWN", "REPORT_NOT_VERIFIED"))
+        self.assertEqual(len(self.cloud.writes), 1)
+
+    def test_pre_send_refusal_without_report_stays_blocked(self):
+        batch = self.prepare()
+        self.evidence_kind = "synthetic"
+        with mock.patch.object(batch_runtime, "_persist_host_report", return_value=None):
+            blocked = self.run_blocked(batch)
+        self.assertNotIsInstance(blocked, HostOutcomeUnknown)
+        self.assertEqual(map_blocked("1" * 32, blocked).status, "BLOCKED")
+        self.assertEqual(self.cloud.writes, [])
+
+    def test_ledger_error_after_send_is_unknown_not_blocked(self):
+        batch = self.prepare(cap=1, records=[volume_record(0)])
+        with mock.patch.object(self.ledger, "complete_batch",
+                               side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")):
+            blocked = self.run_blocked(batch)
+        self.assertIsInstance(blocked, HostOutcomeUnknown)
+        self.assertEqual(map_blocked("1" * 32, blocked).status, "UNKNOWN")
+        self.assertEqual(len(self.cloud.writes), 1)
+
+    def test_rerun_retries_stop_hold_for_undisposed_consumed_permit(self):
+        """m3: a rerun never resends; it retries the durable STOP/HOLD."""
+        batch = self.prepare(cap=1, records=[volume_record(0)])
+        with mock.patch.object(self.ledger, "record_readback",
+                               side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")), \
+                mock.patch.object(self.ledger, "stop_batch",
+                                  side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")), \
+                mock.patch.object(self.ledger, "hold_scope",
+                                  side_effect=LedgerError("BLOCKED_SCOPE_HOLD")):
+            first = self.run_blocked(batch)
+        self.assertIsInstance(first, HostOutcomeUnknown)
+        self.assertEqual((self.state(batch).state, self.scope_state()), ("ACTIVE", "CLEARED"))
+        result = self.run_live(batch, self.runtime())
+        self.assertEqual(result.outcomes, ("OUTCOME_UNKNOWN",))
+        self.assertEqual((self.state(batch).state, self.scope_state()), ("STOPPED", "HOLD"))
+        self.assertEqual(map_endpoint_result("1" * 32, result).status, "UNKNOWN")
+        self.assertEqual((len(self.cloud.writes), len(self.sts.calls)), (1, 1))
 
     def test_response_loss_does_not_mutate_terminal_row(self):
         batch = self.prepare(cap=1, records=[volume_record(0)])

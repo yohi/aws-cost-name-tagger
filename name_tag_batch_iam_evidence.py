@@ -142,6 +142,30 @@ class ProtectedHostScopeVerifier:
         _SCOPES[verified] = host
         return verified
 
+    def reconfirm(self, vscope: VerifiedHostScope, now_utc: datetime) -> None:
+        """Re-load the protected Scope source and require it unchanged (no Ledger read:
+        the caller's own pending Intent makes the effective state HOLD by design)."""
+        _reconfirm_scope(self._source, vscope, now_utc)
+
+
+def _reconfirm_scope(source, vscope: object, now_utc: datetime) -> None:
+    """Pre-Permit: the Host-protected Scope declaration/proof must be exactly unchanged."""
+    vscope = _require_scope(vscope)
+    now = require_aware_utc(now_utc)
+    try:
+        scope, effects = source.load(vscope.scope_id, vscope.host)
+    except HostRuntimeBlocked:
+        raise
+    except Exception as error:  # noqa: BLE001 - protected-state read failure fails closed
+        raise _blocked("Scope evidence unreadable", "BLOCKED_SCOPE_STATE_UNKNOWN") from error
+    if (type(scope) is not ScopeEvidence or scope != vscope.scope
+            or not isinstance(effects, tuple) or effects != vscope.all_side_effects
+            or not scope.not_before_utc <= now < scope.not_after_utc
+            or not now < vscope.not_after_utc
+            or ownership_proof_ref(vscope.host, scope, vscope.target.resource_arn)
+            != vscope.target.ownership_proof_ref):
+        raise _blocked("Host Scope evidence changed before Permit", "BLOCKED_SCOPE_MISMATCH")
+
 
 def _require_scope(scope: object) -> VerifiedHostScope:
     if type(scope) is not VerifiedHostScope or _SCOPES.get(scope) is not scope.host:
