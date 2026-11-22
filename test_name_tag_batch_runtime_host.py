@@ -21,8 +21,8 @@ from name_tag_batch_host_runtime import HostRuntimeBlocked, ProtectedBatchHostEn
 from name_tag_batch_iam_evidence import (
     IamDenyCase, OfflineSyntheticIamEvidenceVerifier, OfflineSyntheticRuntimeVerifier,
     ProtectedEffectiveIamEvidenceVerifier, ProtectedHostRuntimeVerifier,
-    ProtectedHostScopeVerifier, SyntheticIamEvidenceProducer, VerifiedRuntimeGrant,
-    consume_runtime_grant)
+    LIVE_PROVENANCE, ProtectedHostScopeVerifier, SyntheticIamEvidenceProducer,
+    VerifiedRuntimeGrant, consume_offline_synthetic_grant, consume_runtime_grant)
 from name_tag_ledger import FirstSendPermit
 from name_tag_scope import ScopeEvidence, SideEffectEvidence
 from test_name_tag_batch_host_issuer import IssuerHarness
@@ -81,6 +81,7 @@ class GrantHarness:
         self.scope_verifier = ProtectedHostScopeVerifier(source=self.source)
         self.producer = SyntheticIamEvidenceProducer()
         self.h.fx.ledger.owned = True
+        self.h.fx.ledger.permit_identity = self.ledger_identity(self.permit())
         self.clock = lambda: NOW
 
     def scope(self, target=None):
@@ -103,6 +104,20 @@ class GrantHarness:
         return OfflineSyntheticIamEvidenceVerifier(clock=self.clock).verify(
             self.issued, self.authority, self.capability, scope or self.scope(),
             evidence or self.evidence())
+
+    @staticmethod
+    def ledger_identity(permit):
+        """What the Ledger's own Intent row records for the consumed Permit."""
+        import hashlib
+        return (permit.authorization_id, permit.execution_id,
+                hashlib.sha256(permit.ownership_token.encode()).hexdigest())
+
+    def grant(self):
+        scope = self.scope()
+        permit = self.permit()
+        grant = OfflineSyntheticRuntimeVerifier(clock=self.clock).authorize_once(
+            self.authority, self.issued, scope, self.deny(scope=scope), permit)
+        return grant, scope, permit
 
     def permit(self, **changes):
         row = self.authority.row
@@ -220,11 +235,11 @@ class RuntimeGrantTests(unittest.TestCase):
                 attempt(grant)
         with self.assertRaises(HostRuntimeBlocked) as caught:
             consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW)  # require_live defaults to True
+                                  now_utc=NOW)  # the dispatch boundary is live-only
         self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         with self.assertRaises(HostRuntimeBlocked):  # consumed even by the refused attempt
-            consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW, require_live=False)
+            consume_offline_synthetic_grant(grant, row=g.authority, permit=permit,
+                                            target=scope.target, now_utc=NOW)
         with self.assertRaises(HostRuntimeBlocked):  # one Permit -> one grant only
             verifier.authorize_once(g.authority, g.issued, scope, deny, permit)
 
@@ -235,18 +250,18 @@ class RuntimeGrantTests(unittest.TestCase):
         grant = OfflineSyntheticRuntimeVerifier(clock=g.clock).authorize_once(
             g.authority, g.issued, scope, g.deny(scope=scope), permit)
         with self.assertRaises(HostRuntimeBlocked):
-            consume_runtime_grant(grant, row=g.authority, permit=g.permit(), target=scope.target,
-                                  now_utc=NOW, require_live=False)  # equal-valued other Permit
+            consume_offline_synthetic_grant(grant, row=g.authority, permit=g.permit(),
+                                            target=scope.target, now_utc=NOW)  # other Permit
         g2 = GrantHarness(self)
         scope2 = g2.scope()
         permit2 = g2.permit()
         grant2 = OfflineSyntheticRuntimeVerifier(clock=g2.clock).authorize_once(
             g2.authority, g2.issued, scope2, g2.deny(scope=scope2), permit2)
-        consume_runtime_grant(grant2, row=g2.authority, permit=permit2, target=scope2.target,
-                              now_utc=NOW, require_live=False)
+        consume_offline_synthetic_grant(grant2, row=g2.authority, permit=permit2,
+                                        target=scope2.target, now_utc=NOW)
         with self.assertRaises(HostRuntimeBlocked):
-            consume_runtime_grant(grant2, row=g2.authority, permit=permit2,
-                                  target=scope2.target, now_utc=NOW, require_live=False)
+            consume_offline_synthetic_grant(grant2, row=g2.authority, permit=permit2,
+                                            target=scope2.target, now_utc=NOW)
 
     def test_permit_mismatch_unowned_or_constructed_grant_rejected(self):
         g = GrantHarness(self)
@@ -283,6 +298,117 @@ class RuntimeGrantTests(unittest.TestCase):
         with self.assertRaises(HostRuntimeBlocked):
             OfflineSyntheticIamEvidenceVerifier(clock=g.clock).verify(
                 synthetic, g.authority, g.capability, g.scope(), g.evidence())
+
+
+class GrantFixRoundTests(unittest.TestCase):
+    """Review fix round 1: one grant per row/session, live-only dispatch, no promotion."""
+
+    def test_equal_valued_second_permit_cannot_mint_second_grant(self):
+        g = GrantHarness(self)
+        scope = g.scope()
+        deny = g.deny(scope=scope)
+        permit = g.permit()
+        verifier = OfflineSyntheticRuntimeVerifier(clock=g.clock)
+        verifier.authorize_once(g.authority, g.issued, scope, deny, permit)
+        twin = g.permit()  # equal-valued, distinct object; Ledger identity still matches
+        self.assertEqual(twin, permit)
+        with self.assertRaises(HostRuntimeBlocked):  # deny evidence consumed at mint
+            verifier.authorize_once(g.authority, g.issued, scope, deny, twin)
+        with self.assertRaises(HostRuntimeBlocked):  # fresh deny, same session/row
+            verifier.authorize_once(g.authority, g.issued, scope, g.deny(scope=scope), twin)
+
+    def test_permit_not_matching_ledger_intent_rejected(self):
+        for change in (dict(ownership_token="x" * 32), dict(execution_id="f" * 32),
+                       dict(authorization_id="j" * 64)):
+            with self.subTest(change=change):
+                g = GrantHarness(self)
+                scope = g.scope()
+                with self.assertRaises(HostRuntimeBlocked):
+                    OfflineSyntheticRuntimeVerifier(clock=g.clock).authorize_once(
+                        g.authority, g.issued, scope, g.deny(scope=scope), g.permit(**change))
+        g = GrantHarness(self)
+        g.h.fx.ledger.permit_identity = None  # no consumed Intent recorded for the row
+        scope = g.scope()
+        with self.assertRaises(HostRuntimeBlocked):
+            OfflineSyntheticRuntimeVerifier(clock=g.clock).authorize_once(
+                g.authority, g.issued, scope, g.deny(scope=scope), g.permit())
+
+    def test_dispatch_boundary_has_no_live_flag_and_synthetic_cannot_dispatch(self):
+        import inspect
+        self.assertEqual(sorted(inspect.signature(consume_runtime_grant).parameters),
+                         ["grant", "now_utc", "permit", "row", "target"])
+        g = GrantHarness(self)
+        grant, scope, permit = g.grant()
+        with self.assertRaises(TypeError):
+            consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
+                                  now_utc=NOW, require_live=False)
+        with self.assertRaises(HostRuntimeBlocked) as caught:
+            consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
+                                  now_utc=NOW)
+        self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
+        g2 = GrantHarness(self)
+        grant2, scope2, permit2 = g2.grant()
+        self.assertIsNone(consume_offline_synthetic_grant(
+            grant2, row=g2.authority, permit=permit2, target=scope2.target, now_utc=NOW))
+
+    def test_setattr_provenance_promotion_detected(self):
+        g = GrantHarness(self)
+        grant, scope, permit = g.grant()
+        object.__setattr__(grant, "provenance", LIVE_PROVENANCE)
+        with self.assertRaises(HostRuntimeBlocked):
+            consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
+                                  now_utc=NOW)
+        for verifier in (ProtectedHostRuntimeVerifier, OfflineSyntheticRuntimeVerifier):
+            with self.subTest(verifier=verifier.__name__):
+                g = GrantHarness(self)
+                scope = g.scope()
+                deny = g.deny(scope=scope)
+                object.__setattr__(deny, "provenance", LIVE_PROVENANCE)
+                with self.assertRaises(HostRuntimeBlocked):
+                    verifier(clock=g.clock).authorize_once(
+                        g.authority, g.issued, scope, deny, g.permit())
+
+
+class LedgerPermitIdentityTests(unittest.TestCase):
+    def test_ledger_reports_consumed_permit_identity_for_current_execution(self):
+        import hashlib
+        import sqlite3
+        from name_tag_ledger import IntentLedger
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE batch_rows(batch_id TEXT,row_index INTEGER,intent_id TEXT);"
+            "CREATE TABLE intents(intent_id TEXT,authorization_id TEXT,execution_id TEXT,"
+            "ownership_token TEXT,state TEXT);"
+            "INSERT INTO batch_rows VALUES('b',0,'i1');"
+            "INSERT INTO intents VALUES('i1','auth','exec','tok','SEND_ATTEMPT_CONSUMED');"
+            "INSERT INTO batch_rows VALUES('b',1,'i2');"
+            "INSERT INTO intents VALUES('i2','auth2','exec','tok2','WRITE_INTENT_RECORDED');")
+
+        class _Conn:
+            def __enter__(self_inner):
+                return conn
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        ledger = object.__new__(IntentLedger)
+        ledger._execution_id = "exec"
+        class _Batch:
+            batch_id = "b"
+
+        batch = _Batch()
+        with mock.patch("name_tag_ledger.VerifiedBatchApproval", _Batch), \
+                mock.patch.object(IntentLedger, "_assert_batch_source_identity"), \
+                mock.patch.object(IntentLedger, "_lock"), \
+                mock.patch.object(IntentLedger, "_unlock"), \
+                mock.patch.object(IntentLedger, "_validate_ledger_state"), \
+                mock.patch.object(IntentLedger, "_connection", return_value=_Conn()):
+            self.assertEqual(ledger.batch_send_permit_identity(batch, 0),
+                             ("auth", "exec", hashlib.sha256(b"tok").hexdigest()))
+            self.assertIsNone(ledger.batch_send_permit_identity(batch, 1))  # not consumed
+            self.assertIsNone(ledger.batch_send_permit_identity(batch, 2))  # no Intent
+            ledger._execution_id = "other"
+            self.assertIsNone(ledger.batch_send_permit_identity(batch, 0))  # other execution
 
 
 class EndpointTests(unittest.TestCase):

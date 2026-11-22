@@ -511,6 +511,20 @@ class IssuerTests(unittest.TestCase):
                 self.assertNotIn(secret, blob)
 
 
+class SessionTamperTests(unittest.TestCase):
+    def test_swapped_private_triplet_or_policy_detected(self):
+        for name, value in (("_triplet", (ISSUED_AKID, "Z" * 40, ISSUED_TOKEN)),
+                            ("_policy_bytes", b'{"Statement":[]}')):
+            with self.subTest(field=name):
+                h = IssuerHarness(self)
+                issued = h.issue()
+                object.__setattr__(issued, name, value)
+                with self.assertRaises(HostRuntimeBlocked):
+                    issued.sdk_client("ec2", "ap-northeast-1", now_utc=NOW)
+                with self.assertRaises(HostRuntimeBlocked):
+                    h.revalidate(issued)
+
+
 class TombstoneTests(unittest.TestCase):
     def test_issuance_attempt_fsynced_before_assume_role(self):
         h = IssuerHarness(self)

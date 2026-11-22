@@ -344,7 +344,11 @@ def require_issued_session(issued: object, host: object, now_utc: datetime | Non
     host = require_verified_host(host)
     if (type(issued) is not HostIssuedSession or _SESSIONS.get(issued) is not host
             or issued._host is not host or not verify_receipt(issued._receipt)
-            or issued._receipt.run_id != host.run_id or issued._receipt.host_id != host.host_id):
+            or issued._receipt.run_id != host.run_id or issued._receipt.host_id != host.host_id
+            or type(issued._triplet) is not tuple or len(issued._triplet) != 3
+            or _credential_fingerprint(*issued._triplet) != issued._receipt.credential_fingerprint
+            or type(issued._policy_bytes) is not bytes
+            or sha256(issued._policy_bytes).hexdigest() != issued._receipt.policy_sha256):
         raise _blocked("session is not a protected Host-issued session")
     if now_utc is not None and require_aware_utc(now_utc) >= issued._expiration:
         raise _blocked("issued session expired")
