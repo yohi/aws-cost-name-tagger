@@ -109,7 +109,7 @@ class FakeFile:
 class FakeHostOS:
     """Injected OS probe double. It reports facts; it never touches systemd or /run."""
 
-    def __init__(self, state_dir: str) -> None:
+    def __init__(self, state_dir: str, invocation_id: str = INVOCATION_ID) -> None:
         self.state_dir = state_dir
         self.cred_dir = "/fake-run/credentials/aws-cnt-batch.service"
         self.files: dict[str, FakeFile] = {}
@@ -118,7 +118,7 @@ class FakeHostOS:
             platform="linux", init_system="systemd", pid=os.getpid(), uid=SVC_UID,
             gid=SVC_GID, user_name="aws-cnt", cgroup=host_runtime.SERVICE_CGROUP,
             unit_name=host_runtime.SERVICE_UNIT, unit_main_pid=os.getpid(),
-            unit_active_state="active", invocation_id=INVOCATION_ID, boot_id=BOOT_ID,
+            unit_active_state="active", invocation_id=invocation_id, boot_id=BOOT_ID,
             machine_id=MACHINE_ID, unit_properties=MappingProxyType(self.properties),
             credentials_directory=self.cred_dir)
         immutable = {}
@@ -209,18 +209,34 @@ class HostFixture:
     def verify(self):
         return self.verifier.verify_process(now_utc=NOW)
 
+    def repin(self) -> None:
+        """Root re-provisions the manifest and its pin (test-only Host acceptance step)."""
+        self.os.write_manifest()
+        self.verifier = SystemdHostBootstrapVerifier(
+            probe=self.os, manifest_path=self.os.manifest_path,
+            manifest_sha256=self.os.manifest_sha256,
+            ledger_opener=lambda path: self.ledger, fsync=self.fsync)
 
-def host_fixture(testcase: unittest.TestCase) -> HostFixture:
-    tmp = tempfile.TemporaryDirectory()
-    testcase.addCleanup(tmp.cleanup)
-    state_dir = str(Path(tmp.name) / "state")
-    os.mkdir(state_dir, 0o700)
-    fake_os = FakeHostOS(state_dir)
+    @property
+    def state_dir(self) -> str:
+        return self.os.state_dir
+
+
+def host_fixture(testcase: unittest.TestCase, *, restart_of: HostFixture | None = None
+                 ) -> HostFixture:
+    """A Fake Host; ``restart_of`` simulates a Host restart over the same StateDirectory."""
+    if restart_of is None:
+        tmp = tempfile.TemporaryDirectory()
+        testcase.addCleanup(tmp.cleanup)
+        state_dir = str(Path(tmp.name) / "state")
+        os.mkdir(state_dir, 0o700)
+    else:
+        tmp, state_dir = restart_of.tmp, restart_of.state_dir
+    fake_os = FakeHostOS(state_dir, INVOCATION_ID if restart_of is None else "4" * 32)
     fixture = HostFixture(tmp, fake_os, FakeLedger())
-    fixture.verifier = SystemdHostBootstrapVerifier(
-        probe=fake_os, manifest_path=fake_os.manifest_path,
-        manifest_sha256=fake_os.manifest_sha256,
-        ledger_opener=lambda path: fixture.ledger, fsync=fixture.fsync)
+    if restart_of is not None:
+        fixture.events = restart_of.events
+    fixture.repin()
     return fixture
 
 
