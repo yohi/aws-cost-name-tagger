@@ -13,6 +13,7 @@ from name_tag_batch_live import (
     AuthorizedBatchWritePort,
     LiveWriteBlocked,
     build_volume_create_tags_request,
+    protected_registry_adapter,
 )
 from name_tag_batch_runtime import _execute_unclaimed_row
 from name_tag_batch_state import NameObservation
@@ -46,6 +47,27 @@ def _run_unclaimed_row(ledger: Mock, runtime: SimpleNamespace) -> bool:
             )
         )
         return _execute_unclaimed_row(SimpleNamespace(), 0, ledger, runtime, {})
+
+
+class RegistryDispatchTests(unittest.TestCase):
+    def test_volume_dispatches_to_adapter_without_any_client_or_authority(self) -> None:
+        adapter = protected_registry_adapter("volume")
+        self.assertEqual(adapter.kind, "volume")
+
+    def test_cnp_and_unknown_kinds_stay_denied_by_default(self) -> None:
+        for kind in ("instance", "s3_bucket", "apigw_stage", "wafv2", "not-a-kind"):
+            with self.subTest(kind=kind), self.assertRaises(LiveWriteBlocked):
+                protected_registry_adapter(kind)
+        with self.assertRaises(LiveWriteBlocked) as blocked:
+            protected_registry_adapter("s3_bucket")
+        self.assertEqual(blocked.exception.code, "ARN_OWNER_NOT_PROVEN")
+
+    def test_registry_dispatch_does_not_enable_the_live_port(self) -> None:
+        protected_registry_adapter("volume")
+        with self.assertRaises(LiveWriteBlocked) as blocked:
+            AuthorizedBatchWritePort(object()).write_once(
+                session=None, row=None, permit=None, runtime=None)
+        self.assertEqual(blocked.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
 
 
 class VolumeRequestTests(unittest.TestCase):
