@@ -235,6 +235,79 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "IPC_TIMEOUT")
         self.assertLessEqual(max(stream.timeouts[1:]), 30.0)
 
+    def test_body_slow_drip_cumulative_30s_not_per_chunk(self):
+        good = request_frame()
+        self.assertGreater(len(good) - 4, 40 * 5)  # > 30 chunks of 5 bytes... plus header
+        clock = FakeClock()
+        stream = FakeStream(good, clock, chunk=1)
+        orig, state = stream.recv, {"n": 0}
+
+        def drip(size):
+            state["n"] += 1
+            if state["n"] > 4:  # after the 4 header bytes: 1 s per body byte-chunk
+                clock.now += 1.0
+            return orig(size)
+
+        stream.recv = drip
+        with self.assertRaises(IPCError) as ctx:
+            StrictBatchHostIPCCodec(clock=clock).read_request(stream)
+        self.assertEqual(ctx.exception.code, "IPC_TIMEOUT")
+        self.assertLessEqual(max(stream.timeouts[4:]), 30.0)
+        self.assertLessEqual(state["n"], 4 + 31)  # stopped at the cumulative deadline
+
+    def test_eof_read_shares_body_deadline(self):
+        good = request_frame()
+        clock = FakeClock()
+        stream = FakeStream(good, clock, chunk=10**9)
+        orig, state = stream.recv, {"n": 0}
+
+        def timed(size):
+            state["n"] += 1
+            if state["n"] == 2:  # the body read ends at ~29 s
+                clock.now += 29.0
+            elif state["n"] == 3:  # EOF probe takes 2 s: total 31 s > shared 30 s
+                clock.now += 2.0
+            return orig(size)
+
+        stream.recv = timed
+        with self.assertRaises(IPCError) as ctx:
+            StrictBatchHostIPCCodec(clock=clock).read_request(stream)
+        self.assertEqual(ctx.exception.code, "IPC_TIMEOUT")
+        self.assertLess(stream.timeouts[-1], 2.0 + 1e-9)  # EOF got only the remaining ~1 s
+
+    def test_write_response_deadline_5s(self):
+        clock = FakeClock()
+        out = FakeStream(b"", clock)
+        resp = HostIPCResponse(1, RID, "COMPLETE", "COMPLETE", None, None)
+        StrictBatchHostIPCCodec(clock=clock).write_response(out, resp)
+        self.assertLessEqual(out.timeouts[0], 5.0)
+        slow = FakeStream(b"", clock)
+        slow.sendall = lambda data: setattr(clock, "now", clock.now + 6.0)
+        with self.assertRaises(IPCError) as ctx:
+            StrictBatchHostIPCCodec(clock=clock).write_response(slow, resp)
+        self.assertEqual(ctx.exception.code, "IPC_TIMEOUT")
+        blocked = FakeStream(b"", clock)
+
+        def raises(data):
+            raise TimeoutError()
+
+        blocked.sendall = raises
+        with self.assertRaises(IPCError) as ctx:
+            StrictBatchHostIPCCodec(clock=clock).write_response(blocked, resp)
+        self.assertEqual(ctx.exception.code, "IPC_TIMEOUT")
+
+    def test_recv_oserror_is_invalid_frame(self):
+        clock = FakeClock()
+        stream = FakeStream(b"", clock)
+
+        def reset(size):
+            raise ConnectionResetError()
+
+        stream.recv = reset
+        with self.assertRaises(IPCError) as ctx:
+            StrictBatchHostIPCCodec(clock=clock).read_request(stream)
+        self.assertEqual(ctx.exception.code, "IPC_INVALID_FRAME")
+
     def test_module_has_no_aws_sts_sdk_or_ledger_import(self):
         tree = ast.parse(Path(ipc.__file__).read_text())
         names = set()

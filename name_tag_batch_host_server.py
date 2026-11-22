@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Final, Protocol
 
+from name_tag_batch_fake import BatchRunResult
 from name_tag_batch_host_runtime import (
     AWS_RUNTIME_NOT_AUTHORIZED, HostBootstrapVerifier, HostRuntimeBlocked,
     ProtectedHostCommandEndpoint, require_verified_host)
@@ -128,17 +129,27 @@ def _report_identity(result: object) -> tuple[str | None, str | None]:
 
 
 def map_endpoint_result(request_id: str, result: object) -> HostIPCResponse:
-    """Map a returned BatchRunResult to the six-field response (RG-PRC-008)."""
+    """Map a returned BatchRunResult to the six-field response (RG-PRC-008).
+
+    Allowlist: only COMPLETED with a verified durable report is COMPLETE; STOPPED is BLOCKED;
+    any other state (RECOVERY_REQUIRED, HOLD, ACTIVE, unknown) is BLOCKED, never COMPLETE.
+    """
+    if type(result) is not BatchRunResult:
+        return HostIPCResponse(PROTOCOL_VERSION, request_id, "UNKNOWN",
+                               HOST_COMMAND_UNKNOWN, None, None)
     batch_id, report = _report_identity(result)
-    outcomes = getattr(result, "outcomes", ())
-    if "OUTCOME_UNKNOWN" in tuple(outcomes):
+    state = result.batch_state
+    if "OUTCOME_UNKNOWN" in tuple(result.outcomes):
         status, code = "UNKNOWN", "OUTCOME_UNKNOWN"
-    elif getattr(result, "batch_state", None) == "STOPPED":
+    elif state == "STOPPED":
         status, code = "BLOCKED", "BATCH_STOPPED"
-    elif report is not None:
-        status, code = "COMPLETE", "COMPLETE"
+    elif state == "COMPLETED":
+        if report is not None:
+            status, code = "COMPLETE", "COMPLETE"
+        else:
+            status, code = "UNKNOWN", "REPORT_NOT_VERIFIED"
     else:
-        status, code = "UNKNOWN", "REPORT_NOT_VERIFIED"
+        status, code = "BLOCKED", "BATCH_NOT_COMPLETED"
     return HostIPCResponse(PROTOCOL_VERSION, request_id, status, code, batch_id, report)
 
 
@@ -272,14 +283,7 @@ class ProtectedHostIPCServer:
     def handle_connection(self, conn: object, *, bootstrap: HostBootstrapVerifier,
                           endpoint: ProtectedHostCommandEndpoint) -> None:
         try:
-            if not self._slot():
-                self._send(conn, _pre_accept(None, IPC_BUSY))
-                return
-            try:
-                self._serve_connection(conn, bootstrap, endpoint)
-            finally:
-                with self._guard:
-                    self._connections -= 1
+            self._serve_connection(conn, bootstrap, endpoint)
         finally:
             try:
                 conn.close()
@@ -294,6 +298,16 @@ class ProtectedHostIPCServer:
         if not admitted:
             self._send(conn, _pre_accept(None, IPC_PEER_REJECTED))
             return
+        if not self._slot():  # only admitted peers are told BUSY by the connection cap
+            self._send(conn, _pre_accept(None, IPC_BUSY))
+            return
+        try:
+            self._read_and_run(conn, bootstrap, endpoint)
+        finally:
+            with self._guard:
+                self._connections -= 1
+
+    def _read_and_run(self, conn: object, bootstrap, endpoint) -> None:
         try:
             request = self._codec.read_request(conn)
         except IPCError as error:
