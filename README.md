@@ -141,6 +141,52 @@ uv run --locked --no-build python name_tag_batch_report_reader.py \
 The reader performs no STS, Intent, Permit or write, opens no socket and never
 uses a caller-chosen file path.
 
+Two implementation details differ from the wording of Design R0.1.2. The
+Design text is Owner-adopted and is not revised here:
+
+- Host reports are stored under the root-pinned StateDirectory as
+  `<StateDirectory>/batch-reports/<batch_id>/<report_sha256>.json`, with
+  `batch-reports/<batch_id>/index.json` naming the current report. The Design
+  mentions `/var/lib/aws-cnt/reports`.
+- `report_sha256` is a domain-separated SHA-256 over the exact stored bytes:
+  `SHA-256("aws-cnt-host-batch-report-v1" || 0x00 || stored_bytes)`. It is
+  not a plain SHA-256 of the file.
+
+A repeated command for the same Batch rewrites `index.json` to name the newest
+report. Verifying an older report with its digest then gives `NOT_VERIFIED`.
+This fails safe and is not changed in this phase.
+
+### 18-Kind capability coverage report
+
+Unsigned previews, Owner-verified reports and Host reports include
+`kind_capability_coverage`. It covers all 18 Registry Kinds in Registry order,
+and each Kind reports two separate axes:
+
+- Capability: `IMPLEMENTED_OFFLINE`, `LIVE_GATE_PENDING`,
+  `CAPABILITY_NOT_PROVEN`, `UNSUPPORTED_API` or `UNSUPPORTED_BY_POLICY`, with
+  its reason code and any offline dispatch block. For example, S3 is never
+  dispatchable because tag-set replacement is unproven, and API Gateway is
+  blocked because its IAM condition is unproven.
+- Outcome: the exact count and Decimal cost of the Kind's selected rows by
+  outcome. Each row is counted once.
+
+Kind pre-cap counts and costs come only from the signed Plan v3 field
+`cur_population_by_kind`. The stages are `cur_recognized`, `below_min_cost`,
+`above_min_cost`, `lookup_selected` and `max_resources_not_inspected`. They
+must reconcile exactly with `cur_population` and with the selected records.
+
+- A historical signed Plan without the field reports
+  `PRECAP_KIND_BREAKDOWN_NOT_AVAILABLE`. It is never filled with zeros.
+- A forged operation, or an attempt outcome on a row that cannot be signed,
+  rejects the whole report. Such a row is never reported as an unsupported
+  skip.
+- `live_acceptance` is always `NOT_RUN`. A Fake or offline success is not live
+  acceptance.
+
+Only `volume` is `IMPLEMENTED_OFFLINE` in the production Registry. The other
+17 Kinds remain `CAPABILITY_NOT_PROVEN`. Tests promote `instance` or `lambda`
+only through test-only fixtures.
+
 ### Safety gates still held
 
 `SAFETY_HOLD_ACTIVE`, `AWS_WRITE_BLOCKED`, `G1_NOT_PROVEN`, `G2_NOT_VERIFIED`
