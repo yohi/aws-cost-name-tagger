@@ -436,6 +436,11 @@ def _verify_sts_response(exchange: object, *, request_bytes: bytes, role_arn: st
                              _redacted_response_sha256(response))
 
 
+class HostCredentialIssuer(Protocol):
+    def issue(self, batch, subset, host: VerifiedHostContext, now_utc: datetime
+              ) -> HostIssuedSession: ...
+
+
 class HostBatchCredentialIssuer:
     """HostCredentialIssuer: the sole STS credential producer on the protected Host."""
 
