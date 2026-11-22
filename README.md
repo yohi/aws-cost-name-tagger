@@ -61,6 +61,91 @@ refuses an existing Ledger path, uses only the in-memory fake adapter, and marks
 its report `execution_allowed=false`. It never opens the host-bound Ledger or
 contacts AWS/STS. No Batch command enables AWS writes or lifts the Safety Hold.
 
+### Offline versus live authorization
+
+Offline commands (`prepare-batch`, `batch-dryrun`, `verify-batch`,
+`batch-simulate`) only read local files, verify signatures, or use an isolated
+fixture Ledger. They never connect to the Host service or AWS.
+
+`name_tag_batch_cli.py batch-live` is only an untrusted local client of the
+protected Host service. It requires `--live-opt-in`, the exact Plan, review CSV
+and signed Batch envelope, and a new private `--report-out` file:
+
+```bash
+uv run --locked --no-build python name_tag_batch_cli.py batch-live \
+  --plan plan.json --review review.csv --envelope batch-envelope.json \
+  --report-out live-summary.json --live-opt-in
+```
+
+The client sends the exact bytes once over the fixed socket
+`/run/aws-cnt/host.sock` (IPC v1) and reads one reply on the same connection.
+It has no socket, Host runtime, grant, row, subset, policy or request-id option,
+and it ignores environment variables. It never verifies the Owner, opens the
+Ledger, or creates STS/SDK clients. `--live-opt-in`, local UID, `SO_PEERCRED`
+and socket permissions do not grant authority. Only the Host service decides,
+after it re-verifies current OwnerTrust, Scope, IAM, G1/G2 and Ledger state.
+
+The client never retries or reconnects. Read the reply status as follows:
+
+- `COMPLETE`: the accepted command reached a verified durable Host report. It
+  does not mean that every row was applied.
+- `BLOCKED`: the Host refused the command or could not continue safely, or the
+  socket is missing. Earlier rows may already be `APPLIED_VERIFIED`.
+- `UNKNOWN`: the outcome or reply could not be established (timeout, lost or
+  partial reply). Writes may have happened. Do not resubmit.
+
+`--report-out` holds only a bounded local summary (`status`, `code`,
+`batch_id`, `report_sha256`). It is not the Host report and is never used for
+recovery. A repeated command for the same Batch, even with a new request ID,
+gets no second send from the Host Ledger.
+
+Manual STOP: the CLI cannot stop, resume or alter a Batch. To stop work, stop
+the protected Host service (`aws-cnt-batch.service`) as an administrator; any
+post-Permit outcome that is not durably known is kept as `OUTCOME_UNKNOWN` with
+Batch STOP and Scope HOLD and is never replayed.
+
+### Report recovery after UNKNOWN
+
+Never resubmit `batch-live` after `UNKNOWN`. A root-controlled local
+administrator runs the read-only reader instead:
+
+```bash
+uv run --locked --no-build python name_tag_batch_report_reader.py \
+  --plan plan.json --review review.csv --envelope batch-envelope.json \
+  --read-authorization report-read.json --report-out owner-report.json
+```
+
+1. The Owner signs a fresh Batch-scoped read authorization in the namespace
+   `aws-cost-name-tagger-batch-report-read-v1`. Its payload is created with
+   `prepare_report_read_authorization()`, is valid for at most 15 minutes and
+   names the `batch_id` from the original signed envelope. Set
+   `expected_report_sha256` to the reply digest, or `null` if the reply was
+   lost.
+2. The reader checks that signature against the current OwnerTrust, role
+   (`batch-approver`) and revocation. The Owner key must be enrolled for this
+   namespace in the root-managed allowed-signers file. It also re-verifies the
+   original Batch envelope.
+3. It finds the Host StateDirectory from the root-pinned Host manifest, reads
+   `batch-reports/<batch_id>/index.json`, and opens only the report that index
+   names. It checks the exact stored-bytes digest, the embedded Batch ID and the
+   signed Plan/CSV digests.
+4. It writes a new private (`0600`) Owner report with per-row durable outcomes,
+   attempts and cap, Batch state, refusal reason, and earlier
+   `APPLIED_VERIFIED` rows. If the report is missing or does not match, the
+   result is `NOT_VERIFIED` with the protected Ledger status when available. It
+   never infers zero writes.
+
+The reader performs no STS, Intent, Permit or write, opens no socket and never
+uses a caller-chosen file path.
+
+### Safety gates still held
+
+`SAFETY_HOLD_ACTIVE`, `AWS_WRITE_BLOCKED`, `G1_NOT_PROVEN`, `G2_NOT_VERIFIED`
+and `AWS_RUNTIME_NOT_AUTHORIZED` stay in effect. In this phase the Host
+listener, endpoint and report reader production wiring fail closed with
+`AWS_RUNTIME_NOT_AUTHORIZED`, and no Host service is installed. Passing offline
+tests is not approval for a live write.
+
 Example payload preparation:
 
 ```bash
