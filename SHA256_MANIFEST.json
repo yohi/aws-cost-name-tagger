@@ -15,8 +15,8 @@
     },
     {
       "path": "aws_cost_name_tagger_v3.py",
-      "sha256": "e91967895a5d81fe97eb900f0964769ef8d3e13c1e9e48d0c5bca8dbeaa44ef1",
-      "bytes": 111968
+      "sha256": "7313de261df4e9706da5d8d1399748ef22290e8131d50f42a413b859df04a0d8",
+      "bytes": 114724
     },
     {
       "path": "example_report_FORMAT_ONLY.csv",
@@ -30,8 +30,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "11a4503f3999d4fbb8404ea62eb65262cc737a0bc7930f8f9898165b21fece98",
-      "bytes": 7979
+      "sha256": "c3387b63f8a0fdcfe0bf862ec7ed37e3cad28f4104646cf04f332d65879f5d7b",
+      "bytes": 14839
     },
     {
       "path": "SAFETY_REVIEW_RESULT.md",
@@ -40,8 +40,8 @@
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
-      "sha256": "30c7a8387900041b69b86af1adc6ece5cec4729f63cbd9061e7f57c09228b192",
-      "bytes": 200373
+      "sha256": "1edffd2b3a0ebd236b03c305bea2b11691c9f99a31f0f430d4df7c6f81400b43",
+      "bytes": 200389
     },
     {
       "path": "test_results.txt",
@@ -120,8 +120,8 @@
     },
     {
       "path": "name_tag_ledger.py",
-      "sha256": "86864dc09d3d0265c41e2e6d70c050872ec72eeca66b4c00e5bbe8a3c93e4113",
-      "bytes": 104935
+      "sha256": "cc48b19b260e03d5cccd5f4effe425ce7462258aa17a596645c96aa2909d83ce",
+      "bytes": 115595
     },
     {
       "path": "name_tag_ledger_anchor.py",
@@ -200,18 +200,18 @@
     },
     {
       "path": "name_tag_batch_approval.py",
-      "sha256": "99cd8a12011aa26323bd6d4cf59ea3ce014cfcb7df241e0cb05676edc13c9c2a",
-      "bytes": 11029
+      "sha256": "9c19ab2a6560a9be2b80a6e1c82bb31c15a35a91836c63289998092efcc84ff7",
+      "bytes": 11402
     },
     {
       "path": "name_tag_batch_cli.py",
-      "sha256": "2f54a987ef4c390327ec1b903cdb0a07764ed78fc51c438fc5c05e1ef05ce416",
-      "bytes": 14140
+      "sha256": "1fd975ce9403d05b04756b9e22f2530a58b5547e02e906a3be114a90367aa97c",
+      "bytes": 18944
     },
     {
       "path": "name_tag_batch_credentials.py",
-      "sha256": "1df3ce9b80238a68c8a72d5eaa210ea6412596fd3e1ac2375c8e1e82be718714",
-      "bytes": 9770
+      "sha256": "09c21373d1434cfd637e56389c71c18aca9c5f2f5aab1aa5cd30ccf76133e214",
+      "bytes": 10327
     },
     {
       "path": "name_tag_batch_fake.py",
@@ -225,8 +225,8 @@
     },
     {
       "path": "name_tag_batch_iam.py",
-      "sha256": "fd3c4820b8478443f5f9b389eba8ac9e0056300000a2d9754d7eee6ecc7fc284",
-      "bytes": 4954
+      "sha256": "fba10a2a031797568af96c902cf4c02ebfc0feef596c97e8a7accc077b70bff2",
+      "bytes": 8298
     },
     {
       "path": "name_tag_batch_ledger.py",
@@ -245,23 +245,23 @@
     },
     {
       "path": "name_tag_batch_population.py",
-      "sha256": "319214c668e83f0c14054382304b50b0a97ba791a1e020660c2a160fbcf0650d",
-      "bytes": 11116
+      "sha256": "fc842489d39e6f5867d27391fe8dbab1d564a41a3a608c19b39f8328253183ab",
+      "bytes": 14568
     },
     {
       "path": "name_tag_batch_report.py",
-      "sha256": "52c15dd2ded2ef93ca97d8fc1e13f57ed9934c06b20fd28786626d86779e3672",
-      "bytes": 9617
+      "sha256": "96b64eef1a7aa54f4b52e77f784bbeeea2c385119d98ed0760e57b7d0afcac15",
+      "bytes": 17912
     },
     {
       "path": "name_tag_batch_state.py",
-      "sha256": "38b251793067c025d3460caa6ae9966ddadbca907a947f5274c8e88117cc43e0",
-      "bytes": 12302
+      "sha256": "68625d5e8e443dcf7ae34513d70132ba7ff76fc1cc53b384605735a90a1d239f",
+      "bytes": 14232
     },
     {
       "path": "name_tag_batch_runtime.py",
-      "sha256": "ede5f8f5e69f9cd6dda4706f724bdd789a9fcc2905a841dbb3e423322ab5bd35",
-      "bytes": 14036
+      "sha256": "8176502526f7d18521973c53086aa1a0ff86c8638ba4ed89256ae702142d85c4",
+      "bytes": 40372
     },
     {
       "path": "name_tag_batch_trust.py",
@@ -275,13 +275,13 @@
     },
     {
       "path": "test_name_tag_batch_approval.py",
-      "sha256": "02de2ffc3647c4ba51223aff9608bb8857f18b76cf47d9405122d6ec3e30dc2b",
-      "bytes": 9876
+      "sha256": "61b7d0d1e7f43759aba4921404d6361dfc2d98bb41d3b7fe55bf0cdcb13d0a2d",
+      "bytes": 13145
     },
     {
       "path": "test_name_tag_batch_cli.py",
-      "sha256": "2449fe81baacd90d7f300ddba14c1a1791771dc7974b2c61aa41c9b14a472c6d",
-      "bytes": 13283
+      "sha256": "f5bf855293e8be843b72f22c9e20ddf86dcd4e47566331d359e1f9c155316d82",
+      "bytes": 14616
     },
     {
       "path": "test_name_tag_batch_executor.py",
@@ -295,8 +295,8 @@
     },
     {
       "path": "test_name_tag_batch_ledger.py",
-      "sha256": "01f581fa9c3fc6e04d070ccdbc2f7925efcd33a2f9bfa7bb49f6cf165d039f6f",
-      "bytes": 7060
+      "sha256": "1320084f8b322cb0e4674db54a3fc5637fce04513907c84a2566f1006db9f347",
+      "bytes": 36957
     },
     {
       "path": "test_name_tag_batch_migration.py",
@@ -305,8 +305,8 @@
     },
     {
       "path": "test_name_tag_batch_population.py",
-      "sha256": "9052f7ca5d3a79b3740d4277176a9674093c652114ee8a9ffb891b3781188153",
-      "bytes": 5112
+      "sha256": "54e3dc7c1e54d218ef7db5aecb2c6bf42f1bcf0b7b2f09e263fa9066f83ea38c",
+      "bytes": 8647
     },
     {
       "path": "test_name_tag_batch_report.py",
@@ -315,8 +315,8 @@
     },
     {
       "path": "test_name_tag_batch_state.py",
-      "sha256": "6061ab7e6bacbf9ec026ec50a56f3bca5621b0aa41845ce019cefada47d724a4",
-      "bytes": 22471
+      "sha256": "a18033f4c6c15396ff56270c35ef7d685d890120bffd67a740b355c7517e4217",
+      "bytes": 26610
     },
     {
       "path": "test_name_tag_batch_trust.py",
