@@ -624,22 +624,76 @@ def _advance_live_row(batch, row_index, position, state, ledger, runtime, report
     return _execute_live_row(batch, row_index, ledger, runtime, state, report)
 
 
+HOST_REPORTS_DIRNAME: Final = "batch-reports"  # <StateDirectory>/batch-reports/<batch_id>/
+HOST_REPORT_INDEX_NAME: Final = "index.json"  # protected Batch ID -> published digest index
+HOST_REPORT_SCHEMA: Final = _REPORT_SCHEMA
+HOST_REPORT_INDEX_SCHEMA: Final = "aws-cnt-host-batch-report-index-v1"
+
+
+def host_report_sha256(stored: bytes) -> str:
+    """report_sha256 over the *exact stored* report bytes (domain-separated SHA-256)."""
+    return sha256(b"aws-cnt-host-batch-report-v1\x00" + stored).hexdigest()
+
+
 def _report_digest(report: Mapping[str, JsonValue]) -> tuple[str, bytes]:
     from name_tag_batch_approval import canonical_bytes
 
     body = canonical_bytes({k: v for k, v in report.items() if k != "report_sha256"})
-    return sha256(b"aws-cnt-host-batch-report-v1\x00" + body).hexdigest(), body
+    return host_report_sha256(body), body
+
+
+def _publish_report_index(batch_dir, batch_id: str, digest: str, service_uid: int) -> bool:
+    """Atomically publish ``index.json`` (temp + fsync + rename + dir fsync), then verify it."""
+    import os
+    import secrets
+    import stat as stat_module
+    from name_tag_batch_approval import canonical_bytes
+
+    body = canonical_bytes({"schema": HOST_REPORT_INDEX_SCHEMA, "batch_id": batch_id,
+                            "report_sha256": digest})
+    temp = batch_dir / f".index-{secrets.token_hex(8)}.tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600)
+    try:
+        try:
+            view = memoryview(body)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, batch_dir / HOST_REPORT_INDEX_NAME)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+    dir_fd = os.open(batch_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    read_fd = os.open(batch_dir / HOST_REPORT_INDEX_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(read_fd)
+        stored = os.read(read_fd, len(body) + 1)
+    finally:
+        os.close(read_fd)
+    return (stored == body and stat_module.S_ISREG(info.st_mode)
+            and info.st_uid == service_uid and not info.st_mode & 0o077)
 
 
 def _persist_host_report(host, batch_id: str, report: Mapping[str, JsonValue]) -> str | None:
-    """Protected durable report in the verified StateDirectory; None when unverifiable."""
+    """Protected durable report in the verified StateDirectory; None when unverifiable.
+
+    The digest is returned only after the report file *and* the Batch ID -> digest index are
+    durable and verified (Design §5.2.1), so a response digest is never published early.
+    """
     import os
     import stat as stat_module
     from pathlib import Path
 
     try:
         digest, body = _report_digest(report)
-        root = Path(host.state_directory) / "batch-reports"
+        root = Path(host.state_directory) / HOST_REPORTS_DIRNAME
         batch_dir = root / batch_id
         for directory in (root, batch_dir):
             try:
@@ -676,7 +730,9 @@ def _persist_host_report(host, batch_id: str, report: Mapping[str, JsonValue]) -
         finally:
             os.close(read_fd)
         if (stored != body or info.st_uid != host.service_uid or info.st_mode & 0o077
-                or sha256(b"aws-cnt-host-batch-report-v1\x00" + stored).hexdigest() != digest):
+                or host_report_sha256(stored) != digest):
+            return None
+        if not _publish_report_index(batch_dir, batch_id, digest, host.service_uid):
             return None
         return digest
     except (OSError, TypeError, ValueError):

@@ -139,7 +139,8 @@ def prepare_batch_approval(plan_bytes:bytes,csv_bytes:bytes,*,owner_principal_id
     return PreparedBatchApproval(can,payload,sha256(can).hexdigest(),BATCH_NAMESPACE,manifest)
 
 
-def _verify_batch_owner_signature(payload,canonical_payload,envelope,trust,now_utc):
+def _verify_batch_owner_signature(payload,canonical_payload,envelope,trust,now_utc,*,namespace=BATCH_NAMESPACE):
+    """Current OwnerTrust/role/revocation + OpenSSH check; ``namespace`` purpose-separates artifacts."""
     from name_tag_approval import ApprovalRejected, OwnerTrust, _select_signer_lines, _verify_signature
     if not isinstance(trust,OwnerTrust) or type(now_utc) is not datetime or now_utc.tzinfo is None:
         raise BatchAuthRejected()
@@ -153,7 +154,7 @@ def _verify_batch_owner_signature(payload,canonical_payload,envelope,trust,now_u
     lines=_select_signer_lines(trust._check_file(),payload['owner_principal_id'],allowed)
     signature=base64.b64decode(envelope['signature_ref'],validate=True)
     try:
-        actual=_verify_signature(signature,canonical_payload,payload['owner_principal_id'],BATCH_NAMESPACE,lines)
+        actual=_verify_signature(signature,canonical_payload,payload['owner_principal_id'],namespace,lines)
     except ApprovalRejected as error:
         raise BatchAuthRejected() from error
     if actual!=payload['owner_key_fingerprint']:
