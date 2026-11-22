@@ -25,7 +25,7 @@ from typing import Final, Protocol
 
 from name_tag_batch_fake import BatchRunResult
 from name_tag_batch_host_runtime import (
-    AWS_RUNTIME_NOT_AUTHORIZED, HostBootstrapVerifier, HostRuntimeBlocked,
+    AWS_RUNTIME_NOT_AUTHORIZED, HostBootstrapVerifier, HostOutcomeUnknown, HostRuntimeBlocked,
     ProtectedHostCommandEndpoint, require_verified_host)
 from name_tag_batch_ipc import (
     HOST_SOCKET_PATH, IPC_BUSY, IPC_PEER_REJECTED, PROTOCOL_VERSION, ZERO_REQUEST_ID,
@@ -154,11 +154,14 @@ def map_endpoint_result(request_id: str, result: object) -> HostIPCResponse:
 
 
 def map_blocked(request_id: str, blocked: HostRuntimeBlocked) -> HostIPCResponse:
+    """BLOCKED for refusals; UNKNOWN (no report digest) for a HostOutcomeUnknown."""
     code = getattr(blocked, "code", None)
     if type(code) is not str or _CODE.fullmatch(code) is None:
         code = AWS_RUNTIME_NOT_AUTHORIZED
     batch_id, report = _identity(getattr(blocked, "batch_id", None),
                                  getattr(blocked, "report_sha256", None))
+    if isinstance(blocked, HostOutcomeUnknown):
+        return HostIPCResponse(PROTOCOL_VERSION, request_id, "UNKNOWN", code, batch_id, None)
     return HostIPCResponse(PROTOCOL_VERSION, request_id, "BLOCKED", code, batch_id, report)
 
 

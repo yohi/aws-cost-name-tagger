@@ -343,7 +343,7 @@ class NonEc2BatchValidatorTests(RealLedgerV2Case):
         self.assertEqual(self.intents(), [("SEND_ATTEMPT_CONSUMED", None, "lambda:TagResource")])
 
     def _denied(self, batch_records, *, scope_arns, changes=None, scope_changes=None,
-                proven=True, code=None):
+                proven=True, code=None, effects_transform=None):
         ctx = proven_lambda() if proven else _contextlib.nullcontext()
         with ctx, self.trusted():
             batch = self.make_batch(batch_records)
@@ -351,6 +351,8 @@ class NonEc2BatchValidatorTests(RealLedgerV2Case):
             scope, effects = self.init_scope(ledger, scope_arns)
             if scope_changes:
                 scope = _dataclasses.replace(scope, **scope_changes)
+            if effects_transform:
+                effects = effects_transform(effects)
             authority = self.authority(batch)
             with (tampered_rows(**changes) if changes else _contextlib.nullcontext()):
                 with self.assertRaises(_LedgerError) as caught:
@@ -392,6 +394,23 @@ class NonEc2BatchValidatorTests(RealLedgerV2Case):
         self._denied([lambda_record(0)], scope_arns=[LAMBDA_ARN],
                      scope_changes={"writer_control_scope_id": "scope-2"},
                      code="BLOCKED_SCOPE_STATE_UNKNOWN")
+
+    def test_scope_account_partition_and_side_effect_uniqueness_denied(self):
+        """m6: each Batch-path Scope clause refuses before any Intent."""
+        self._denied([volume_record(0)], scope_arns=[VOLUMES[0]],
+                     scope_changes={"account": "210987654321"}, code="BLOCKED_SCOPE_MISMATCH")
+        self._reset_ledger()
+        self._denied([volume_record(0)], scope_arns=[VOLUMES[0]],
+                     scope_changes={"partition": "aws-us-gov"}, code="BLOCKED_SCOPE_MISMATCH")
+        self._reset_ledger()
+        self._denied([volume_record(0)], scope_arns=[VOLUMES[0]],
+                     effects_transform=lambda effects: effects + effects[:1],
+                     code="BLOCKED_SCOPE_MISMATCH")
+        self._reset_ledger()
+        self._denied([volume_record(0, VOLUMES[0])], scope_arns=sorted(VOLUMES),
+                     effects_transform=lambda effects: tuple(
+                         e for e in effects if e.target_arn != VOLUMES[0]),
+                     code="BLOCKED_SCOPE_MISMATCH")
 
     def test_unapproved_or_unvetted_kind_denied(self):
         # Signed while the test-only promotion was active; at admission the vetted Registry

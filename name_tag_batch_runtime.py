@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
 import re
@@ -357,6 +358,35 @@ _UNRESOLVED_INTENT: Final = "UNRESOLVED_WRITE_INTENT"
 _REPORT_SCHEMA: Final = "aws-cnt-host-batch-report-v1"
 
 
+class _SendTracker:
+    """Per-command record of whether a send may have happened (Permit consumption attempted
+    by this command, or the Ledger already shows consumed sends for this Batch)."""
+
+    def __init__(self) -> None:
+        self.possible_send = False
+
+    def observe(self, state: BatchExecutionState) -> None:
+        if state.send_attempts_consumed > 0 or any(
+                outcome in ("SEND_ATTEMPT_CONSUMED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN")
+                for outcome in state.outcomes):
+            self.possible_send = True
+
+
+_TRACKER: ContextVar[_SendTracker | None] = ContextVar("aws_cnt_live_send_tracker",
+                                                        default=None)
+
+
+def _mark_possible_send() -> None:
+    tracker = _TRACKER.get()
+    if tracker is not None:
+        tracker.possible_send = True
+
+
+def _outcome_unknown(code: str, detail: str, **identity):
+    from name_tag_batch_host_runtime import HostOutcomeUnknown
+    return HostOutcomeUnknown(code, detail, **identity)
+
+
 class _LiveRefusal(Exception):
     """Internal: a pre-send refusal already durably handled (zero send for this row)."""
 
@@ -429,6 +459,7 @@ def _recheck_before_permit(runtime, issued, authority, vscope, deny, adapter_kin
     require_issued_session(issued, host, now)
     if not (now < deny.expires_at_utc and now < vscope.not_after_utc):
         raise _blocked_live("G2_NOT_VERIFIED", "evidence expired before Permit")
+    runtime.scope_verifier.reconfirm(vscope, now)  # Host-protected Scope proof unchanged
     live_dispatch_adapter(adapter_kind)
 
 
@@ -518,6 +549,7 @@ def _execute_live_row(batch, row_index: int, ledger, runtime, state: BatchExecut
     # ---- refusal window B: Intent recorded, Permit not yet consumed.
     try:
         _recheck_before_permit(runtime, issued, authority, vscope, deny, kind)
+        _mark_possible_send()  # from here a Permit may be durably consumed
         permit = ledger.consume_first_send(handle)
     except Exception as error:  # noqa: BLE001 - the finalizer re-proves zero send
         _finalize_unsent_intent(ledger, batch, handle,
@@ -540,7 +572,11 @@ def _execute_live_row(batch, row_index: int, ledger, runtime, state: BatchExecut
         ledger.record_readback(handle, name_after=name_after, outcome=outcome)
     except Exception:  # noqa: BLE001 - missing durable disposition: STOP/HOLD, no replay
         report["durable_readback_missing"] = True
-        _durable_stop_and_hold(ledger, batch, "OUTCOME_UNKNOWN", vscope.scope_id)
+        try:
+            _durable_stop_and_hold(ledger, batch, "OUTCOME_UNKNOWN", vscope.scope_id)
+        except HostRuntimeBlocked as error:
+            raise _outcome_unknown("OUTCOME_UNKNOWN", "post-Permit STOP/HOLD not durable",
+                                   batch_id=batch.batch_id) from error
         return True
     return outcome != "APPLIED_VERIFIED"
 
@@ -565,6 +601,16 @@ def _advance_live_row(batch, row_index, position, state, ledger, runtime, report
             report["unresolved_send_owner"] = (
                 "CURRENT_EXECUTION" if owned is True else
                 "OTHER_EXECUTION" if owned is False else "UNKNOWN")
+            if state.state == "ACTIVE":
+                # A consumed Permit without a durable disposition: retry STOP/HOLD (never a
+                # resend). Failure keeps the Host blocked with an UNKNOWN outcome.
+                scope_id = batch.approved_rows[position].get("writer_control_scope_id")
+                try:
+                    _durable_stop_and_hold(ledger, batch, "OUTCOME_UNKNOWN",
+                                           scope_id if isinstance(scope_id, str) else None)
+                except Exception as error:  # noqa: BLE001
+                    raise _outcome_unknown("OUTCOME_UNKNOWN", "STOP/HOLD retry not durable",
+                                           batch_id=batch.batch_id) from error
             return True
         if outcome == "WRITE_INTENT_RECORDED":
             ledger.stop_batch(batch, reason_code="BLOCKED_INCOMPLETE_INTENT")
@@ -686,8 +732,11 @@ def _run_live(batch: VerifiedBatchApproval, ledger: IntentLedger, runtime) -> Ba
     report = make_authenticated_batch_report(
         fresh, plan_bytes=fresh.plan_bytes, csv_bytes=fresh.csv_bytes, trust=trust, now_utc=now)
     refusal: str | None = None
+    tracker = _TRACKER.get()
     for position, row_index in enumerate(fresh.approved_row_indexes):
         state = ledger.batch_execution_state(fresh)
+        if tracker is not None:
+            tracker.observe(state)
         try:
             if _advance_live_row(fresh, row_index, position, state, ledger, runtime, report):
                 break
@@ -702,13 +751,20 @@ def _run_live(batch: VerifiedBatchApproval, ledger: IntentLedger, runtime) -> Ba
             for outcome in state.outcomes):
         ledger.complete_batch(fresh)
         state = ledger.batch_execution_state(fresh)
+    if tracker is not None:
+        tracker.observe(state)
     result = _complete_live_result(report, state, fresh, refusal)
     digest = _persist_host_report(runtime.host, fresh.batch_id, result.report)
+    possible_send = tracker is not None and tracker.possible_send
+    if digest is None and possible_send:
+        # A possible send with no verified report is UNKNOWN, never a pre-send BLOCKED.
+        raise _outcome_unknown("REPORT_NOT_VERIFIED", "report not persisted/verified",
+                               batch_id=fresh.batch_id)
     if refusal is not None:
         raise _blocked_live(refusal, "pre-send refusal; durable partial report",
                             batch_id=fresh.batch_id, report_sha256=digest)
     if digest is None:
-        return result  # no report_sha256: the IPC mapping cannot claim COMPLETE
+        return result  # nothing was sent; no report_sha256 so never COMPLETE
     final = dict(result.report)
     final["report_sha256"] = digest
     return BatchRunResult(result.batch_state, result.send_attempts_consumed,
@@ -726,13 +782,29 @@ def execute_batch_live(batch: VerifiedBatchApproval, ledger: IntentLedger,
     if (type(batch) is not VerifiedBatchApproval or type(ledger) is not IntentLedger
             or ledger is not bound_ledger(verified.host) or not ledger._trusted_host):
         raise _blocked_live("BLOCKED_SCOPE_STATE_UNKNOWN", "not the Host-bound Ledger")
+    from name_tag_batch_host_runtime import HostOutcomeUnknown
+
+    tracker = _SendTracker()
+    token = _TRACKER.set(tracker)
     try:
         return _run_live(batch, ledger, verified)
-    except HostRuntimeBlocked:
+    except HostOutcomeUnknown:
         raise
-    except LedgerError as error:
-        raise _blocked_live(error.code, "Ledger refused the command") from error
+    except HostRuntimeBlocked as error:
+        # BLOCKED may coexist with earlier durable sends only with a verified report digest.
+        if tracker.possible_send and error.report_sha256 is None:
+            raise _outcome_unknown("OUTCOME_UNKNOWN", "refusal after a possible send",
+                                   batch_id=getattr(error, "batch_id", None)) from error
+        raise
+    except Exception as error:  # noqa: BLE001
+        if tracker.possible_send:
+            raise _outcome_unknown("OUTCOME_UNKNOWN", "failure after a possible send",
+                                   batch_id=batch.batch_id) from error
+        if isinstance(error, LedgerError):  # pre-send Ledger refusal keeps its code
+            raise _blocked_live(error.code, "Ledger refused the command") from error
+        raise
     finally:
+        _TRACKER.reset(token)
         clear_selections(verified.host)
 
 
