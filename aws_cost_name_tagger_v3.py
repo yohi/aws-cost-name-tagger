@@ -599,8 +599,11 @@ def cur_candidates_batch(
     files: list[str], month: str | None, min_cost: float,
     max_resources: int, account: str, kind_filter: set[str] | None = None,
 ):
-    """Return Batch-selected candidates and exact pre-cap accounting from two bounded passes."""
-    from name_tag_batch_population import exact_add, partition_cur_population
+    """Return Batch-selected candidates and exact pre-cap accounting from two bounded passes.
+
+    The fifth element is the per-Kind pre-cap breakdown built from the same aggregates.
+    """
+    from name_tag_batch_population import build_kind_precap, exact_add, partition_cur_population
     from name_tag_batch_population import _canonical_decimal
 
     paths = _cur_input_paths(files)
@@ -613,6 +616,7 @@ def cur_candidates_batch(
     population = partition_cur_population(
         aggregates, min_cost=min_cost, max_resources=max_resources)
     selected_keys = population.pop("selected_keys")
+    kind_precap = build_kind_precap(aggregates, selected_keys, min_cost=min_cost)
     candidates = []
     for key in selected_keys:
         aggregate = aggregates[key]
@@ -642,7 +646,7 @@ def cur_candidates_batch(
             candidate["effective_usage_cost_usd"] for candidate in candidates
     )) != population["lookup_selected"]["cost_usd"]:
         raise ValueError("Batch selected CUR total failed exact reconciliation")
-    return active_month, candidates, population, reason_details
+    return active_month, candidates, population, reason_details, kind_precap
 
 
 class AWSReadBudgetExceeded(RuntimeError):
@@ -1616,6 +1620,49 @@ def _partition_for_region(region: str) -> str:
     return "aws"
 
 
+def _project_pre_sign_identity(record: dict, partition: str, account: str) -> None:
+    """Freeze canonical ARN, signed Scope region and vetted operation BEFORE proposal_key/Plan bytes.
+
+    The resolver already ran against the original service endpoint region. A Kind that fails
+    identity or capability stays an unsigned, non-signable preview (empty ARN, no operation).
+    """
+    from name_tag_kind_capabilities import project_pre_sign_kind_target
+
+    kind, locator = record["kind"], record["locator"]
+    target = str(record.get("write_target") or "")
+    arn = target if target.startswith("arn:") else None
+    if kind == "apigw_stage" and isinstance(locator, str) and locator.count("|") >= 2:
+        arn = arn or locator.split("|", 2)[2]
+        locator = arn
+    try:
+        projected = project_pre_sign_kind_target(
+            kind=kind, locator=locator, discovered_region=record["region"],
+            discovered_arn=arn, partition=partition, account=account,
+            evidence=record.get("evidence"), proposed_name=record.get("proposed_name"))
+    except ValueError as error:
+        if record.get("status") == "proposed":
+            record.update(status="manual_review", confidence="none", proposed_name="",
+                          evidence=f"Canonical target identity rejected before signing: {error}")
+        record["resource_arn"], record["aws_operation"] = "", None
+        return
+    record["resource_arn"] = projected.identity.resource_arn
+    record["region"] = projected.identity.scope_region
+    record["aws_operation"] = projected.aws_operation
+
+
+def _reject_identity_collisions(records: list[dict]) -> None:
+    """Duplicate post-projection identity (e.g. one global Kind seen via two regions) never reaches a Plan."""
+    seen = set()
+    for record in records:
+        arn = record.get("resource_arn")
+        if not arn:
+            continue
+        identity = (record["kind"], arn)
+        if identity in seen:
+            raise SystemExit("batch-plan identity collision after Kind projection; no Plan written")
+        seen.add(identity)
+
+
 def _batch_partition(candidates: list[dict]) -> str:
     """Select the single AWS partition represented by the Batch candidates."""
     partitions={_partition_for_region(str(candidate.get("region", "")))
@@ -1669,6 +1716,13 @@ def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str
     return path
 
 
+def _arn_partition(arn, row: dict) -> str:
+    parts = arn.split(":", 2) if isinstance(arn, str) else []
+    if len(parts) == 3 and parts[0] == "arn" and parts[1]:
+        return parts[1]
+    return _partition_for_region(str(row.get("region", "")))
+
+
 def _batch_plan_report_fields(row: dict, scope_declarations: list[dict], account: str) -> dict:
     proposed_name = row.get("proposed_name")
     evidence = row.get("evidence")
@@ -1686,7 +1740,7 @@ def _batch_plan_report_fields(row: dict, scope_declarations: list[dict], account
                else "UNSUPPORTED_API")
     matches = [scope for scope in scope_declarations
                if scope.get("account") == account
-               and scope.get("partition") == _partition_for_region(str(row.get("region", "")))
+               and scope.get("partition") == _arn_partition(row.get("resource_arn"), row)
                and scope.get("region") == row.get("region")
                and row.get("resource_arn") in scope.get("resource_arns", [])]
     scope_state = "DECLARED_ONLY" if len(matches) == 1 else "NOT_APPLIED"
@@ -2053,7 +2107,7 @@ def plan_batch(args, *, scope_declarations, session=None):
     preflight_report_destination(out)
     preflight_outputs(destinations)
 
-    month, candidates, cur_population, reason_details = cur_candidates_batch(
+    month, candidates, cur_population, reason_details, kind_precap = cur_candidates_batch(
         args.cur, args.month, args.min_cost, args.max_resources, args.account,
         kind_filter=_cur_kind_filter(args),
     )
@@ -2070,10 +2124,10 @@ def plan_batch(args, *, scope_declarations, session=None):
             candidate_states=("ABSENT", "EMPTY", "WHITESPACE_ONLY"),
         )
         record = {**candidate, **info}
+        _project_pre_sign_identity(record, partition, args.account)
         record["proposal_id"] = proposal_key(record)
-        record["resource_arn"] = resource_arn(record, args.account)
-        record["aws_operation"] = "ec2:CreateTags" if record["kind"] == "volume" else None
         records.append(record)
+    _reject_identity_collisions(records)
     _demote_colliding_proposals(records)
     if session.read_budget.exhausted:
         raise AWSReadBudgetExceeded("AWS read budget exhausted: no partial Batch Plan")
@@ -2090,6 +2144,7 @@ def plan_batch(args, *, scope_declarations, session=None):
         "count": len(records),
         "records": records,
         "cur_population": cur_population,
+        "cur_population_by_kind": kind_precap,
         "cur_population_reason_details": reason_details,
         "execution_limits": {"max_send_attempts": max_send_attempts},
         "scope_declarations": scope_declarations,

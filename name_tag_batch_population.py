@@ -6,6 +6,8 @@ from typing import Mapping
 import math
 import re
 
+from name_tag_kind_capabilities import REGISTRY_KINDS
+
 MAX_CUR_ROWS = 2_000_000
 MAX_CUR_DISTINCT_RESOURCES = 250_000
 MAX_COST_DIGITS = 1_000
@@ -185,6 +187,7 @@ def validate_signed_population(plan:dict)->dict:
     _validate_billing_summaries(c,billing,cost)
     if not _population_is_conserved(c,cost):
         raise ValueError('Inexact CUR population conservation')
+    validate_kind_precap(plan,c)
     if 'cur_population_reason_details' in plan:
         validate_reason_details(plan['cur_population_reason_details'],c)
     if type(plan.get('count')) is not int or plan['count']!=len(plan.get('records',[])) or plan['count']!=c['lookup_selected']['count']:
@@ -192,6 +195,63 @@ def validate_signed_population(plan:dict)->dict:
     if exact_add(record['effective_usage_cost_usd'] for record in plan['records']) != cost(c['lookup_selected']['cost_usd']):
         raise ValueError('Selected record costs contradict signed population')
     return c
+
+
+KIND_PRECAP_STAGES=('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')
+
+
+def build_kind_precap(aggregates, selected_keys, *, min_cost: float):
+    """Per-Kind pre-cap stages from the SAME aggregates/Decimals and the SAME selection as the totals."""
+    selected=set(selected_keys)
+    groups={kind:{stage:[] for stage in KIND_PRECAP_STAGES} for kind in REGISTRY_KINDS}
+    for key,aggregate in aggregates.items():
+        stages=groups[key[0]]  # KeyError: a non-registry Kind must never be silently dropped
+        stages['cur_recognized'].append(aggregate.exact_cost)
+        if aggregate.legacy_rank_cost<min_cost:
+            stages['below_min_cost'].append(aggregate.exact_cost)
+            continue
+        stages['above_min_cost'].append(aggregate.exact_cost)
+        stages['lookup_selected' if key in selected else 'max_resources_not_inspected'].append(aggregate.exact_cost)
+    return {'schema_version':1,'kinds':{
+        kind:{stage:{'count':len(values),'cost_usd':_canonical_decimal(exact_add(values))}
+              for stage,values in stages.items()}
+        for kind,stages in groups.items()}}
+
+
+def validate_kind_precap(plan:dict,population:dict)->None:
+    """Optional authenticated Kind pre-cap field; absent (historical Plan) claims no Kind coverage."""
+    if 'cur_population_by_kind' not in plan:
+        return
+    field=plan['cur_population_by_kind']
+    if (type(field) is not dict or set(field)!={'schema_version','kinds'}
+            or type(field['schema_version']) is not int or field['schema_version']!=1
+            or type(field['kinds']) is not dict or tuple(sorted(field['kinds']))!=tuple(sorted(REGISTRY_KINDS))):
+        raise ValueError('Invalid Kind pre-cap population')
+    totals={stage:[0,[]] for stage in KIND_PRECAP_STAGES}
+    for kind in REGISTRY_KINDS:
+        stages=field['kinds'][kind]
+        if type(stages) is not dict or set(stages)!=set(KIND_PRECAP_STAGES):
+            raise ValueError('Invalid Kind pre-cap stages')
+        parsed={}
+        for stage in KIND_PRECAP_STAGES:
+            entry=stages[stage]
+            if (type(entry) is not dict or set(entry)!={'count','cost_usd'} or type(entry['count']) is not int
+                    or not 0<=entry['count']<=MAX_CUR_DISTINCT_RESOURCES):
+                raise ValueError('Invalid Kind pre-cap summary')
+            amount=_canonical_cost(entry['cost_usd'])
+            if entry['count']==0 and amount!=0:
+                raise ValueError('Empty Kind pre-cap stage has nonzero cost')
+            parsed[stage]=(entry['count'],amount)
+            totals[stage][0]+=entry['count']
+            totals[stage][1].append(amount)
+        for whole,first,second in (('cur_recognized','below_min_cost','above_min_cost'),
+                                   ('above_min_cost','lookup_selected','max_resources_not_inspected')):
+            if (parsed[whole][0]!=parsed[first][0]+parsed[second][0]
+                    or parsed[whole][1]!=exact_add((parsed[first][1],parsed[second][1]))):
+                raise ValueError('Kind pre-cap identity violated')
+    for stage in KIND_PRECAP_STAGES:
+        if totals[stage][0]!=population[stage]['count'] or exact_add(totals[stage][1])!=_canonical_cost(population[stage]['cost_usd']):
+            raise ValueError('Kind pre-cap does not reconcile with signed population')
 
 
 def _validate_resource_summaries(population,names,cost):

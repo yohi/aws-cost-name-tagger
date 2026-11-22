@@ -2488,7 +2488,7 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
                                   line_item_unblended_cost='0.2')))
             self.write_cur(path,rows)
 
-            month,candidates,population,reasons=t.cur_candidates_batch(
+            month,candidates,population,reasons,_kinds=t.cur_candidates_batch(
                 [str(path)],None,0.05,100,ACCOUNT)
 
             self.assertEqual(month,'2026-10')
@@ -2512,7 +2512,7 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
                          line_item_product_code='AmazonS3',line_item_unblended_cost='3'),
             ])
 
-            _,candidates,population,_=t.cur_candidates_batch(
+            _,candidates,population,_,_k=t.cur_candidates_batch(
                 [str(path)],'2026-10',0,10,ACCOUNT)
 
             self.assertEqual([(row['kind'],row['effective_usage_cost_usd'])
@@ -2534,7 +2534,7 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
                 self.row(line_item_resource_id='arn:aws:ec2:ap-northeast-1:999999999999:volume/vol-0123456789abcdef0',line_item_unblended_cost='6'),
             ])
 
-            _,candidates,population,reasons=t.cur_candidates_batch(
+            _,candidates,population,reasons,_k=t.cur_candidates_batch(
                 [str(path)],'2026-10',0,10,ACCOUNT,kind_filter={'instance'})
 
             self.assertEqual(candidates,[])
@@ -2621,7 +2621,7 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
                 '--scope-declarations','unused.json','--output',str(Path(tmp)/'plan.json')])
             candidate={'kind':'volume','region':'us-gov-west-1','locator':'vol-0123456789abcdef0'}
             with patch.object(t,'cur_candidates_batch',return_value=(
-                    '2026-10',[candidate],{},{})) as cur, patch.object(t,'build_session') as session:
+                    '2026-10',[candidate],{},{},{})) as cur, patch.object(t,'build_session') as session:
                 with self.assertRaisesRegex(SystemExit,'GovCloud'):
                     t.plan_batch(args,scope_declarations=[])
             cur.assert_called_once()
