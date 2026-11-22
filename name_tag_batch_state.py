@@ -210,23 +210,28 @@ def derive_declared_row_scope(plan:dict,row:dict)->str:
     return entries[0]['writer_control_scope_id']
 
 
-def _validate_name_eligibility(r,name):
-    """Re-check the v3 volume Name generation contract; never trust non-empty evidence alone."""
-    from aws_cost_name_tagger_v3 import meaningful
-    locator=r.get('locator')
-    if meaningful(name)!=name:
-        raise BatchValidationError('Proposed Name is not a meaningful generated Name')
-    evidence=r['evidence']
-    match=(re.fullmatch(
-        rf'EBS {re.escape(locator)} -> attachment (i-(?:[0-9a-f]{{8}}|[0-9a-f]{{17}})) '
-        rf'([a-z][a-z0-9-]*[a-z0-9]) -> EC2 \1 Name=(\S+?);.*',evidence)
-        if isinstance(locator,str) else None)
-    device=match.group(2) if match else None
-    anchor=match.group(3) if match else None
-    expected=(f'{anchor}-ebs-{device}-{locator[-7:]}'
-              if anchor is not None and device is not None else None)
-    if (anchor is None or meaningful(anchor)!=anchor or expected!=name):
-        raise BatchValidationError('Evidence does not support the generated Name')
+def _approved_target_identity(p,r):
+    """Canonical identity of the signed row; the row locator itself must identify the ARN resource."""
+    kind=r.get('kind')
+    if kind not in _caps.REGISTRY_KINDS:raise BatchValidationError('Kind/API is not proven eligible')
+    decision=_caps.resolve_kind_capability(kind)
+    if decision.status!='IMPLEMENTED_OFFLINE' or r.get('aws_operation')!=decision.write_operation:
+        raise BatchValidationError('Kind/API is not proven eligible')
+    try:
+        return _caps.canonical_target_identity(kind=kind,locator=r.get('locator'),resource_arn=r.get('resource_arn'),partition=p.get('partition'),account=p.get('account'),scope_region=r.get('region'))
+    except ValueError as error:
+        raise BatchValidationError('Locator/ARN/account/partition/region mismatch') from error
+
+
+def _validate_name_eligibility(p,r,name):
+    """Rederive the Name from the Plan record evidence with the trusted per-Kind verifier."""
+    import name_tag_kind_name_evidence as evidence_module
+    target=_approved_target_identity(p,r)
+    try:
+        verified=evidence_module.verified_generated_name(r,target)
+    except evidence_module.NameEvidenceNotProven as error:
+        raise BatchValidationError(str(error)) from error
+    if verified.generated_name!=name:raise BatchValidationError('Evidence does not support the generated Name')
 
 
 def validate_approved_batch_row(p,r,approved:str):
@@ -240,9 +245,7 @@ def validate_approved_batch_row(p,r,approved:str):
     if not isinstance(name,str) or not name or len(name)>256 or name!=name.strip() or any(ord(c)<32 or ord(c)==127 for c in name):raise BatchValidationError('Invalid proposed Name')
     if not isinstance(r.get('proposal_id'),str) or not r['proposal_id'] or not isinstance(r.get('evidence'),str) or not r['evidence']:
         raise BatchValidationError('No proposal/evidence')
-    _validate_name_eligibility(r,name)
-    if r.get('kind')!='volume' or r.get('aws_operation')!='ec2:CreateTags':
-        raise BatchValidationError('Kind/API is not proven eligible')
+    _validate_name_eligibility(p,r,name)
     scope=derive_declared_row_scope(p,r)
     return {**r,'approved':'YES','approved_name':name,'writer_control_scope_id':scope}
 
