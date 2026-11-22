@@ -147,6 +147,7 @@ class LiveHarness(RealLedgerV2Case):
         self.source = ScopeSource()
         self.evidence_kind = "live"
         self.evidence_calls = 0
+        self.evidence_ttl = timedelta(minutes=10)
         self.fail_evidence_on: set[int] = set()
         self.ledger = self.open()
         self.fx = host_fixture(self)
@@ -190,7 +191,7 @@ class LiveHarness(RealLedgerV2Case):
             resource_policy_sha256=H, session_grant_sha256=H, approved_allow=(arn, action, "Name"),
             deny_cases=_deny_cases(arn, action), source="PROTECTED_EVIDENCE_PRODUCER",
             captured_at_utc=self.clock_now - timedelta(minutes=1),
-            expires_at_utc=self.clock_now + timedelta(minutes=10), captured_state_sha256=H,
+            expires_at_utc=self.clock_now + self.evidence_ttl, captured_state_sha256=H,
             current_state_sha256=H, verifier_result="PASS")
         if self.evidence_kind == "synthetic" or self.evidence_calls in self.fail_evidence_on:
             return SyntheticIamEvidenceProducer().produce(**fields)
@@ -319,6 +320,20 @@ class LiveCoordinatorStepOneTests(LiveHarness):
         blocked = self.run_blocked(batch)
         self.assertEqual(blocked.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         self.assertEqual((self.intents(), self.cloud.writes), ([], []))
+
+    def test_expired_iam_evidence_refused_before_intent_and_sdk(self):
+        # IAM evidence already expired when the Host consumes it: refused before any
+        # Intent / create_batch_intent / SDK write; no send happens after expiry.
+        self.evidence_ttl = timedelta(seconds=-1)
+        batch = self.prepare()
+        with mock.patch.object(self.ledger, "create_batch_intent",
+                               wraps=self.ledger.create_batch_intent) as create_intent:
+            blocked = self.run_blocked(batch)
+        self.assertEqual(blocked.code, "AWS_RUNTIME_NOT_AUTHORIZED")
+        create_intent.assert_not_called()
+        self.assertEqual(self.intents(), [])
+        self.assertEqual(self.cloud.writes, [])
+        self.assertGreaterEqual(self.evidence_calls, 1)
 
     def test_valid_mock_proven_host_one_permit_one_send_readback(self):
         batch = self.prepare()

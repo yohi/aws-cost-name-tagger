@@ -185,7 +185,7 @@ class EffectiveIamEvidenceTests(unittest.TestCase):
                     g.deny(g.evidence(**change))
         self.assertEqual(g.deny().provenance, "OFFLINE_SYNTHETIC_NOT_STS")
 
-    def test_runtime_evidence_expired_no_intent(self):
+    def test_runtime_evidence_window_and_late_clock_refused(self):
         g = GrantHarness(self)
         expired = g.evidence(captured_at_utc=NOW - timedelta(hours=2),
                              expires_at_utc=NOW - timedelta(seconds=1))
@@ -197,7 +197,6 @@ class EffectiveIamEvidenceTests(unittest.TestCase):
         late = OfflineSyntheticRuntimeVerifier(clock=lambda: NOW + timedelta(minutes=11))
         with self.assertRaises(HostRuntimeBlocked):
             late.authorize_once(g.authority, g.issued, g.scope(), deny, g.permit())
-        self.assertNotIn("create_batch_intent", g.h.fx.ledger.calls)
 
     def test_evidence_is_protected_reference_not_fields(self):
         g = GrantHarness(self)
