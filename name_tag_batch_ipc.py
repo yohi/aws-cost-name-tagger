@@ -129,6 +129,8 @@ def _recv(stream: object, size: int, deadline: Deadline) -> bytes:
         data = stream.recv(size)
     except TimeoutError as error:
         raise IPCError(IPC_TIMEOUT, "read timed out") from error
+    except OSError as error:  # e.g. ECONNRESET: a broken stream is an invalid frame
+        raise IPCError(IPC_INVALID_FRAME, "stream read failed") from error
     if type(data) is not bytes or len(data) > size:
         raise IPCError(IPC_INVALID_FRAME, "stream returned invalid data")
     if deadline.expired():

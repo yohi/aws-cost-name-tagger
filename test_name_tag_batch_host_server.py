@@ -461,6 +461,20 @@ class AcceptedTests(unittest.TestCase):
         rig.endpoint.seen_batches.clear()
         self.assertEqual(rig.handle(rig.conn()).status, "COMPLETE")
 
+    def test_connection_cap_busy_only_for_admitted_peers(self):
+        rig = Rig(endpoint_kwargs={"result": run_result()})
+        rig.server._max_connections = 0
+        reply = rig.handle(rig.conn(uid=OPERATOR_UID + 7))
+        self.assertEqual(reply.code, "IPC_PEER_REJECTED")
+
+    def test_forged_host_context_blocked_before_endpoint(self):
+        rig = Rig(endpoint_kwargs={"result": run_result()})
+        rig.server._host_check = host_runtime.require_verified_host  # production default
+        reply = rig.handle(rig.conn())  # bootstrap returns a forged SimpleNamespace
+        self.assertEqual(reply.status, "BLOCKED")
+        self.assertEqual(rig.endpoint.calls, [])
+        self.assertEqual(rig.events, ["IPC_REQUEST_ACCEPTED", "verify_process"])
+
     def test_connection_cap_returns_busy_without_reading(self):
         rig = Rig(endpoint_kwargs={"result": run_result()})
         rig.server._max_connections = 0
@@ -532,6 +546,17 @@ class MappingTests(unittest.TestCase):
         self.assertEqual((reply.status, reply.code, reply.batch_id),
                          ("UNKNOWN", "HOST_COMMAND_UNKNOWN", None))
         self.assertNotIn("secret", repr(reply))
+
+    def test_non_completed_states_with_valid_digest_never_complete(self):
+        for state in ("RECOVERY_REQUIRED", "HOLD", "ACTIVE", "WEIRD", "COMPLETE"):
+            with self.subTest(state=state):
+                reply, _ = self.run_endpoint(result=run_result(state=state))
+                self.assertEqual((reply.status, reply.code), ("BLOCKED", "BATCH_NOT_COMPLETED"))
+                self.assertEqual((reply.batch_id, reply.report_sha256), (BATCH_ID, REPORT))
+        reply, _ = self.run_endpoint(result=object())  # not a BatchRunResult
+        self.assertEqual((reply.status, reply.code), ("UNKNOWN", "HOST_COMMAND_UNKNOWN"))
+        reply, _ = self.run_endpoint(result=None)
+        self.assertEqual(reply.status, "UNKNOWN")
 
     def test_host_blocked_codes_are_mapped_and_unknown_codes_sanitized(self):
         reply, _ = self.run_endpoint(error=HostRuntimeBlocked("BLOCKED_OWNER_AUTHN", "x"))
