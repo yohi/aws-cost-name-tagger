@@ -1,7 +1,7 @@
-# AWS Cost Name Tagger — Production Runtime Completion Design R0.1.1
+# AWS Cost Name Tagger — Production Runtime Completion Design R0.1.2
 
 - Date: 2026-11-21 (JST)
-- Limited remediation: 2026-11-22 (JST), RG-PRC-001…004 only (Design-only, not committed)
+- Limited remediation: 2026-11-22 (JST), RG-PRC-001…004; 2026-11-22 Finding 001–004 (document-only, not committed)
 - Repository: `yohi/aws-cost-name-tagger`
 - Base: `master@bffc5d97e5ccd53bc094785bcda70476b2be2fd7`
 - Status: **PROPOSED — Human Owner Design Approval Pending**
@@ -135,6 +135,31 @@ Mandatory nonregional/accountless ARN rules (regional account-qualified kinds ke
 
 The complete registry must specify remaining kinds' exact canonical ARN grammar and normalization, not accept a generic `split(':')` or caller-supplied Region fallback. For EC2, IDs (including allocation IDs) are parsed to their own ARN resource type, never guessed from CUR service name. ARN equality is byte-exact after **one** deterministic pre-sign projection; aliases are rejected instead of silently rewritten. Cross-account values, duplicate Scope ownership, unknown global/region mapping, different buckets sharing ambiguous identities, unresolved snapshots and unproven endpoint ownership return `BLOCKED_SCOPE_MISMATCH` / `BLOCKED_SCOPE_STATE_UNKNOWN` / `CAPABILITY_NOT_PROVEN` with **zero Intent / Permit / Write**. A supported shape is not itself permission to write.
 
+### 4.1.1 Deterministic pre-sign target projection — Finding 001
+
+**The Registry is connected to `plan_batch()` before signing, not solely to IAM/Adapter dispatch.** For each CUR candidate, keep the existing CUR kind/locator/region and cost aggregation as raw discovery inputs. After bounded read-only `Investigator.resolve()`, but **before** `proposal_key()`, final `resource_arn`, `aws_operation`, CSV projection, signed Scope matching or Plan serialization, call the versioned Registry to deterministically obtain the one canonical target identity and *supported* operation. This is a single pre-sign projection; nothing may rewrite the signed Plan, row region, ARN or operation later. Define the internal contract:
+
+```python
+@dataclass(frozen=True)
+class PreSignKindTarget:
+    identity: CanonicalTargetIdentity
+    aws_operation: str | None   # None unless API/IAM/Name evidence is vetted for approved-row admission
+    capability_status: str
+    reason_code: str
+
+def project_pre_sign_kind_target(*, kind: str, locator: str,
+                                 discovered_region: str, discovered_arn: str | None,
+                                 partition: str, account: str,
+                                 evidence: str, proposed_name: str | None
+                                 ) -> PreSignKindTarget: ...
+```
+
+The projection sets `record['resource_arn'] = identity.resource_arn`, `record['region'] = identity.scope_region`, and `record['aws_operation'] = aws_operation` **before** `proposal_key(record)` and signed Plan generation. The initial `aws_operation=None` for unproven/unsupported kinds remains a valid **unapproved Preview** state; it never yields an approved `VerifiedBatchRowAuthority`. Once a non-Volume kind's Name evidence, API/IAM contract and account/Scope ownership rules are genuinely proven, the Registry provides the *only* supported operation for signing (not an undocumented candidate). A signed legacy Volume Plan is not reprojected on readback or verification. No editable CSV columns are added.
+
+The projection's nonregional/accountless cases are exact: `snapshot` accountless EC2 snapshot ARN only if proven by the designated rule and independent owner evidence; `s3_bucket` and `cloudfront` signed `scope_region='global'` with their respective accountless/account-qualified regionless ARN; WAFv2 `CLOUDFRONT` ARN retains the actual regional ARN component/endpoint (typically `us-east-1`), while REGIONAL WAF uses its regional ARN. Uncertain account, endpoint, original ARN/locator ambiguity or conflicting scoped identities are rejected or reported `CAPABILITY_NOT_PROVEN` **without approval**. The newly projected row must match exactly one predeclared signed Scope; do not create a Scope from untrusted CUR text.
+
+**Non-Volume vertical test:** use an independent Fake and a demonstrably validated eligible kind (for example a vetted `instance` with deterministic Name evidence and per-resource IAM constraints): `cur_candidates_batch` → `plan_batch` (canonical ARN, region, operation) → immutable Plan v3 and 14-column CSV → Owner signature verification → `VerifiedBatchRowAuthority` → Kind IAM policy → vetted Adapter. Negative tests cover candidate operation with CNP evidence, mutated signed ARN/Region/operation, duplicate Scope, and cross-account target. Fake acceptance does not authorize AWS.
+
 ### 4.2 Kind-level API candidate decision register — RG-PRC-002
 
 This is an explicit **candidate register**, not a claim that all candidate IAM conditions have been proven. API call spelling follows AWS SDK's snake_case model operation naming; arguments are the *security-critical minimum*, and all output-derived identity and Name tags require strict validation. `R` = Pre-send Read and identical-session Readback. Every `W` is a **single Name-key request**; service API `*Tags*` methods may overwrite the value **for `Name`**, but may not alter other tag keys. Exception: tagged-set **replacement** APIs are disallowed. Additional mandatory identity verification API is shown where relevant.
@@ -252,6 +277,30 @@ class ProtectedBatchRuntimeVerifier(Protocol):
 
 **Ordering:** Trust/Scope/capability/issuer/subset/IAM acceptance must pass **before Ledger Intent**; after Intent and immediately before Permit consumption revalidate protected authority/Scope and fresh evidence; the one-shot grant is checked immediately at the SDK dispatch boundary and consumed, with no reusable session grant. The host executor owns both grant minting and the SDK invocation; `AuthorizedBatchWritePort` must reject all caller-fabricated runtimes. Missing, expired, mismatched, revoked, protected-state read failures and unknown process termination yield no send before Permit; after Permit use durable `OUTCOME_UNKNOWN`, Batch STOP/HOLD and no replay. An inability to durably STOP/HOLD blocks the Host. No automatic bootstrap credential recovery or fail-open retry.
 
+### 5.2 Fixed protected Host bootstrap — Finding 004
+
+**Single architecture, not implementation discretion:** The only production Host entry is a manually Owner-authorized, system-level Linux **systemd service**, `aws-cnt-batch.service`, running as a dedicated unprivileged `aws-cnt` OS account. The service has one Coordinator inside the **existing** `name_tag_batch_runtime.py`, the one host-bound SQLite Ledger, and the existing protected OwnerTrust/Scope/IAM evidence. No second signer, ledger, writable remote service or direct CLI-to-SDK execution is introduced. The service is **not installed, enabled, started or connected** by this document. A non-systemd host is unsupported pending a distinct Owner decision; a caller invoking the Python module directly cannot self-assert service provenance.
+
+Provisioning contract for later separately authorized Host acceptance: root-managed `aws-cnt-batch.service` unit and immutable executable/config/manifest with pinned exact digests, dedicated service UID/GID and protected access permissions, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `UMask=0077`, `StateDirectory=aws-cnt`, `RuntimeDirectory=aws-cnt`, and protected ledger/trust/evidence paths. If required host hardening cannot be verified, **Fail-Closed**; specifying a unit option is not proof that the OS enforced it. One local UNIX socket `/run/aws-cnt/host.sock` is owned by that protected service. The `batch-live` CLI is an *untrusted local client* to this fixed socket and may submit only the exact Plan/CSV/Owner envelope and a bounded request; it cannot send credentials, substitute proof, grant, output paths or a socket location. Socket permission and `SO_PEERCRED` checks are supplemental controls, **not** Owner approval or a substitute for signed-row verification. The service re-verifies all Owner/Scope/Issuer/IAM/Permit gates before any dispatch.
+
+**Single trust root and bootstrap interface:** A Host-only `verify_host_bootstrap(now_utc: datetime) -> VerifiedHostContext` owns an unforgeable process-local registry entry and must validate the live service/cgroup identity, root-controlled unit/config/executable manifest and trusted digests, protected file ownership/mode/no-symlink path components, stable Host/run ID, private protected Ledger identity and current OwnerTrust/Scope source bindings. Merely matching a UID, an environment variable, an object constructor, or a fabricated `VerifiedHostContext` is insufficient. No validated boot context => no Host Credential Issuer, no Intent, no Permit and no AWS call.
+
+**Only STS bootstrap credential source:** `HostBootstrapCredentialProvider.load(host: VerifiedHostContext, now_utc: datetime) -> ProtectedBootstrapCredentials` reads the **systemd encrypted credential** `LoadCredentialEncrypted=aws-bootstrap.json:<root-provisioned encrypted path>` delivered exclusively into the service's verified `CREDENTIALS_DIRECTORY`, parses an exact short-lived `AccessKeyId`, `SecretAccessKey`, `SessionToken`, `Expiration` tuple, validates freshness/format/declared bootstrap principal and protects it in process memory. This directory's environment variable is only a location hint, never an authority claim. No ambient boto3 credential chain, `AWS_*` key fallback, shared config/profile, IMDS fallback, automatic renewal or cached expired credentials. Construct the Host-owned STS client **only with explicitly supplied validated credential bytes**, and only after protected Host and Owner checks; bind the actual AssumeRole request/response to the protected issuance receipt under §5.1. Missing, expired, substituted or inaccessible encrypted credentials fail closed. Credential provisioning/rotation, unit hardening, trust setup, IAM changes, real STS and Host G1/G2 attestation remain **NOT_VERIFIED / Owner HOLD**.
+
+```python
+class HostBootstrapVerifier(Protocol):
+    def verify_process(self, *, now_utc: datetime) -> VerifiedHostContext: ...
+class HostBootstrapCredentialProvider(Protocol):
+    def load(self, host: VerifiedHostContext, *, now_utc: datetime
+             ) -> ProtectedBootstrapCredentials: ...
+class ProtectedHostCommandEndpoint(Protocol):
+    def execute_signed_batch(self, *, plan_bytes: bytes, csv_bytes: bytes,
+                             owner_envelope_bytes: bytes,
+                             host: VerifiedHostContext) -> BatchRunResult: ...
+```
+
+**Offline vs real proof:** Inject filesystem/service/credential transport doubles in tests to exercise denied bootstrap, forged UID/cgroup/unit, symlink/permission/digest drift, substituted `CREDENTIALS_DIRECTORY`, missing/expired credentials, copied runtime grants, incorrect peer and crash states. These Fake verifications assert only *code behavior*. Real process isolation, protected credential delivery, absence of ambient access, effective IAM denies and G1/G2 must be independently evidenced during a later specifically approved Host acceptance. Preserve `SAFETY_HOLD_ACTIVE`, `AWS_WRITE_BLOCKED`, `G1_NOT_PROVEN`, `G2_NOT_VERIFIED` and `AWS_RUNTIME_NOT_AUTHORIZED` in this implementation phase.
+
 ## 6. Write Execution Contract
 
 書き込み対象の各行で以下を保証する。
@@ -352,6 +401,29 @@ IAMの継承Policy、Permission Boundary、SCP、Resource-based Policy、Assumed
 
 The Registry's coverage table is keyed by the exact 18 immutable Kind identifiers, not by inferred service text. Each selected CUR resource has exactly one **stage classification** plus a separate immutable **capability assessment**; use disjoint population partitions and `Decimal` sums, never sum stages twice. `cur_recognized = below_min_cost + above_min_cost`; `above_min_cost = lookup_selected + max_resources_not_inspected` remain intact, as do existing excluded-billing-line and reason-detail totals. For each Kind, track pre-cap resource count/cost, selected, eligible, unsigned/unapproved, unsupported, unproven, cap-not-attempted, attempted, verified and unknown. Reconcile each stage to fixed population and do not conflate `CAPABILITY_NOT_PROVEN` with `UNSUPPORTED_BY_POLICY`, `NOT_RUN` or actually observed API failure. `APPLIED_VERIFIED` requires a signed row, consumed Permit, issued identity and same-session Readback. Report exactly why a Kind is disabled, even if other kinds proceed.
 
+### 8.2 Authenticated 18-kind pre-cap accounting — Finding 003
+
+`cur_candidates_batch()` must calculate per-kind resource partitions **from the same exact-Decimal, deduplicated CUR aggregates before applying `--min-cost` and `--max-resources`**. Selected `plan.records` alone cannot recover excluded/uninspected kinds. The original `cur_population` object remains `schema_version=2` and is neither reinterpreted nor backfilled. New Plans v3 contain one additional **optional, read-only, top-level** `cur_population_by_kind` field; it is included automatically in the existing exact `plan_sha256`, so no change to Plan schema version, 14-column CSV or `BatchApprovalV1` fields is required. New Plan generation always emits it; historical signed Plans lacking it continue to verify without reinterpretation and must report `PRECAP_KIND_BREAKDOWN_NOT_AVAILABLE` rather than fabricated zeros.
+
+```python
+# Exact optional Plan v3 field (read-only, SHA-protected as ordinary Plan bytes):
+cur_population_by_kind = {
+    'schema_version': 1,
+    'kinds': {
+        kind: {
+            stage: {'count': int, 'cost_usd': str}
+            for stage in ('cur_recognized', 'below_min_cost', 'above_min_cost',
+                          'lookup_selected', 'max_resources_not_inspected')
+        }
+        for kind in SUPPORTED_KINDS
+    },
+}
+```
+
+Every recognized resource maps to exactly one Kind before threshold/cap selection. Emit all 18 Kind keys in deterministic ordering, including genuine zero entries when the request's Kind filter excludes a Kind; this does not add an out-of-filter cost. Validate finite, canonical exact-Decimal strings, nonnegative counts, mutually exclusive partitions, and for each Kind `cur_recognized = below_min_cost + above_min_cost` and `above_min_cost = lookup_selected + max_resources_not_inspected`. Across all 18 Kinds, each stage's count and cost **must equal** the corresponding existing overall `cur_population` stage, without modifying unattributable/outside-filter billing lines. A malformed, inconsistent or extraneous optional field invalidates the Plan **before approval**. Pre-cap totals cannot be inferred later from the selected rows or from an unsigned report.
+
+Reporting interface is `report_kind_capability_coverage(plan: Mapping[str, object], decisions: Mapping[str, KindCapabilityDecision], row_outcomes: Mapping[int, str]) -> dict[str, object]`; it consumes `plan['cur_population_by_kind']` as the **only signed per-kind pre-cap source**, uses selected signed records for post-selection details, and preserves capability assessment and execution outcome as separate axes. It rejects unknown stage arithmetic and duplicate costs rather than declaring coverage complete.
+
 ## 9. TDD Strategy
 
 1工程内で小さなRED → GREEN → REFACTORを繰り返す。
@@ -372,6 +444,8 @@ The Registry's coverage table is keyed by the exact 18 immutable Kind identifier
 ### 9.1 Bounded TDD acceptance and existing-plan compatibility — RG-PRC-001…004
 
 Offline tests must include table-driven 18-kind canonical ARN/locator, service/operation/request-shape and declared/independent Scope mapping; CloudFront/S3 account/region-empty ARN handling; forged/mismatched ownership and conflicting scopes; snapshots and API Gateway accountless ARNs; WAF regional/global scope; S3 `s3control.tag_resource` candidate and pinned SDK absence; explicit rejection of S3 `put_bucket_tagging`; multi-key/multi-resource forbidden requests; every Kind's key-only vs tag-set replacement; unsupported/unproven **unsigned** reporting vs invalid **signed** approval rejection; Name inference evidence mismatch; counterfeit/copied issuances; policy-size excess; stale Host/Scope/IAM/receipt and expired token; same-session read/write/readback; pre-Permit zero-Intent refusal; post-Permit unknown no-retry/STOP/HOLD; cross-kind attempt cap and Decimal report reconciliation. Existing volume, OwnerTrust, Batch signature, Phase A and Task 7 regressions remain required.
+
+**Finding 001–004 acceptance additions (no extra independent review loop):** Task 1 proves exact 18-kind pre-sign projection rules and all four global/accountless cases; Task 2 proves `name_tag_batch_state._valid_declared_arn()` and `derive_declared_row_scope()` pass their canonical global/accountless syntax **without** depending on Task 3 Name evidence; Task 3 proves one supported non-Volume Kind's signed Plan→Owner verification→row authority path and CNP unsigned report-only behavior; Task 2/9 prove all 18 pre-cap Count/Decimal totals match the immutable CUR aggregate and signed Plan source, including below-threshold and max-resources-uninspected entries; Tasks 6–8 prove systemd bootstrap failures cause zero Intent/Permit/STS/Write and that CLI/env/UID alone never establish Host authority. Offline success leaves real Host acceptance `NOT_VERIFIED`.
 
 **Existing-plan compatibility:** `docs/superpowers/plans/2026-11-18-aws-cost-name-tagger-batch-implementation-plan.md` remains the historical implementation plan for Tasks 1–7 and the **Volume-first** implementation. This R0.1.x Design adds a *future* single-phase extension, not a retroactive change to the executed Tasks 1–7. A later explicitly approved `writing-plans` output must derive individual TDD steps from §§4–9, bind new interfaces/production Host proofs, note all 18 Kind decisions, preserve existing Plan v3/BatchApprovalV1 semantics, and clearly leave live AWS acceptance outside its done criteria. **No plan file is modified in this remediation.** A new plan must not silently declare live IAM proof from Fake tests or rewrite existing Plan history.
 
