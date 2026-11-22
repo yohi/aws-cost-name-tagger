@@ -68,8 +68,8 @@ class ProtectedScopeSource(Protocol):
 
 
 class VerifiedHostScope(_Protected):
-    __slots__ = ("host", "scope_id", "scope", "side_effects", "target", "not_after_utc",
-                 "__weakref__")
+    __slots__ = ("host", "scope_id", "scope", "side_effects", "all_side_effects", "target",
+                 "not_after_utc", "__weakref__")
 
     def __init__(self, _mint: object = None, **values) -> None:
         _mint_guard(_mint)
@@ -136,6 +136,7 @@ class ProtectedHostScopeVerifier:
             raise _blocked("ownership proof is not bound to this target", "BLOCKED_SCOPE_MISMATCH")
         verified = VerifiedHostScope(
             _MINT, host=host, scope_id=signed_scope_id, scope=scope, side_effects=tuple(matching),
+            all_side_effects=tuple(effects),
             target=replace(target, ownership_proof_ref=ref),
             not_after_utc=min(scope.not_after_utc, matching[0].not_after_utc))
         _SCOPES[verified] = host

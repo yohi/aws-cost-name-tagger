@@ -488,6 +488,7 @@ class HostBatchCredentialIssuer:
         if (fresh.batch_id != selection.batch.batch_id
                 or fresh.canonical_payload_bytes != selection.batch.canonical_payload_bytes):
             raise _blocked("batch differs from the Host selection", "BLOCKED_OWNER_AUTHN")
+        self._recheck_selection_state(selection, fresh, host)
         authority = selection.row_authority
         kind = authority.row["kind"]
         try:
@@ -571,6 +572,24 @@ class HostBatchCredentialIssuer:
             _SESSIONS.pop(session, None)
             raise
         return session
+
+    @staticmethod
+    def _recheck_selection_state(selection, fresh, host) -> None:
+        """Pre-STS: a stale selection never reaches the tombstone or AssumeRole."""
+        from name_tag_batch_host_runtime import bound_ledger, read_batch_snapshot
+
+        ledger = bound_ledger(host)
+        snapshot = read_batch_snapshot(ledger, fresh, signed_cap=selection.signed_cap,
+                                       row_count=len(fresh.approved_row_indexes))
+        if snapshot != selection.snapshot:
+            raise _blocked("Ledger state changed since selection", "BLOCKED_SCOPE_STATE_UNKNOWN")
+        for scope_id in sorted({row["writer_control_scope_id"] for row in fresh.approved_rows}):
+            try:
+                scope_state = ledger.effective_scope_state(scope_id)  # type: ignore[attr-defined]
+            except Exception as error:  # noqa: BLE001
+                raise _blocked("Scope state unreadable", "BLOCKED_SCOPE_STATE_UNKNOWN") from error
+            if scope_state != "CLEARED":
+                raise _blocked("signed Scope not CLEARED", "BLOCKED_SCOPE_HOLD")
 
     @staticmethod
     def _unresolved(journal, pending, now: datetime) -> None:

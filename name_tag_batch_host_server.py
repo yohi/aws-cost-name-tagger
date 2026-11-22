@@ -329,12 +329,13 @@ class ProtectedHostIPCServer:
             result = endpoint.execute_signed_batch(
                 plan_bytes=request.plan_bytes, csv_bytes=request.csv_bytes,
                 owner_envelope_bytes=request.owner_envelope_bytes, host=host)
+            # Inside the try (Task 7): a mapping failure after the batch ran is UNKNOWN.
+            return map_endpoint_result(request.request_id, result)
         except HostRuntimeBlocked as blocked:
             return map_blocked(request.request_id, blocked)
         except Exception:  # noqa: BLE001 - never leak details; outcome is unverified
             return HostIPCResponse(PROTOCOL_VERSION, request.request_id, "UNKNOWN",
                                    HOST_COMMAND_UNKNOWN, None, None)
-        return map_endpoint_result(request.request_id, result)
 
 
 def production_ipc_server() -> ProtectedHostIPCServer:
