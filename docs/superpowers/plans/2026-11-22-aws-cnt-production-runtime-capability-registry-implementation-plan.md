@@ -302,7 +302,23 @@ A concrete issuer builds the **actual** `AssumeRole` request with exact approved
 
 **Files:** Modify `name_tag_batch_runtime.py`, `name_tag_batch_live.py`, and **`name_tag_ledger.py` (mandatory narrow Batch-only _validated_batch_intent_fields() change and Host-protected Registry matching, without schema migration)**. Create `test_name_tag_batch_live_runtime.py`; extend `test_name_tag_batch_runtime.py`, `test_name_tag_batch_ledger.py` and `test_name_tag_batch_live.py`. Preserve existing Volume and separate VerifiedEnvelope SUPPORTED_OPERATIONS path.
 
-**Interface:** Keep existing `execute_batch_offline(batch: VerifiedBatchApproval, ledger: IntentLedger, runtime: BatchOfflineRuntime)` behavior/signature. Add a Host-only typed entry point:
+**Interface — existing Offline API (RG-PRC-004):** Preserve the exact existing `name_tag_batch_runtime.py` API and call compatibility; do not replace it or change positional versus keyword-only arguments:
+
+~~~python
+def execute_batch_offline(
+    batch: VerifiedBatchApproval,
+    *,
+    plan_bytes: bytes,
+    csv_bytes: bytes,
+    ledger: IntentLedger,
+    runtime: BatchOfflineRuntime,
+) -> BatchRunResult:
+    ...
+~~~
+
+`batch` remains the only positional argument; `plan_bytes`, `csv_bytes`, `ledger` and `runtime` remain **keyword-only**. Preserve exact original bytes checks `plan_bytes == batch.plan_bytes` and `csv_bytes == batch.csv_bytes`, the existing Owner/Host/Ledger validation and `BatchOfflineRuntime` with `FakeBatchSDKAdapter` **offline-only** guard. Existing callers must continue to work without signature, behavior or signed Plan/CSV/BatchApprovalV1 changes. **The following `execute_batch_live()` is a distinct Host-only new API**; it never replaces or exposes the Offline API to actual AWS execution.
+
+**New Host-only typed entry point (separate from existing Offline API):**
 
 ~~~python
 def execute_batch_live(batch: VerifiedBatchApproval, ledger: IntentLedger,
