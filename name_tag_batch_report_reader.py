@@ -175,7 +175,8 @@ def _private_dir(path: Path, uid: int, *, missing_code: str) -> None:
 
 def _read_protected_file(path: Path, uid: int, limit: int, *, missing_code: str) -> bytes:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                     | getattr(os, "O_CLOEXEC", 0))
     except FileNotFoundError as error:
         raise _NotVerified(missing_code) from error
     except OSError as error:  # ELOOP (symlink) and friends
@@ -194,8 +195,13 @@ def _read_protected_file(path: Path, uid: int, limit: int, *, missing_code: str)
             size += len(chunk)
             if size > limit:
                 raise _NotVerified("REPORT_STORAGE_NOT_PROTECTED")
+    except OSError as error:
+        raise _NotVerified("REPORT_STORAGE_NOT_PROTECTED") from error
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as error:
+            raise _NotVerified("REPORT_STORAGE_NOT_PROTECTED") from error
     return b"".join(chunks)
 
 

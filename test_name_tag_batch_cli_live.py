@@ -549,6 +549,31 @@ class StatusSemanticsTests(LiveCase):
                 self.assertNotIn("BLOCKED (offline)", self.stderr)
                 self.assertFalse((self.root / f"{status}.json").exists())
 
+    def test_stdout_errors_do_not_prevent_summary_or_change_host_exit_code(self):
+        cases = (("line", "COMPLETE", 0, {}),
+                 ("status_meaning", "UNKNOWN", 3, {"reply_mode": "lost"}))
+        original_print = print
+        for output, status, exit_code, kwargs in cases:
+            with self.subTest(output=output):
+                self.endpoint.seen_batches.clear()
+                self.endpoint.result = run_result({"batch_id": self.batch_id,
+                                                   "report_sha256": REPORT})
+                self.socket_kwargs = kwargs
+                filename = f"{output}.json"
+
+                def fail_selected_stdout(*args, **print_kwargs):
+                    is_stdout = print_kwargs.get("file") is None
+                    text = str(args[0]) if args else ""
+                    selected = (text.startswith("batch-live:") if output == "line"
+                                else not text.startswith("batch-live:"))
+                    if is_stdout and selected:
+                        raise OSError("stdout is closed")
+                    return original_print(*args, **print_kwargs)
+
+                with mock.patch("builtins.print", side_effect=fail_selected_stdout):
+                    self.assertEqual(self.run_cli(out=filename), exit_code)
+                self.assertEqual(self.summary(filename)["status"], status)
+
     def test_cli_complete_not_all_rows_applied(self):
         self.endpoint.result = run_result({"batch_id": self.batch_id, "report_sha256": REPORT},
                                           outcomes=("APPLIED_VERIFIED", "NOT_ATTEMPTED_CAP"))

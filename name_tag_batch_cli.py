@@ -314,14 +314,17 @@ def _batch_live(args):
     summary=_live_summary(response)
     line=(f"batch-live: status={response.status} code={response.code} "
           f"batch_id={response.batch_id} report_sha256={response.report_sha256}")
-    print(line)
-    print(summary['status_meaning'])
     try:
         _write_new(args.report_out,_pretty(summary))
     except (OSError,ValueError) as error:  # e.g. output created after the precheck
         print(f'Local summary was NOT written ({error}); the Host reply status='
               f'{response.status} code={response.code} above stands.',
               file=sys.stderr)
+    for output in (line, summary['status_meaning']):
+        try:
+            print(output)
+        except OSError:
+            pass  # stdout failure does not change the already-received Host outcome
     return _LIVE_EXIT[response.status]
 
 

@@ -22,6 +22,7 @@ from name_tag_batch_credentials import validate_issued_batch_session
 from name_tag_batch_iam import IAMPolicyBlocked, KindPolicy, build_subset_session_policy
 from name_tag_batch_report import ReportBlocked, make_authenticated_batch_report
 from name_tag_batch_report import reconcile_batch_outcomes
+from name_tag_batch_outcomes import _refresh_kind_coverage
 from name_tag_batch_state import classify_batch_name
 from name_tag_batch_trust import load_current_protected_owner_trust
 from name_tag_batch_fake import (
@@ -810,6 +811,10 @@ def _complete_live_result(report, state, batch, refusal_code: str | None) -> Bat
         else outcome for outcome in state.outcomes)
     if unresolved:
         report = dict(report)
+        rows = report["rows"]
+        for row_index, outcome in zip(batch.approved_row_indexes, truthful, strict=True):
+            rows[row_index]["outcome"] = outcome
+        _refresh_kind_coverage(report, rows)
         report["outcome_reconciliation"] = "UNRESOLVED"
         report["batch_state"] = state.state
         report["send_attempts_consumed"] = state.send_attempts_consumed

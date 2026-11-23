@@ -205,8 +205,8 @@
     },
     {
       "path": "name_tag_batch_cli.py",
-      "sha256": "1fd975ce9403d05b04756b9e22f2530a58b5547e02e906a3be114a90367aa97c",
-      "bytes": 18944
+      "sha256": "3d7b4b6dc9b3bdc8dd0cf7a463307bb3050c679fd60482b381e0e85190add3a0",
+      "bytes": 19092
     },
     {
       "path": "name_tag_batch_credentials.py",
@@ -260,8 +260,8 @@
     },
     {
       "path": "name_tag_batch_runtime.py",
-      "sha256": "b334ff367d034bd2a70088a83163a0de29b9e19cac327a18718be7ea4bc91a93",
-      "bytes": 42776
+      "sha256": "c73b9b3ee706c3db835a3ec4d9cb37053df3b1784a57c267d2deeb3727b83952",
+      "bytes": 43049
     },
     {
       "path": "name_tag_batch_trust.py",

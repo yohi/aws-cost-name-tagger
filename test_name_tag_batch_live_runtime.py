@@ -877,6 +877,19 @@ class LiveRefusalWindowTests(LiveHarness):
         self.assertEqual(result.outcomes[0], "UNRESOLVED_WRITE_INTENT")
         self.assertEqual(result.report["unresolved_rows"], [batch.approved_row_indexes[0]])
         self.assertEqual(result.report["outcome_reconciliation"], "UNRESOLVED")
+        final_outcomes = dict(result.report["row_ledger_outcomes"])
+        for row_index, outcome in final_outcomes.items():
+            self.assertEqual(result.report["rows"][row_index]["outcome"], outcome)
+        coverage = result.report["kind_capability_coverage"]["kinds"]
+        expected_by_kind = {kind: {} for kind in coverage}
+        for row in result.report["rows"]:
+            counts = expected_by_kind.setdefault(row["kind"], {})
+            counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+        actual_by_kind = {
+            kind: {outcome: details["count"] for outcome, details in entry["outcomes"].items()}
+            for kind, entry in coverage.items()
+        }
+        self.assertEqual(actual_by_kind, expected_by_kind)
 
     def test_post_intent_owner_scope_recheck_and_replay_denied(self):
         batch = self.prepare()

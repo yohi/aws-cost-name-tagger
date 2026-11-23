@@ -285,6 +285,47 @@ class ReportRecoveryTests(ReaderHarness):
         self.assertEqual(no_ledger["ledger_status"], {"status": "LEDGER_STATUS_NOT_AVAILABLE"})
         self.assertIs(no_ledger["zero_writes_inferred"], False)
 
+    def test_fifo_is_opened_nonblocking_then_rejected(self):
+        fifo = Path(self.root) / "report-fifo"
+        os.mkfifo(fifo, 0o600)
+        requested_flags = []
+        real_open = os.open
+
+        def open_nonblocking_for_test(path, flags, *args, **kwargs):
+            requested_flags.append(flags)
+            return real_open(path, flags | os.O_NONBLOCK, *args, **kwargs)
+
+        with mock.patch.object(reader_mod.os, "open", side_effect=open_nonblocking_for_test):
+            with self.assertRaises(reader_mod._NotVerified) as caught:
+                reader_mod._read_protected_file(
+                    fifo, os.getuid(), 1024, missing_code="REPORT_FILE_ABSENT")
+        self.assertEqual(caught.exception.code, "REPORT_STORAGE_NOT_PROTECTED")
+        self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+
+    def test_read_oserror_returns_not_verified_without_partial_report(self):
+        batch, _ = self.completed_with_lost_reply()
+        authorization = self.read_auth(batch.batch_id)
+        report_fds = set()
+        real_open, real_read = os.open, os.read
+
+        def track_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if batch.batch_id in Path(path).parts:
+                report_fds.add(fd)
+            return fd
+
+        def fail_report_read(fd, size):
+            if fd in report_fds:
+                raise OSError("read failed")
+            return real_read(fd, size)
+
+        with mock.patch.object(reader_mod.os, "open", side_effect=track_open), \
+                mock.patch.object(reader_mod.os, "read", side_effect=fail_report_read):
+            result = self.recover(batch, authorization)
+        self.assertEqual((result["recovery_status"], result["code"], result["report"]),
+                         ("NOT_VERIFIED", "REPORT_STORAGE_NOT_PROTECTED", None))
+        self.assertEqual(result["ledger_status"]["status"], "READ")
+
     def test_partial_success_stop_hold_readback(self):
         batch = self.prepare()
         self.fail_evidence_on = {2}
