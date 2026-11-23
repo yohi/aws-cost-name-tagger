@@ -4,6 +4,7 @@ from decimal import Decimal
 from name_tag_batch_population import (
     CurCostAggregate, CurBudgetExceeded, partition_cur_population,
     decimal_cost_of, classify_cur_row, exact_add, validate_kind_precap,
+    build_kind_precap, validate_reason_details, _aggregate_add,
     validate_signed_population, KIND_PRECAP_STAGES, MAX_AGGREGATE_DIGITS,
     MAX_COST_DIGITS,
 )
@@ -123,6 +124,41 @@ class PopulationTests(unittest.TestCase):
                 'records': [{'kind': 'volume', 'effective_usage_cost_usd': amount}],
             },
             sample_population(count=1, cost=amount))
+
+    def test_build_kind_precap_sums_aggregate_costs_over_cur_input_digit_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        aggregates={
+            ('volume','vol-a','ap-northeast-1'): CurCostAggregate(Decimal(amount), 1.0),
+            ('volume','vol-b','ap-northeast-1'): CurCostAggregate(Decimal(amount), 1.0),
+        }
+
+        precap=build_kind_precap(aggregates, aggregates, min_cost=0.0)
+
+        self.assertEqual(
+            precap['kinds']['volume']['cur_recognized']['cost_usd'],
+            format(_aggregate_add([Decimal(amount), Decimal(amount)]), 'f'))
+
+    def test_reason_details_accept_aggregate_billing_cost_over_cur_input_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        population=sample_population()
+        population['unattributable_cur']={
+            'known':True, 'billing_rows':1, 'cost_usd':amount,
+        }
+        details={'UNATTRIBUTABLE_CUR:missing':{
+            'billing_rows':1, 'cost_usd':amount,
+        }}
+
+        self.assertEqual(validate_reason_details(details, population), details)
+
+    def test_signed_population_accepts_record_aggregate_over_cur_input_digit_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        plan={
+            'count':1,
+            'records':[{'effective_usage_cost_usd':amount}],
+            'cur_population':sample_population(count=1, cost=amount),
+        }
+
+        self.assertEqual(validate_signed_population(plan), plan['cur_population'])
 
     def test_signed_population_accepts_aggregate_summary_over_cur_input_limit(self):
         record_cost='9' * MAX_COST_DIGITS

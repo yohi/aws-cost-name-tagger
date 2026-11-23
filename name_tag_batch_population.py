@@ -189,7 +189,7 @@ def validate_reason_details(details,population)->dict:
                 or set(value)!={'billing_rows','cost_usd'}
                 or type(value['billing_rows']) is not int or value['billing_rows']<0):
             raise ValueError('Malformed CUR classification reason detail')
-        _canonical_cost(value['cost_usd'])
+        _canonical_aggregate_cost(value['cost_usd'])
     classes={name.upper() for name in _BILLING_CLASSES}
     if any(key.partition(':')[0] not in classes for key in details):
         raise ValueError('Unknown CUR reason detail class')
@@ -200,7 +200,7 @@ def validate_reason_details(details,population)->dict:
             if entries:raise ValueError('CUR reason details for unknown class')
             continue
         if (sum(v['billing_rows'] for v in entries)!=total['billing_rows']
-                or exact_add(_canonical_cost(v['cost_usd']) for v in entries)!=_canonical_cost(total['cost_usd'])):
+                or _aggregate_add(_canonical_aggregate_cost(v['cost_usd']) for v in entries)!=_canonical_aggregate_cost(total['cost_usd'])):
             raise ValueError('CUR reason details mismatch class total')
     return details
 
@@ -223,7 +223,7 @@ def validate_signed_population(plan:dict)->dict:
         validate_reason_details(plan['cur_population_reason_details'],c)
     if type(plan.get('count')) is not int or plan['count']!=len(plan.get('records',[])) or plan['count']!=c['lookup_selected']['count']:
         raise ValueError('Selected records contradict signed population')
-    if exact_add(record['effective_usage_cost_usd'] for record in plan['records']) != cost(c['lookup_selected']['cost_usd']):
+    if _aggregate_add(_canonical_aggregate_cost(record['effective_usage_cost_usd']) for record in plan['records']) != cost(c['lookup_selected']['cost_usd']):
         raise ValueError('Selected record costs contradict signed population')
     return c
 
@@ -244,7 +244,7 @@ def build_kind_precap(aggregates, selected_keys, *, min_cost: float):
         stages['above_min_cost'].append(aggregate.exact_cost)
         stages['lookup_selected' if key in selected else 'max_resources_not_inspected'].append(aggregate.exact_cost)
     return {'schema_version':1,'kinds':{
-        kind:{stage:{'count':len(values),'cost_usd':_canonical_decimal(exact_add(values))}
+        kind:{stage:{'count':len(values),'cost_usd':_canonical_decimal(_aggregate_add(values))}
               for stage,values in stages.items()}
         for kind,stages in groups.items()}}
 
