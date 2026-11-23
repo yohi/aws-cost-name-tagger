@@ -49,7 +49,7 @@ _RUN_COUNTER = iter(range(1, 1 << 30))
 def next_invocation_id() -> str:
     """Each Fake Host start (or restart) is a distinct systemd invocation, as on a real Host."""
     return f"{next(_RUN_COUNTER):032x}"
-SVC_UID = 1000
+SVC_UID = os.getuid()
 SVC_GID = 1000
 
 
