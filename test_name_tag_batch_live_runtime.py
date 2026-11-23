@@ -12,13 +12,14 @@ import contextlib
 import json
 import os
 import sqlite3
+import tempfile
 import threading
 import unittest
 from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from unittest import mock
 
 import name_tag_batch_host_runtime as host_runtime
@@ -854,6 +855,145 @@ class LiveRefusalWindowTests(LiveHarness):
 
 
 # ============================================================== RG-PRC-008
+class HostReportPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_directory = Path(self._temporary.name)
+        self.host = SimpleNamespace(state_directory=str(self.state_directory),
+                                    service_uid=os.getuid())
+
+    @staticmethod
+    def _report(batch_id):
+        return {"batch_id": batch_id, "batch_state": "COMPLETED",
+                "applied_verified_count": 1}
+
+    def _paths(self, batch_id, report):
+        digest, body = batch_runtime._report_digest(report)
+        batch_dir = self.state_directory / "batch-reports" / batch_id
+        return digest, body, batch_dir, batch_dir / f"{digest}.json"
+
+    def _persist(self, batch_id, report):
+        return batch_runtime._persist_host_report(self.host, batch_id, report)
+
+    def test_new_report_uses_exclusive_temp_file_and_same_directory_replace(self):
+        batch_id = "b" * 64
+        report = self._report(batch_id)
+        digest, body, batch_dir, final_path = self._paths(batch_id, report)
+        created = []
+        real_open = os.open
+
+        def capture_open(path, flags, mode=0o777):
+            if flags & os.O_CREAT:
+                created.append((Path(path), flags, mode))
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "replace", wraps=os.replace) as replace_file:
+            self.assertEqual(self._persist(batch_id, report), digest)
+
+        self.assertEqual(len(created), 1)
+        temp_path, flags, mode = created[0]
+        self.assertEqual(temp_path.parent, batch_dir)
+        self.assertNotEqual(temp_path, final_path)
+        self.assertTrue(flags & os.O_EXCL)
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertEqual(mode, 0o600)
+        replace_file.assert_called_once_with(temp_path, final_path)
+        self.assertFalse(temp_path.exists())
+        self.assertEqual(final_path.read_bytes(), body)
+
+    def test_write_file_fsync_and_replace_failures_clean_temp_and_allow_retry(self):
+        failures = (("write", "write"), ("file_fsync", "fsync"),
+                    ("replace", "replace"))
+        for position, (name, operation) in enumerate(failures, start=1):
+            with self.subTest(failure=name):
+                batch_id = f"{position:064x}"
+                report = self._report(batch_id)
+                digest, _body, batch_dir, final_path = self._paths(batch_id, report)
+                with mock.patch.object(os, operation, side_effect=OSError(name)):
+                    self.assertIsNone(self._persist(batch_id, report))
+                self.assertEqual(list(batch_dir.glob(f".{digest}.*.tmp")), [])
+                self.assertFalse(final_path.exists())
+                self.assertEqual(self._persist(batch_id, report), digest)
+
+    def test_cleanup_failure_does_not_block_retry_with_unique_temp_name(self):
+        batch_id = "c" * 64
+        report = self._report(batch_id)
+        digest, _body, batch_dir, final_path = self._paths(batch_id, report)
+        with mock.patch.object(os, "replace", side_effect=OSError("replace failed")), \
+                mock.patch.object(os, "unlink", side_effect=OSError("cleanup failed")):
+            self.assertIsNone(self._persist(batch_id, report))
+        stale_temps = list(batch_dir.glob(f".{digest}.*.tmp"))
+        self.assertEqual(len(stale_temps), 1)
+
+        self.assertEqual(self._persist(batch_id, report), digest)
+        self.assertTrue(final_path.is_file())
+        self.assertIn(stale_temps[0], list(batch_dir.glob(f".{digest}.*.tmp")))
+
+    def test_new_and_reused_reports_sync_file_then_directory_ancestry_bottom_up(self):
+        batch_id = "d" * 64
+        report = self._report(batch_id)
+        digest, _body, batch_dir, final_path = self._paths(batch_id, report)
+        report_root = batch_dir.parent
+        real_open, real_fsync = os.open, os.fsync
+        descriptor_paths = {}
+        sync_paths = []
+
+        def capture_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            descriptor_paths[fd] = Path(path)
+            return fd
+
+        def capture_fsync(fd):
+            sync_paths.append(descriptor_paths[fd])
+            return real_fsync(fd)
+
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "fsync", side_effect=capture_fsync):
+            self.assertEqual(self._persist(batch_id, report), digest)
+
+        self.assertTrue(sync_paths[0].name.startswith(f".{digest}."))
+        self.assertEqual(sync_paths[-4:],
+                         [final_path, batch_dir, report_root, self.state_directory])
+
+        descriptor_paths.clear()
+        sync_paths.clear()
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "fsync", side_effect=capture_fsync):
+            self.assertEqual(self._persist(batch_id, report), digest)
+        self.assertEqual(sync_paths, [final_path, batch_dir, report_root, self.state_directory])
+
+    def test_reused_digest_requires_exact_verification_and_successful_syncs(self):
+        batch_id = "e" * 64
+        report = self._report(batch_id)
+        digest, body, batch_dir, final_path = self._paths(batch_id, report)
+        self.assertEqual(self._persist(batch_id, report), digest)
+
+        final_path.write_bytes(b"x" * len(body))
+        self.assertIsNone(self._persist(batch_id, report))
+        final_path.write_bytes(body)
+
+        real_open, real_fsync = os.open, os.fsync
+        descriptor_paths = {}
+
+        def capture_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            descriptor_paths[fd] = Path(path)
+            return fd
+
+        def fail_batch_directory_sync(fd):
+            if descriptor_paths[fd] == batch_dir:
+                raise OSError("directory sync failed")
+            return real_fsync(fd)
+
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "fsync", side_effect=fail_batch_directory_sync):
+            self.assertIsNone(self._persist(batch_id, report))
+
+        self.assertEqual(self._persist(batch_id, report), digest)
+
+
 class LivePartialReportTests(LiveHarness):
     def _partial(self):
         batch = self.prepare()

@@ -634,53 +634,97 @@ def _report_digest(report: Mapping[str, JsonValue]) -> tuple[str, bytes]:
 def _persist_host_report(host, batch_id: str, report: Mapping[str, JsonValue]) -> str | None:
     """Protected durable report in the verified StateDirectory; None when unverifiable."""
     import os
+    import secrets
     import stat as stat_module
     from pathlib import Path
 
+    temp_path = None
     try:
         digest, body = _report_digest(report)
-        root = Path(host.state_directory) / "batch-reports"
+        state_directory = Path(host.state_directory)
+        root = state_directory / "batch-reports"
         batch_dir = root / batch_id
-        for directory in (root, batch_dir):
-            try:
-                os.mkdir(directory, 0o700)
-            except FileExistsError:
-                pass
+        for directory in (state_directory, root, batch_dir):
+            if directory != state_directory:
+                try:
+                    os.mkdir(directory, 0o700)
+                except FileExistsError:
+                    pass
             info = os.lstat(directory)
             if (not stat_module.S_ISDIR(info.st_mode) or info.st_uid != host.service_uid
                     or info.st_mode & 0o077):
                 return None
         path = batch_dir / f"{digest}.json"
+
+        verify_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                         | os.O_CLOEXEC, 0o600)
-        except FileExistsError:
-            fd = None
-        if fd is not None:
+            verify_fd = os.open(path, verify_flags)
+        except FileNotFoundError:
+            verify_fd = None
+        if verify_fd is None:
+            temp_fd = None
+            for _attempt in range(8):
+                candidate = batch_dir / f".{digest}.{secrets.token_hex(16)}.tmp"
+                try:
+                    temp_fd = os.open(
+                        candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                        | os.O_CLOEXEC, 0o600)
+                except FileExistsError:
+                    continue
+                temp_path = candidate
+                break
+            if temp_fd is None:
+                return None
             try:
                 view = memoryview(body)
                 while view:
-                    view = view[os.write(fd, view):]
-                os.fsync(fd)
+                    written = os.write(temp_fd, view)
+                    if written <= 0:
+                        raise OSError("report write made no progress")
+                    view = view[written:]
+                os.fsync(temp_fd)
             finally:
-                os.close(fd)
-            dir_fd = os.open(batch_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                os.close(temp_fd)
+            os.replace(temp_path, path)
+            temp_path = None
+            verify_fd = os.open(path, verify_flags)
+
+        try:
+            info = os.fstat(verify_fd)
+            if (not stat_module.S_ISREG(info.st_mode) or info.st_uid != host.service_uid
+                    or info.st_mode & 0o077 or info.st_size != len(body)):
+                return None
+            stored = bytearray()
+            while len(stored) <= len(body):
+                chunk = os.read(verify_fd, len(body) + 1 - len(stored))
+                if not chunk:
+                    break
+                stored.extend(chunk)
+            stored_bytes = bytes(stored)
+            if (stored_bytes != body
+                    or sha256(b"aws-cnt-host-batch-report-v1\x00" + stored_bytes).hexdigest()
+                    != digest):
+                return None
+            os.fsync(verify_fd)
+        finally:
+            os.close(verify_fd)
+
+        for directory in (batch_dir, root, state_directory):
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                             | os.O_CLOEXEC)
             try:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        read_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            info = os.fstat(read_fd)
-            stored = os.read(read_fd, len(body) + 1)
-        finally:
-            os.close(read_fd)
-        if (stored != body or info.st_uid != host.service_uid or info.st_mode & 0o077
-                or sha256(b"aws-cnt-host-batch-report-v1\x00" + stored).hexdigest() != digest):
-            return None
         return digest
     except (OSError, TypeError, ValueError):
         return None
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def _complete_live_result(report, state, batch, refusal_code: str | None) -> BatchRunResult:
