@@ -173,16 +173,22 @@ class FakeSts:
 
 
 class Gate:
-    def __init__(self, *, pre=True, post=True):
-        self.pre, self.post, self.calls = pre, post, []
+    def __init__(self, *, pre=True, post=True, ledger=None):
+        self.pre, self.post, self.ledger, self.calls = pre, post, ledger, []
+        self.pre_times, self.post_times = [], []
 
     def check_pre_sts(self, selection, *, now_utc):
         self.calls.append("pre")
+        self.pre_times.append(now_utc)
         if not self.pre:
             raise HostRuntimeBlocked("G2_NOT_VERIFIED", "fake independent evidence denies")
+        if (self.ledger is not None
+                and self.ledger.effective_scope_state(selection.scope_id) != "CLEARED"):
+            raise HostRuntimeBlocked("BLOCKED_SCOPE_HOLD", "Scope changed after selection")
 
     def check_issued(self, issued, *, now_utc):
         self.calls.append("post")
+        self.post_times.append(now_utc)
         if not self.post:
             raise HostRuntimeBlocked("G2_NOT_VERIFIED", "fake independent evidence denies")
 
@@ -204,8 +210,9 @@ class IssuerHarness:
         self.batch = batch or build_batch()
         self.fx.ledger.state = state()
         self.sts = FakeSts(self.fx, **(sts_kwargs or {}))
-        self.gate = gate or Gate()
+        self.gate = gate or Gate(ledger=self.fx.ledger)
         self.factory = ClientFactory()
+        self.response_time = NOW
         self.issuer = HostBatchCredentialIssuer(
             provider=SystemdEncryptedCredentialProvider(probe=self.fx.os), transport=self.sts,
             evidence_gate=self.gate, client_factory=self.factory)
@@ -219,7 +226,8 @@ class IssuerHarness:
     def issue(self, subset=None, batch=None):
         batch = batch or self.batch
         subset = subset or self.select(batch)
-        with owner_verified():
+        with owner_verified(), mock.patch.object(
+                issuer_module, "_utc_now", return_value=self.response_time):
             return self.issuer.issue(batch, subset, self.host, NOW)
 
     def revalidate(self, issued):
@@ -264,6 +272,61 @@ class SessionNameTests(unittest.TestCase):
 
 
 class IssuerTests(unittest.TestCase):
+    def test_scope_hold_after_selection_blocks_before_pending_and_sts(self):
+        h = IssuerHarness(self)
+        subset = h.select()
+        h.fx.ledger.scope_states["s1"] = "HOLD"
+
+        with self.assertRaises(HostRuntimeBlocked) as caught:
+            h.issue(subset)
+
+        self.assertEqual(caught.exception.code, "BLOCKED_SCOPE_HOLD")
+        self.assertEqual(h.gate.calls, ["pre"])
+        self.assertEqual(h.records(), ())
+        self.assertEqual(h.sts.calls, [])
+
+    def test_response_received_time_is_used_for_issuance_records(self):
+        response_time = NOW + timedelta(seconds=30)
+        h = IssuerHarness(self)
+        h.response_time = response_time
+        issued = h.issue()
+
+        self.assertEqual(h.gate.pre_times, [NOW])
+        self.assertEqual(h.gate.post_times, [response_time])
+        self.assertEqual(issued.receipt.issued_at_utc, issuer_module._iso_z(response_time))
+        (record,) = h.records()
+        self.assertEqual(record["updated_at_utc"], issuer_module._iso_z(response_time))
+
+    def test_response_expiration_must_be_after_response_received_time(self):
+        response_time = NOW + timedelta(seconds=30)
+        h = IssuerHarness(
+            self, sts_kwargs={"mutate": lambda r: r["Credentials"].update(
+                Expiration=response_time)})
+        h.response_time = response_time
+
+        with self.assertRaises(HostRuntimeBlocked):
+            h.issue()
+
+        (record,) = h.records()
+        self.assertEqual(record["status"], "ISSUANCE_UNRESOLVED")
+        self.assertEqual(len(h.sts.calls), 1)
+
+    def test_response_expiration_upper_bound_remains_request_relative(self):
+        response_time = NOW + timedelta(minutes=6)
+        too_late = NOW + timedelta(
+            seconds=issuer_module.STS_DURATION_SECONDS) + issuer_module._STS_EXPIRY_SKEW \
+            + timedelta(seconds=1)
+        h = IssuerHarness(
+            self, sts_kwargs={"mutate": lambda r: r["Credentials"].update(
+                Expiration=too_late)})
+        h.response_time = response_time
+
+        with self.assertRaises(HostRuntimeBlocked):
+            h.issue()
+
+        (record,) = h.records()
+        self.assertEqual(record["status"], "ISSUANCE_UNRESOLVED")
+
     def test_actual_sts_request_bytes_bound_to_response_receipt(self):
         h = IssuerHarness(self)
         subset = h.select()
@@ -392,8 +455,10 @@ class IssuerTests(unittest.TestCase):
         self.assertEqual(len(h.sts.calls), 1)
         restarted = IssuerHarness(self, restart_of=h, batch=other)
         restarted.fx.ledger.state = state(outcomes=("UNCLAIMED",))
-        with self.assertRaises(HostRuntimeBlocked):
-            restarted.issue()  # journal binding survives the restart
+        with mock.patch.dict(issuer_module._NAME_BINDINGS, {}, clear=True):
+            with self.assertRaises(HostRuntimeBlocked) as restarted_caught:
+                restarted.issue()  # durable journal binding survives the restart
+        self.assertEqual(restarted_caught.exception.code, "BLOCKED_AUTH_REPLAY")
         self.assertEqual(restarted.sts.calls, [])
 
     def test_unselectable_subset_never_issues_sts(self):
@@ -526,6 +591,87 @@ class SessionTamperTests(unittest.TestCase):
 
 
 class TombstoneTests(unittest.TestCase):
+    def test_parent_directory_sync_retried_after_initial_sync_failure(self):
+        h = IssuerHarness(self)
+        journal = host_runtime.bound_journal(h.host)
+        synced_dirs = []
+        sync_dir = journal._sync_dir
+        original_fsync = journal._fsync
+        failed = False
+
+        def record_sync(path):
+            synced_dirs.append(Path(path))
+            return sync_dir(path)
+
+        def fail_first_directory_sync(fd):
+            nonlocal failed
+            if not failed and stat.S_ISDIR(os.fstat(fd).st_mode):
+                failed = True
+                raise OSError(5, "initial parent fsync failed")
+            original_fsync(fd)
+
+        journal._sync_dir = record_sync
+        journal._fsync = fail_first_directory_sync
+        state_dir = Path(h.fx.state_dir)
+        with self.assertRaises(HostRuntimeBlocked):
+            h.issue()
+        self.assertEqual(synced_dirs.count(state_dir), 1)
+
+        h.issue()
+
+        self.assertEqual(synced_dirs.count(state_dir), 2)
+        self.assertEqual(len(h.sts.calls), 1)
+
+    def test_scan_ignores_valid_finalize_temp_but_keeps_pending_row_blocked(self):
+        h = IssuerHarness(self, sts_kwargs={"crash": True})
+        with self.assertRaises(_Crash):
+            h.issue()
+        journal = host_runtime.bound_journal(h.host)
+        (pending,) = journal.scan()
+
+        with mock.patch("name_tag_batch_host_runtime.os.replace",
+                        side_effect=OSError(5, "simulated crash before publish")):
+            with self.assertRaises(HostRuntimeBlocked):
+                journal.finalize(pending, status=host_runtime.ISSUANCE_UNRESOLVED,
+                                 updated_at_utc="2026-11-19T12:00:01Z")
+
+        self.assertEqual(journal.scan(), (pending,))
+        with self.assertRaises(HostRuntimeBlocked) as caught:
+            journal.assert_row_unattempted(h.batch.batch_id, 0)
+        self.assertEqual(caught.exception.code, "BLOCKED_ISSUANCE_ATTEMPT_EXISTS")
+
+    def test_scan_rejects_unpaired_finalize_temp_and_unknown_files(self):
+        for filename in (f".0-{'a' * 64}.json.{'b' * 64}.tmp", "unknown.data"):
+            with self.subTest(filename=filename):
+                h = IssuerHarness(self)
+                journal = host_runtime.bound_journal(h.host)
+                batch_dir = journal._batch_dir(h.batch.batch_id)
+                journal._secure_dir(journal._root, create=True)
+                journal._secure_dir(batch_dir, create=True)
+                stray = batch_dir / filename
+                stray.write_bytes(b"untrusted")
+                stray.chmod(0o600)
+                with self.assertRaises(HostRuntimeBlocked):
+                    journal.scan()
+
+    def test_scan_rejects_malformed_finalize_temp_with_canonical_tombstone(self):
+        h = IssuerHarness(self, sts_kwargs={"crash": True})
+        with self.assertRaises(_Crash):
+            h.issue()
+        journal = host_runtime.bound_journal(h.host)
+        (pending,) = journal.scan()
+        with mock.patch("name_tag_batch_host_runtime.os.replace",
+                        side_effect=OSError(5, "simulated crash before publish")):
+            with self.assertRaises(HostRuntimeBlocked):
+                journal.finalize(pending, status=host_runtime.ISSUANCE_UNRESOLVED,
+                                 updated_at_utc="2026-11-19T12:00:01Z")
+        (temp,) = (journal._batch_dir(h.batch.batch_id)).glob(".*.tmp")
+        temp.write_bytes(b"malformed")
+        temp.chmod(0o600)
+
+        with self.assertRaises(HostRuntimeBlocked):
+            journal.scan()
+
     def test_issuance_attempt_fsynced_before_assume_role(self):
         h = IssuerHarness(self)
         h.issue()

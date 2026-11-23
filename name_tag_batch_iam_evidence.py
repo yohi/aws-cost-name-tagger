@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
+from threading import Lock
 from typing import Final, Protocol
 from weakref import WeakKeyDictionary
 
@@ -122,22 +123,36 @@ class ProtectedHostScopeVerifier:
                 or _HEX64.fullmatch(scope.writer_evidence_digest) is None
                 or not scope.not_before_utc <= now < scope.not_after_utc):
             raise _blocked("Scope evidence does not cover the target", "BLOCKED_SCOPE_MISMATCH")
-        matching = [e for e in effects if type(e) is SideEffectEvidence and e.target_arn == arn] \
-            if isinstance(effects, tuple) else []
-        if (len(matching) != 1
-                or (matching[0].iam_abac_resource_tag_assessment, matching[0].iac_assessment,
-                    matching[0].event_automation_assessment) != ("PASS", "PASS", "PASS")
-                or not matching[0].evidence_references
-                or not all(matching[0].evidence_references)
-                or not matching[0].not_before_utc <= now < matching[0].not_after_utc):
+        if not isinstance(effects, tuple):
             raise _blocked("side-effect evidence unassessed", "BLOCKED_SIDE_EFFECT_UNASSESSED")
+        effects_by_arn = {}
+        for effect in effects:
+            if (type(effect) is not SideEffectEvidence
+                    or effect.target_arn not in scope.controlled_arns
+                    or effect.target_arn in effects_by_arn
+                    or (effect.iam_abac_resource_tag_assessment, effect.iac_assessment,
+                        effect.event_automation_assessment) != ("PASS", "PASS", "PASS")
+                    or not effect.evidence_references
+                    or not all(effect.evidence_references)
+                    or not effect.not_before_utc <= now < effect.not_after_utc):
+                raise _blocked("side-effect evidence unassessed",
+                               "BLOCKED_SIDE_EFFECT_UNASSESSED")
+            effects_by_arn[effect.target_arn] = effect
+        if set(effects_by_arn) != set(scope.controlled_arns):
+            raise _blocked("side-effect evidence does not cover every controlled ARN",
+                           "BLOCKED_SIDE_EFFECT_UNASSESSED")
+        verified_effects = tuple(effects_by_arn[controlled_arn]
+                                 for controlled_arn in sorted(scope.controlled_arns))
+        matching = effects_by_arn[arn]
         ref = ownership_proof_ref(host, scope, arn)
         if target.ownership_proof_ref and target.ownership_proof_ref != ref:
             raise _blocked("ownership proof is not bound to this target", "BLOCKED_SCOPE_MISMATCH")
         verified = VerifiedHostScope(
-            _MINT, host=host, scope_id=signed_scope_id, scope=scope, side_effects=tuple(matching),
+            _MINT, host=host, scope_id=signed_scope_id, scope=scope,
+            side_effects=verified_effects,
             target=replace(target, ownership_proof_ref=ref),
-            not_after_utc=min(scope.not_after_utc, matching[0].not_after_utc))
+            not_after_utc=min(scope.not_after_utc,
+                              *(effect.not_after_utc for effect in verified_effects)))
         _SCOPES[verified] = host
         return verified
 
@@ -293,9 +308,12 @@ def _validate_evidence(issued, row, capability, scope, evidence, now: datetime) 
             or {c.case for c in cases} != _DENY_CASES or any(c.decision != "DENY" for c in cases)):
         raise _blocked("required deny cases missing or not denied")
     for c in cases:
-        if ((c.case == "FOREIGN_ARN" and (c.resource_arn == arn or c.action != action))
-                or (c.case == "OTHER_TAG_KEY" and (c.resource_arn != arn or c.tag_key == "Name"))
-                or (c.case == "ALTERNATE_API" and (c.resource_arn != arn or c.action == action))):
+        if ((c.case == "FOREIGN_ARN"
+             and (c.resource_arn == arn or c.action != action or c.tag_key != "Name"))
+                or (c.case == "OTHER_TAG_KEY"
+                    and (c.resource_arn != arn or c.action != action or c.tag_key == "Name"))
+                or (c.case == "ALTERNATE_API"
+                    and (c.resource_arn != arn or c.action == action or c.tag_key != "Name"))):
             raise _blocked("deny case does not exercise its boundary")
     captured, expires = evidence.captured_at_utc, evidence.expires_at_utc
     if (type(captured) is not datetime or type(expires) is not datetime
@@ -372,6 +390,7 @@ _GRANTS: WeakKeyDictionary = WeakKeyDictionary()
 # One grant per (Host run, Batch, row) for the life of the process: an equal-valued second
 # FirstSendPermit, a fresh deny bundle or a re-presented session can never mint another.
 _GRANTED_ROWS: set[tuple[str, str, int]] = set()
+_GRANT_ISSUANCE_LOCK = Lock()
 
 
 def _permit_sha256(permit: FirstSendPermit) -> str:
@@ -394,6 +413,10 @@ class _RuntimeVerifierBase:
         self._clock = clock
 
     def authorize_once(self, row, issued, scope, deny, permit) -> VerifiedRuntimeGrant:
+        with _GRANT_ISSUANCE_LOCK:
+            return self._authorize_once_locked(row, issued, scope, deny, permit)
+
+    def _authorize_once_locked(self, row, issued, scope, deny, permit) -> VerifiedRuntimeGrant:
         now = require_aware_utc(self._clock())
         issued, scope = _check_binding(issued, row, scope, now)
         binding = _DENIES.get(deny) if type(deny) is VerifiedDenyEvidence else None
