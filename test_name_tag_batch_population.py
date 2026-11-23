@@ -113,6 +113,32 @@ class PopulationTests(unittest.TestCase):
             },
             sample_population(count=2, cost='0'))
 
+    def test_kind_precap_reconciles_population_aggregate_over_cur_input_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        precap=self.kind_precap({'volume': (1, amount)})
+
+        validate_kind_precap(
+            {
+                'cur_population_by_kind': precap,
+                'records': [{'kind': 'volume', 'effective_usage_cost_usd': amount}],
+            },
+            sample_population(count=1, cost=amount))
+
+    def test_signed_population_accepts_aggregate_summary_over_cur_input_limit(self):
+        record_cost='9' * MAX_COST_DIGITS
+        total=exact_add([record_cost, record_cost])
+        cost_text=format(total, 'f')
+        plan={
+            'count': 2,
+            'records': [
+                {'effective_usage_cost_usd': record_cost},
+                {'effective_usage_cost_usd': record_cost},
+            ],
+            'cur_population': sample_population(count=2, cost=cost_text),
+        }
+
+        self.assertEqual(validate_signed_population(plan), plan['cur_population'])
+
     def test_kind_precap_rejects_aggregate_amount_over_aggregate_digit_limit(self):
         amount='1' + '0' * MAX_AGGREGATE_DIGITS
         precap=self.kind_precap({'volume': (1, amount)})

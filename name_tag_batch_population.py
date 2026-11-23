@@ -213,7 +213,7 @@ def validate_signed_population(plan:dict)->dict:
         raise ValueError('Incomplete or unknown Batch CUR accounting')
     kind_counts=('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')
     billing=('unattributable_cur','outside_requested_kinds','unsupported_kind')
-    cost=_canonical_cost
+    cost=_canonical_aggregate_cost
     _validate_resource_summaries(c,kind_counts,cost)
     _validate_billing_summaries(c,billing,cost)
     if not _population_is_conserved(c,cost):
@@ -281,7 +281,7 @@ def validate_kind_precap(plan:dict,population:dict)->None:
                     or parsed[whole][1]!=_aggregate_add((parsed[first][1],parsed[second][1]))):
                 raise ValueError('Kind pre-cap identity violated')
     for stage in KIND_PRECAP_STAGES:
-        if totals[stage][0]!=population[stage]['count'] or _aggregate_add(totals[stage][1])!=_canonical_cost(population[stage]['cost_usd']):
+        if totals[stage][0]!=population[stage]['count'] or _aggregate_add(totals[stage][1])!=_canonical_aggregate_cost(population[stage]['cost_usd']):
             raise ValueError('Kind pre-cap does not reconcile with signed population')
     selected_by_kind={kind:[0,[]] for kind in REGISTRY_KINDS}
     for record in plan.get('records',[]):
@@ -324,5 +324,5 @@ def _validate_billing_summaries(population,names,cost):
 def _population_is_conserved(population,cost):
     def matches(total,first,second):
         return (population[total]['count']==population[first]['count']+population[second]['count']
-                and cost(population[total]['cost_usd'])==exact_add((cost(population[first]['cost_usd']),cost(population[second]['cost_usd']))))
+                and cost(population[total]['cost_usd'])==_aggregate_add((cost(population[first]['cost_usd']),cost(population[second]['cost_usd']))))
     return matches('cur_recognized','below_min_cost','above_min_cost') and matches('above_min_cost','lookup_selected','max_resources_not_inspected')
