@@ -120,8 +120,8 @@
     },
     {
       "path": "name_tag_ledger.py",
-      "sha256": "86864dc09d3d0265c41e2e6d70c050872ec72eeca66b4c00e5bbe8a3c93e4113",
-      "bytes": 104935
+      "sha256": "cfe0df86fce12848a8e63465637a9f7cc3285c7684b276b19af1ffcda013e7a2",
+      "bytes": 106513
     },
     {
       "path": "name_tag_ledger_anchor.py",
@@ -210,8 +210,8 @@
     },
     {
       "path": "name_tag_batch_credentials.py",
-      "sha256": "1df3ce9b80238a68c8a72d5eaa210ea6412596fd3e1ac2375c8e1e82be718714",
-      "bytes": 9770
+      "sha256": "09c21373d1434cfd637e56389c71c18aca9c5f2f5aab1aa5cd30ccf76133e214",
+      "bytes": 10327
     },
     {
       "path": "name_tag_batch_fake.py",

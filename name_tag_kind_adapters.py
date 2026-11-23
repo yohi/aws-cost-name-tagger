@@ -20,8 +20,8 @@ from name_tag_kind_capabilities import (
     CanonicalTargetIdentity, KindCapabilityDecision, canonical_target_identity,
     resolve_kind_capability)
 
-if TYPE_CHECKING:  # Task 6 creates it; never imported at runtime here.
-    from name_tag_batch_host_runtime import VerifiedRuntimeGrant
+if TYPE_CHECKING:  # Task 6 protected grant; never imported at runtime (no import cycle).
+    from name_tag_batch_iam_evidence import VerifiedRuntimeGrant
 
 UNKNOWN = NameObservation("UNKNOWN", None, None)
 _NAME_CONTROL = re.compile(r"[\x00-\x1f\x7f]")

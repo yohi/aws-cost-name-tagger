@@ -1771,6 +1771,37 @@ class IntentLedger:
         finally:
             self._unlock()
 
+    def batch_send_permit_identity(
+        self,batch:VerifiedBatchApproval,row_index:int
+    )->tuple[str,str,str]|None:
+        """Read-only identity of this execution's consumed Permit for one Batch row.
+
+        Returns (authorization_id, execution_id, sha256(ownership_token)) only when the
+        row's Intent is SEND_ATTEMPT_CONSUMED by the current execution; otherwise None.
+        No schema change; the raw ownership token is never returned.
+        """
+        if type(batch) is not VerifiedBatchApproval or type(row_index) is not int:
+            raise LedgerError("BLOCKED_OWNER_AUTHN")
+        self._assert_batch_source_identity(batch)
+        self._lock()
+        try:
+            with self._connection() as connection:
+                self._validate_ledger_state(connection)
+                row=connection.execute(
+                    "SELECT i.authorization_id,i.execution_id,i.ownership_token,i.state "
+                    "FROM batch_rows br JOIN intents i ON i.intent_id=br.intent_id "
+                    "WHERE br.batch_id=? AND br.row_index=?",
+                    (batch.batch_id,row_index),
+                ).fetchone()
+                if (row is None or row[3]!="SEND_ATTEMPT_CONSUMED"
+                        or row[1]!=self._execution_id or not isinstance(row[2],str)):
+                    return None
+                return (row[0],row[1],hashlib.sha256(row[2].encode("utf-8")).hexdigest())
+        except sqlite3.Error as error:
+            raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN") from error
+        finally:
+            self._unlock()
+
     def create_intent(
         self, authorization: VerifiedEnvelope, *, scope_id: str,
         scope: ScopeEvidence | None = None,
