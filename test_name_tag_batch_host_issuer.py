@@ -281,7 +281,7 @@ class IssuerTests(unittest.TestCase):
             h.issue(subset)
 
         self.assertEqual(caught.exception.code, "BLOCKED_SCOPE_HOLD")
-        self.assertEqual(h.gate.calls, ["pre"])
+        self.assertEqual(h.gate.calls, [])
         self.assertEqual(h.records(), ())
         self.assertEqual(h.sts.calls, [])
 
