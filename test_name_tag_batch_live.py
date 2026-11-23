@@ -243,21 +243,68 @@ class GrantGatedWritePortTests(unittest.TestCase):
         port = AuthorizedBatchWritePort("client", adapter=adapter, target=scope.target,
                                         clock=g.clock)
         port.write_once(session=g.issued, row=g.authority, permit=permit, runtime=grant)
-        adapter.write_once.assert_called_once_with("client", scope.target,
-                                                   permit.approved_name, grant)
+        adapter.write_once.assert_called_once()
+        args = adapter.write_once.call_args.args
+        self.assertEqual(args[:3], ("client", scope.target, permit.approved_name))
+        self.assertIsNot(args[3], grant)
         with self.assertRaises(LiveWriteBlocked):
             port.write_once(session=g.issued, row=g.authority, permit=permit, runtime=grant)
         adapter.write_once.assert_called_once()
 
-    def test_synthetic_grant_or_missing_binding_never_dispatches(self):
+    def test_synthetic_grant_never_reaches_registry_or_sdk(self):
         g, grant, scope, permit = self._grant(live=False)
-        adapter = Mock()
-        for port in (AuthorizedBatchWritePort("client", adapter=adapter, target=scope.target,
-                                              clock=g.clock),
-                     AuthorizedBatchWritePort("client")):
-            with self.assertRaises(LiveWriteBlocked):
-                port.write_once(session=g.issued, row=g.authority, permit=permit, runtime=grant)
-        adapter.write_once.assert_not_called()
+        client = type("FakeSdkClient", (), {
+            "__init__": lambda self: setattr(self, "calls", []),
+            "create_tags": lambda self, **kwargs: self.calls.append(kwargs),
+        })()
+        port = AuthorizedBatchWritePort(
+            client, adapter=protected_registry_adapter("volume"), target=scope.target,
+            clock=g.clock)
+
+        with self.assertRaises(LiveWriteBlocked):
+            port.write_once(session=g.issued, row=g.authority, permit=permit, runtime=grant)
+
+        self.assertEqual(client.calls, [])
+
+    def test_missing_adapter_target_or_clock_blocks_with_fresh_grants(self):
+        for missing in ("adapter", "target", "clock"):
+            with self.subTest(missing=missing):
+                g, grant, scope, permit = self._grant()
+                adapter = Mock()
+                kwargs = {"adapter": adapter, "target": scope.target, "clock": g.clock}
+                kwargs[missing] = None
+                port = AuthorizedBatchWritePort("client", **kwargs)
+
+                with self.assertRaises(LiveWriteBlocked):
+                    port.write_once(session=g.issued, row=g.authority, permit=permit,
+                                    runtime=grant)
+
+                adapter.write_once.assert_not_called()
+
+    def test_real_registry_adapter_consumes_host_binding_before_sdk_write(self):
+        g, grant, scope, permit = self._grant()
+
+        class FakeSdkClient:
+            def __init__(self):
+                self.calls = []
+
+            def create_tags(self, **kwargs):
+                self.calls.append(kwargs)
+
+        client = FakeSdkClient()
+        port = AuthorizedBatchWritePort(
+            client, adapter=protected_registry_adapter("volume"), target=scope.target,
+            clock=g.clock)
+        call = dict(session=g.issued, row=g.authority, permit=permit, runtime=grant)
+
+        port.write_once(**call)
+        with self.assertRaises(LiveWriteBlocked):
+            port.write_once(**call)
+
+        self.assertEqual(client.calls, [{
+            "Resources": [scope.target.resource_arn.rsplit("/", 1)[1]],
+            "Tags": [{"Key": "Name", "Value": permit.approved_name}],
+        }])
 
 
 if __name__ == "__main__":

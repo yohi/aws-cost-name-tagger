@@ -6,33 +6,25 @@ An adapter builds exactly one request for exactly one resource carrying exactly 
 never calls ``put_bucket_tagging``. Reads fail closed: malformed, duplicate, ambiguous,
 partial or paginated tag sets are ``UNKNOWN`` (never ``ABSENT``).
 The write method accepts a protected grant structurally only. Its presence is NOT
-authorization; the actual send is authorized and consumed by the Host verifier at the
-dispatch boundary.
+authorization; the actual send requires the Host verifier's one-use dispatch binding,
+which this adapter consumes immediately before touching the SDK client.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from name_tag_batch_state import NameObservation, classify_batch_name
 from name_tag_kind_capabilities import (
     CanonicalTargetIdentity, KindCapabilityDecision, canonical_target_identity,
     resolve_kind_capability)
 
-if TYPE_CHECKING:  # Task 6 protected grant; never imported at runtime (no import cycle).
-    from name_tag_batch_iam_evidence import VerifiedRuntimeGrant
-
 UNKNOWN = NameObservation("UNKNOWN", None, None)
 _NAME_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 # Policy-level hard blocks that no decision value can override at dispatch.
 _PROMOTION_BLOCKS = {"apigw_stage": "IAM_CONDITION_NOT_PROVEN"}
-
-
-def _is_host_issued_runtime_grant(grant: object) -> bool:
-    """Fail closed until the protected Host-side grant registry is integrated."""
-    return False
 
 
 class AdapterRejected(RuntimeError):
@@ -65,7 +57,7 @@ class _Mismatch(Exception):
 class KindWriteAdapter(Protocol):
     def read_current(self, client: object, target: CanonicalTargetIdentity) -> NameObservation: ...
     def write_once(self, client: object, target: CanonicalTargetIdentity, name: str,
-                   grant: "VerifiedRuntimeGrant") -> None: ...
+                   dispatch_binding: object) -> None: ...
     def readback(self, client: object, target: CanonicalTargetIdentity) -> NameObservation: ...
 
 
@@ -177,18 +169,23 @@ class SingleNameAdapter:
         return self._observe(client, target)
 
     def write_once(self, client: object, target: CanonicalTargetIdentity, name: str,
-                   grant: "VerifiedRuntimeGrant") -> None:
-        # The grant is accepted structurally; its presence is never authorization.
+                   dispatch_binding: object) -> None:
         self._check(target)
-        if grant is None:
+        if dispatch_binding is None:
             raise AdapterRejected("GRANT_REQUIRED", self.kind)
         if (not isinstance(name, str) or not name or name != name.strip()
                 or len(name) > 256 or _NAME_CONTROL.search(name)):
             raise AdapterRejected("NAME_INVALID", self.kind)
         if self._spec.needs_ownership_proof and not target.ownership_proof_ref:
             raise AdapterRejected("ARN_OWNER_NOT_PROVEN", self.kind)
-        if not _is_host_issued_runtime_grant(grant):
-            raise AdapterRejected("AWS_RUNTIME_NOT_AUTHORIZED", self.kind)
+        from name_tag_batch_host_runtime import HostRuntimeBlocked
+        from name_tag_batch_iam_evidence import consume_host_dispatch_binding
+
+        try:
+            consume_host_dispatch_binding(
+                dispatch_binding, target=target, name=name, kind=self.kind)
+        except HostRuntimeBlocked as error:
+            raise AdapterRejected(error.code, self.kind) from error
         self._preflight_write(client, target)
         kwargs = self._spec.write_kwargs(target, name)
         self._invoke(client, self._spec.service, self._spec.write_operation, kwargs)

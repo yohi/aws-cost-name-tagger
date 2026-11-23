@@ -172,12 +172,34 @@ def _reconfirm_scope(source, vscope: object, now_utc: datetime) -> None:
     except Exception as error:  # noqa: BLE001 - protected-state read failure fails closed
         raise _blocked("Scope evidence unreadable", "BLOCKED_SCOPE_STATE_UNKNOWN") from error
     if (type(scope) is not ScopeEvidence or scope != vscope.scope
-            or not isinstance(effects, tuple) or effects != vscope.all_side_effects
+            or type(effects) is not tuple
             or not scope.not_before_utc <= now < scope.not_after_utc
             or not now < vscope.not_after_utc
             or ownership_proof_ref(vscope.host, scope, vscope.target.resource_arn)
             != vscope.target.ownership_proof_ref):
         raise _blocked("Host Scope evidence changed before Permit", "BLOCKED_SCOPE_MISMATCH")
+    effects_by_arn = {}
+    for effect in effects:
+        if (type(effect) is not SideEffectEvidence
+                or effect.target_arn not in scope.controlled_arns
+                or effect.target_arn in effects_by_arn
+                or (effect.iam_abac_resource_tag_assessment, effect.iac_assessment,
+                    effect.event_automation_assessment) != ("PASS", "PASS", "PASS")
+                or type(effect.evidence_references) is not tuple
+                or not effect.evidence_references
+                or any(type(reference) is not str or not reference
+                       for reference in effect.evidence_references)
+                or not effect.not_before_utc <= now < effect.not_after_utc):
+            raise _blocked("Host SideEffect evidence changed before Permit",
+                           "BLOCKED_SIDE_EFFECT_UNASSESSED")
+        effects_by_arn[effect.target_arn] = effect
+    if set(effects_by_arn) != set(scope.controlled_arns):
+        raise _blocked("Host SideEffect evidence does not cover every controlled ARN",
+                       "BLOCKED_SIDE_EFFECT_UNASSESSED")
+    canonical_effects = tuple(effects_by_arn[arn] for arn in sorted(scope.controlled_arns))
+    if canonical_effects != vscope.side_effects:
+        raise _blocked("Host SideEffect evidence changed before Permit",
+                       "BLOCKED_SCOPE_MISMATCH")
 
 
 def _require_scope(scope: object) -> VerifiedHostScope:
@@ -409,7 +431,30 @@ class _GrantBinding:
     digest: str
 
 
+@dataclass(frozen=True, eq=False)
+class _HostDispatchRecord:
+    host: VerifiedHostContext
+    issued: HostIssuedSession
+    row: VerifiedBatchRowAuthority
+    permit: FirstSendPermit
+    target: CanonicalTargetIdentity
+    grant: VerifiedRuntimeGrant
+    provenance: str
+    digest: str
+
+
+class _HostDispatchBinding(_Protected):
+    """Opaque one-use token for a validated live grant at the Registry adapter boundary."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, _mint: object = None) -> None:
+        _mint_guard(_mint)
+
+
 _GRANTS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_DISPATCH_BINDINGS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_DISPATCH_BINDINGS_LOCK = Lock()
 # One grant per (Host run, Batch, row) for the life of the process: an equal-valued second
 # FirstSendPermit, a fresh deny bundle or a re-presented session can never mint another.
 _GRANTED_ROWS: set[tuple[str, str, int]] = set()
@@ -421,6 +466,18 @@ def _permit_sha256(permit: FirstSendPermit) -> str:
         permit.authorization_id, permit.resource_arn, permit.approved_name,
         permit.writer_control_scope_id, permit.aws_operation, permit.execution_id,
         sha256(permit.ownership_token.encode()).hexdigest()])).hexdigest()
+
+
+def _host_dispatch_digest(record: _HostDispatchRecord) -> str:
+    return sha256(canonical_bytes([
+        id(record.host), record.host.host_id, record.host.run_id,
+        id(record.issued), id(record.row), record.row.row_authority_id,
+        record.row.batch.batch_id, record.row.row_index, id(record.permit),
+        _permit_sha256(record.permit), id(record.target), record.target.kind,
+        record.target.locator, record.target.resource_arn,
+        record.target.ownership_proof_ref, id(record.grant),
+        _field_digest(record.grant, _GRANT_FIELDS), record.provenance,
+    ])).hexdigest()
 
 
 class ProtectedBatchRuntimeVerifier(Protocol):
@@ -531,11 +588,72 @@ def _consume_grant(grant: object, *, row: VerifiedBatchRowAuthority,
 
 def consume_runtime_grant(grant: object, *, row: VerifiedBatchRowAuthority,
                           permit: FirstSendPermit, target: CanonicalTargetIdentity,
-                          now_utc: datetime) -> None:
-    """The SDK dispatch boundary: live-only, exactly once, no caller override."""
+                          now_utc: datetime) -> object:
+    """Validate a live grant and mint an opaque one-use Registry dispatch binding."""
     binding = _consume_grant(grant, row=row, permit=permit, target=target, now_utc=now_utc)
     if binding.provenance != LIVE_PROVENANCE:
         raise _blocked("synthetic grant cannot authorize a live SDK dispatch")
+    host = require_verified_host(binding.issued.selection.host)
+    token = _HostDispatchBinding(_MINT)
+    record = _HostDispatchRecord(
+        host=host, issued=binding.issued, row=binding.row, permit=binding.permit,
+        target=target, grant=grant, provenance=binding.provenance, digest="")
+    record = _HostDispatchRecord(
+        host=record.host, issued=record.issued, row=record.row, permit=record.permit,
+        target=record.target, grant=record.grant, provenance=record.provenance,
+        digest=_host_dispatch_digest(record))
+    with _HOST_DISPATCH_BINDINGS_LOCK:
+        _HOST_DISPATCH_BINDINGS[token] = record
+    return token
+
+
+def consume_host_dispatch_binding(binding: object, *,
+                                  target: CanonicalTargetIdentity,
+                                  name: str, kind: str) -> None:
+    """Consume and validate the Host-minted binding before a Registry SDK dispatch."""
+    if type(binding) is not _HostDispatchBinding:
+        raise _blocked("no protected Host dispatch binding")
+    with _HOST_DISPATCH_BINDINGS_LOCK:
+        record = _HOST_DISPATCH_BINDINGS.pop(binding, None)
+    if record is None:
+        raise _blocked("Host dispatch binding is unknown or already consumed")
+    try:
+        host = require_verified_host(record.host)
+        require_issued_session(record.issued, host, None)
+        row = record.row
+        row_fields = row.row
+        permit = record.permit
+        grant = record.grant
+        target_matches = (
+            type(target) is CanonicalTargetIdentity and target is record.target
+            and target.kind == kind == row_fields.get("kind")
+            and target.resource_arn == permit.resource_arn
+            and target.ownership_proof_ref == grant.ownership_proof_ref)
+        permit_matches = (
+            type(permit) is FirstSendPermit
+            and permit.resource_arn == row_fields.get("resource_arn")
+            and permit.approved_name == row_fields.get("approved_name") == name
+            and permit.writer_control_scope_id == row_fields.get("writer_control_scope_id")
+            and permit.aws_operation == row_fields.get("aws_operation"))
+        grant_matches = (
+            type(grant) is VerifiedRuntimeGrant
+            and grant.provenance == record.provenance == LIVE_PROVENANCE
+            and record.issued.provenance == "HOST_STS_ISSUED"
+            and grant.host_id == host.host_id and grant.run_id == host.run_id
+            and grant.batch_id == row.batch.batch_id
+            and grant.row_authority_id == row.row_authority_id
+            and grant.resource_arn == permit.resource_arn
+            and grant.approved_name == permit.approved_name == name
+            and grant.aws_operation == permit.aws_operation
+            and grant.scope_id == permit.writer_control_scope_id
+            and grant.permit_sha256 == _permit_sha256(permit))
+        if (record.digest != _host_dispatch_digest(record)
+                or not target_matches or not permit_matches or not grant_matches):
+            raise _blocked("Host dispatch binding does not match the Registry write")
+    except HostRuntimeBlocked:
+        raise
+    except Exception as error:  # noqa: BLE001 - malformed protected state fails closed
+        raise _blocked("Host dispatch binding is malformed") from error
 
 
 def consume_offline_synthetic_grant(grant: object, *, row: VerifiedBatchRowAuthority,

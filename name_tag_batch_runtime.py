@@ -601,7 +601,7 @@ def _advance_live_row(batch, row_index, position, state, ledger, runtime, report
             report["unresolved_send_owner"] = (
                 "CURRENT_EXECUTION" if owned is True else
                 "OTHER_EXECUTION" if owned is False else "UNKNOWN")
-            if state.state == "ACTIVE":
+            if state.state in ("ACTIVE", "STOPPED"):
                 # A consumed Permit without a durable disposition: retry STOP/HOLD (never a
                 # resend). Failure keeps the Host blocked with an UNKNOWN outcome.
                 scope_id = batch.approved_rows[position].get("writer_control_scope_id")
@@ -734,7 +734,12 @@ def _run_live(batch: VerifiedBatchApproval, ledger: IntentLedger, runtime) -> Ba
     refusal: str | None = None
     tracker = _TRACKER.get()
     for position, row_index in enumerate(fresh.approved_row_indexes):
-        state = ledger.batch_execution_state(fresh)
+        try:
+            state = ledger.batch_execution_state(fresh)
+        except LedgerError as error:
+            raise _outcome_unknown(
+                "OUTCOME_UNKNOWN", "initial Batch execution state is unknown",
+                batch_id=fresh.batch_id) from error
         if tracker is not None:
             tracker.observe(state)
         try:
@@ -776,7 +781,8 @@ def execute_batch_live(batch: VerifiedBatchApproval, ledger: IntentLedger,
                        runtime) -> BatchRunResult:
     """Host-only protected dispatch; a distinct API that never replaces the Offline API."""
     from name_tag_batch_host_runtime import (
-        HostRuntimeBlocked, bound_ledger, clear_selections, require_verified_host_runtime)
+        HostRuntimeBlocked, bound_ledger, clear_selections, host_execution_lock,
+        require_verified_host_runtime)
 
     verified = require_verified_host_runtime(runtime)
     if (type(batch) is not VerifiedBatchApproval or type(ledger) is not IntentLedger
@@ -784,28 +790,29 @@ def execute_batch_live(batch: VerifiedBatchApproval, ledger: IntentLedger,
         raise _blocked_live("BLOCKED_SCOPE_STATE_UNKNOWN", "not the Host-bound Ledger")
     from name_tag_batch_host_runtime import HostOutcomeUnknown
 
-    tracker = _SendTracker()
-    token = _TRACKER.set(tracker)
-    try:
-        return _run_live(batch, ledger, verified)
-    except HostOutcomeUnknown:
-        raise
-    except HostRuntimeBlocked as error:
-        # BLOCKED may coexist with earlier durable sends only with a verified report digest.
-        if tracker.possible_send and error.report_sha256 is None:
-            raise _outcome_unknown("OUTCOME_UNKNOWN", "refusal after a possible send",
-                                   batch_id=getattr(error, "batch_id", None)) from error
-        raise
-    except Exception as error:  # noqa: BLE001
-        if tracker.possible_send:
-            raise _outcome_unknown("OUTCOME_UNKNOWN", "failure after a possible send",
-                                   batch_id=batch.batch_id) from error
-        if isinstance(error, LedgerError):  # pre-send Ledger refusal keeps its code
-            raise _blocked_live(error.code, "Ledger refused the command") from error
-        raise
-    finally:
-        _TRACKER.reset(token)
-        clear_selections(verified.host)
+    with host_execution_lock(verified.host):
+        tracker = _SendTracker()
+        token = _TRACKER.set(tracker)
+        try:
+            return _run_live(batch, ledger, verified)
+        except HostOutcomeUnknown:
+            raise
+        except HostRuntimeBlocked as error:
+            # BLOCKED may coexist with earlier durable sends only with a verified report digest.
+            if tracker.possible_send and error.report_sha256 is None:
+                raise _outcome_unknown("OUTCOME_UNKNOWN", "refusal after a possible send",
+                                       batch_id=getattr(error, "batch_id", None)) from error
+            raise
+        except Exception as error:  # noqa: BLE001
+            if tracker.possible_send:
+                raise _outcome_unknown("OUTCOME_UNKNOWN", "failure after a possible send",
+                                       batch_id=batch.batch_id) from error
+            if isinstance(error, LedgerError):  # pre-send Ledger refusal keeps its code
+                raise _blocked_live(error.code, "Ledger refused the command") from error
+            raise
+        finally:
+            _TRACKER.reset(token)
+            clear_selections(verified.host)
 
 
 class HostLedgerBatchCoordinator:

@@ -12,8 +12,10 @@ import contextlib
 import json
 import os
 import sqlite3
+import threading
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -452,6 +454,106 @@ class LiveCoordinatorStepOneTests(LiveHarness):
 
 # ============================================================== RG-PRC-005
 class LiveSelectionLedgerTests(LiveHarness):
+    def test_same_host_live_executions_serialize_selection_cleanup(self):
+        batch = self.prepare()
+        runtime = self.runtime()
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        second_selection_preserved = threading.Event()
+        call_count = 0
+        errors = []
+
+        def fake_run_live(_batch, _ledger, active_runtime):
+            nonlocal call_count
+            call_number = call_count
+            call_count += 1
+            spec = object()
+            selection = host_runtime.HostSelection(
+                host=active_runtime.host, batch=batch, spec=spec, row_authority=None,
+                snapshot=None, signed_cap=1, scope_id="scope-1", capability=None,
+                target=None, name_evidence_sha256="a" * 64, selected_at_utc=self.now)
+            host_runtime._SELECTIONS[id(spec)] = selection
+            if call_number == 0:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise AssertionError("first execution was not released")
+            else:
+                second_entered.set()
+                if not release_second.wait(5):
+                    raise AssertionError("second execution was not released")
+                try:
+                    self.assertIs(host_runtime.peek_selection(spec, active_runtime.host),
+                                  selection)
+                    second_selection_preserved.set()
+                except BaseException as error:
+                    errors.append(error)
+                    raise
+            return object()
+
+        def execute():
+            try:
+                execute_batch_live(batch, self.ledger, runtime)
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=execute)
+        second = threading.Thread(target=execute)
+        with mock.patch.object(batch_runtime, "_run_live", side_effect=fake_run_live):
+            first.start()
+            self.assertTrue(first_entered.wait(5))
+            second.start()
+            try:
+                self.assertFalse(second_entered.wait(0.1))
+            finally:
+                release_first.set()
+            first.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertTrue(second_entered.wait(5))
+            release_second.set()
+            second.join(5)
+
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_selection_preserved.is_set())
+
+    def _verified_scope(self, batch):
+        record = batch.approved_rows[0]
+        arn_parts = record["resource_arn"].split(":", 5)
+        target = caps.canonical_target_identity(
+            kind=record["kind"], locator=record["locator"],
+            resource_arn=record["resource_arn"], partition=arn_parts[1],
+            account=arn_parts[4], scope_region=record["region"])
+        verifier = self.runtime().scope_verifier
+        return verifier, verifier.resolve("scope-1", target, self.host, self.now)
+
+    def test_scope_reconfirmation_accepts_reordered_valid_evidence(self):
+        batch = self.prepare()
+        verifier, verified_scope = self._verified_scope(batch)
+        self.source.effects = tuple(reversed(self.source.effects))
+
+        verifier.reconfirm(verified_scope, self.now)
+
+    def test_scope_reconfirmation_rejects_invalid_or_changed_evidence(self):
+        batch = self.prepare()
+        verifier, verified_scope = self._verified_scope(batch)
+        original = self.source.effects
+        cases = {
+            "wrong element type": ("not-side-effect-evidence", *original[1:]),
+            "duplicate target": (original[0], original[0]),
+            "missing target": original[:-1],
+            "changed content": (replace(original[0], evidence_references=("changed://evidence",)),
+                                *original[1:]),
+        }
+
+        for label, effects in cases.items():
+            with self.subTest(case=label):
+                self.source.effects = effects
+                with self.assertRaises(HostRuntimeBlocked):
+                    verifier.reconfirm(verified_scope, self.now)
+        self.source.effects = original
+
     def test_signed_row_indexes_ascending_singleton_selection(self):
         batch = self.prepare()
         self.run_live(batch)
@@ -459,7 +561,19 @@ class LiveSelectionLedgerTests(LiveHarness):
         self.assertEqual([r["row_index"] for r in self.journal()],
                          list(batch.approved_row_indexes))
         policies = [json.loads(json.loads(call)["Policy"]) for call in self.sts.calls]
-        for policy, arn in zip(policies, VOLUMES):
+        self.assertEqual(len(self.sts.calls), len(batch.approved_row_indexes))
+        self.assertEqual(len(policies), len(batch.approved_row_indexes))
+        write_arns = []
+        for policy in policies:
+            writes = [statement for statement in policy["Statement"]
+                      if "ec2:CreateTags" in statement["Action"]]
+            self.assertEqual(len(writes), 1)
+            self.assertEqual(len(writes[0]["Resource"]), 1)
+            write_arns.append(writes[0]["Resource"][0])
+        self.assertCountEqual(write_arns, [batch.approved_rows[i]["resource_arn"]
+                                           for i in batch.approved_row_indexes])
+        for position, policy in enumerate(policies):
+            arn = batch.approved_rows[batch.approved_row_indexes[position]]["resource_arn"]
             dumped = json.dumps(policy)
             self.assertIn(arn.rsplit("/", 1)[1], dumped)
             self.assertNotIn([a for a in VOLUMES if a != arn][0].rsplit("/", 1)[1], dumped)
@@ -516,6 +630,47 @@ class LiveSelectionLedgerTests(LiveHarness):
         self.assertEqual(again.batch_state, "COMPLETED")
         self.assertEqual((len(self.sts.calls), len(self.cloud.writes)), (2, 2))
 
+    def test_initial_ledger_state_error_is_unknown_with_batch_id(self):
+        batch = self.prepare()
+        runtime = self.runtime()
+        with self.trusted(), mock.patch.object(
+                self.ledger, "batch_execution_state",
+                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")):
+            with self.assertRaises(HostOutcomeUnknown) as caught:
+                execute_batch_live(batch, self.ledger, runtime)
+
+        self.assertEqual(caught.exception.batch_id, batch.batch_id)
+
+    def test_stopped_unresolved_permit_retries_scope_hold_without_resend(self):
+        batch = self.prepare([volume_record(0)], cap=1)
+        real_hold_scope = self.ledger.hold_scope
+        hold_attempts = []
+
+        def fail_first_hold(scope_id, *, reason):
+            hold_attempts.append((scope_id, reason))
+            if len(hold_attempts) == 1:
+                raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+            return real_hold_scope(scope_id, reason=reason)
+
+        with self.trusted(), mock.patch.object(
+                self.ledger, "record_readback",
+                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")), mock.patch.object(
+                    self.ledger, "hold_scope", side_effect=fail_first_hold):
+            with self.assertRaises(HostOutcomeUnknown) as caught:
+                execute_batch_live(batch, self.ledger, self.runtime())
+            self.assertEqual(caught.exception.batch_id, batch.batch_id)
+            self.assertEqual(self.state(batch).state, "STOPPED")
+            self.assertEqual(self.scope_state(), "CLEARED")
+            sends_after_first_attempt = len(self.cloud.writes)
+            sts_after_first_attempt = len(self.sts.calls)
+            result = execute_batch_live(batch, self.ledger, self.runtime())
+
+        self.assertEqual(result.batch_state, "STOPPED")
+        self.assertEqual(self.scope_state(), "HOLD")
+        self.assertEqual(len(hold_attempts), 2)
+        self.assertEqual(len(self.cloud.writes), sends_after_first_attempt)
+        self.assertEqual(len(self.sts.calls), sts_after_first_attempt)
+
 
 class LiveFirstRegistrationTests(LiveHarness):
     def test_valid_first_unregistered_sts_to_active_intent_permit(self):
@@ -563,8 +718,9 @@ class LiveFirstRegistrationTests(LiveHarness):
         with mock.patch.object(self.ledger, "batch_execution_state",
                                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")):
             blocked = self.run_blocked(batch)
-        self.assertEqual(blocked.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
-        self.assertNotIsInstance(blocked, HostOutcomeUnknown)  # pre-send: BLOCKED
+        self.assertEqual(blocked.code, "OUTCOME_UNKNOWN")
+        self.assertIsInstance(blocked, HostOutcomeUnknown)
+        self.assertEqual(blocked.batch_id, batch.batch_id)
         self.assertEqual((self.sts.calls, self.intents()), ([], []))
 
     def test_first_scope_hold_or_pending_intent_denied(self):

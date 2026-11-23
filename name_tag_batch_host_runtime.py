@@ -21,6 +21,7 @@ from dataclasses import dataclass, fields as dataclass_fields
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from types import MappingProxyType
 from typing import Final, Protocol
 from weakref import WeakKeyDictionary
@@ -199,6 +200,8 @@ class _HostBinding:
 
 
 _HOSTS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_EXECUTION_LOCKS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_EXECUTION_LOCKS_GUARD = Lock()
 
 
 def _context_digest(host: VerifiedHostContext) -> str:
@@ -228,6 +231,17 @@ def bound_ledger(host: VerifiedHostContext) -> object:
 
 def bound_journal(host: VerifiedHostContext) -> "IssuanceAttemptJournal":
     return _HOSTS[require_verified_host(host)].journal
+
+
+def host_execution_lock(host: VerifiedHostContext) -> Lock:
+    """Return the process-local serialization lock for one verified Host context."""
+    host = require_verified_host(host)
+    with _HOST_EXECUTION_LOCKS_GUARD:
+        lock = _HOST_EXECUTION_LOCKS.get(host)
+        if lock is None:
+            lock = Lock()
+            _HOST_EXECUTION_LOCKS[host] = lock
+        return lock
 
 
 def _require_hex(value: object, pattern: re.Pattern[str], what: str) -> str:
