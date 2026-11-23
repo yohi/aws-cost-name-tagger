@@ -201,7 +201,7 @@ class _Rule:
     accountless: bool = False    # ARN account component must be empty
 
 
-def _simple(service, rtype, sep, pattern, global_=False):
+def _simple(service, rtype, sep, pattern):
     rx = re.compile(rf"{re.escape(rtype)}{sep}(?P<loc>{pattern})")
     def tmpl(p, r, a, loc):
         return f"arn:{p}:{service}:{r}:{a}:{rtype}{sep}{loc}"
@@ -344,6 +344,8 @@ def project_unsigned_scope_region(*, kind: str, classified_region: str,
     parts = canonical_arn.split(":", 5) if isinstance(canonical_arn, str) else []
     if len(parts) != 6 or not parts[3]:
         _fail("Canonical ARN has no region")
+    if classified_region != parts[3]:
+        _fail("Classified region differs from the canonical ARN region")
     return parts[3]
 
 

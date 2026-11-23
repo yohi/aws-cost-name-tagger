@@ -230,6 +230,17 @@ class PreSignProjectionTests(unittest.TestCase):
         self.assertEqual(caps.project_unsigned_scope_region(
             kind="volume", classified_region=R, canonical_arn=POSITIVE["volume"][1]), R)
 
+    def test_unsigned_scope_projection_rejects_classified_region_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "Classified region differs"):
+            caps.project_unsigned_scope_region(
+                kind="volume", classified_region="us-east-1",
+                canonical_arn=POSITIVE["volume"][1])
+        # Global-scope Kinds project to "global"; their service endpoint region
+        # is intentionally not the ARN region (which is empty for CloudFront).
+        self.assertEqual(caps.project_unsigned_scope_region(
+            kind="cloudfront", classified_region="us-east-1",
+            canonical_arn=POSITIVE["cloudfront"][1]), "global")
+
     def test_vetted_nonvolume_pre_sign_operation_only_after_evidence(self):
         base = caps.resolve_kind_capability("instance")
         vetted = dataclasses.replace(
