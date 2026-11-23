@@ -143,7 +143,6 @@ class ProtectedHostScopeVerifier:
                            "BLOCKED_SIDE_EFFECT_UNASSESSED")
         verified_effects = tuple(effects_by_arn[controlled_arn]
                                  for controlled_arn in sorted(scope.controlled_arns))
-        matching = effects_by_arn[arn]
         ref = ownership_proof_ref(host, scope, arn)
         if target.ownership_proof_ref and target.ownership_proof_ref != ref:
             raise _blocked("ownership proof is not bound to this target", "BLOCKED_SCOPE_MISMATCH")
