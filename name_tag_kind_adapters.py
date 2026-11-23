@@ -183,7 +183,7 @@ class SingleNameAdapter:
 
         try:
             consume_host_dispatch_binding(
-                dispatch_binding, target=target, name=name, kind=self.kind)
+                dispatch_binding, client=client, target=target, name=name, kind=self.kind)
         except HostRuntimeBlocked as error:
             raise AdapterRejected(error.code, self.kind) from error
         self._preflight_write(client, target)

@@ -199,7 +199,7 @@ class ClientFactory:
 
     def create(self, service, region, *, access_key_id, secret_access_key, session_token):
         self.calls.append((service, region, access_key_id, secret_access_key, session_token))
-        return object()
+        return type("FakeIssuedSdkClient", (), {})()
 
 
 class IssuerHarness:

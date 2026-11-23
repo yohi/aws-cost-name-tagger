@@ -16,8 +16,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields as dataclass_fields
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from threading import Lock
 from typing import Final, Protocol
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 from name_tag_batch_approval import canonical_bytes
 from name_tag_batch_host_runtime import (
@@ -336,14 +337,55 @@ class HostIssuedSession(_NonCopyable):
         """Read/write/readback clients from the same explicit triplet and session."""
         require_issued_session(self, self._host, now_utc)
         akid, secret, token = self._triplet
-        return self._factory.create(service, region, access_key_id=akid,
-                                    secret_access_key=secret, session_token=token)
+        client = self._factory.create(service, region, access_key_id=akid,
+                                      secret_access_key=secret, session_token=token)
+        _register_issued_sdk_client(self, client)
+        return client
 
 
 _SESSION_MINT: Final = object()
 _SESSIONS: WeakKeyDictionary = WeakKeyDictionary()
 _INTENT_ADMITTED: WeakKeyDictionary = WeakKeyDictionary()
 _NAME_BINDINGS: dict[str, tuple[str, str]] = {}
+_ISSUED_SDK_CLIENTS: list[tuple[object, object]] = []
+_ISSUED_SDK_CLIENTS_LOCK = Lock()
+
+
+def _register_issued_sdk_client(issued: HostIssuedSession, client: object) -> None:
+    try:
+        client_ref, issued_ref = ref(client), ref(issued)
+    except TypeError as error:
+        raise _blocked("SDK client cannot be bound to its Host-issued session") from error
+    with _ISSUED_SDK_CLIENTS_LOCK:
+        retained = []
+        already_registered = False
+        for registered_client_ref, registered_issued_ref in _ISSUED_SDK_CLIENTS:
+            registered_client = registered_client_ref()
+            registered_issued = registered_issued_ref()
+            if registered_client is None or registered_issued is None:
+                continue
+            if registered_client is client:
+                if registered_issued is not issued:
+                    raise _blocked("SDK client is already bound to another issued session")
+                already_registered = True
+            retained.append((registered_client_ref, registered_issued_ref))
+        if not already_registered:
+            retained.append((client_ref, issued_ref))
+        _ISSUED_SDK_CLIENTS[:] = retained
+
+
+def require_issued_sdk_client(issued: object, client: object) -> object:
+    """Accept only the exact SDK client registered by this live issued session."""
+    if type(issued) is not HostIssuedSession:
+        raise _blocked("SDK client is not bound to a Host-issued session")
+    require_issued_session(issued, issued._host, None)
+    with _ISSUED_SDK_CLIENTS_LOCK:
+        registered = any(
+            registered_client_ref() is client and registered_issued_ref() is issued
+            for registered_client_ref, registered_issued_ref in _ISSUED_SDK_CLIENTS)
+    if not registered:
+        raise _blocked("SDK client was not created by this Host-issued session")
+    return client
 
 
 def require_issued_session(issued: object, host: object, now_utc: datetime | None

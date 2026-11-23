@@ -139,7 +139,8 @@ class AuthorizedBatchWritePort:
             raise LiveWriteBlocked("AWS_RUNTIME_NOT_AUTHORIZED")
         try:
             dispatch_binding = consume_runtime_grant(
-                grant, row=row, permit=permit, target=self._target, now_utc=self._clock())
+                grant, row=row, permit=permit, target=self._target, client=self._client,
+                now_utc=self._clock())
         except HostRuntimeBlocked as error:
             raise LiveWriteBlocked(error.code) from error
         self._adapter.write_once(

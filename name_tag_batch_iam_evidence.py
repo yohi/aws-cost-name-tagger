@@ -21,7 +21,8 @@ from weakref import WeakKeyDictionary
 import name_tag_kind_capabilities as caps
 from name_tag_batch_approval import VerifiedBatchRowAuthority, canonical_bytes
 from name_tag_batch_credentials import SYNTHETIC_PROVENANCE, is_offline_synthetic
-from name_tag_batch_host_issuer import HostIssuedSession, require_issued_session
+from name_tag_batch_host_issuer import (
+    HostIssuedSession, require_issued_sdk_client, require_issued_session)
 from name_tag_batch_host_runtime import (
     HostRuntimeBlocked, VerifiedHostContext, _NonCopyable, _blocked, bound_ledger,
     require_aware_utc, require_verified_host)
@@ -435,6 +436,7 @@ class _GrantBinding:
 class _HostDispatchRecord:
     host: VerifiedHostContext
     issued: HostIssuedSession
+    client: object
     row: VerifiedBatchRowAuthority
     permit: FirstSendPermit
     target: CanonicalTargetIdentity
@@ -471,7 +473,7 @@ def _permit_sha256(permit: FirstSendPermit) -> str:
 def _host_dispatch_digest(record: _HostDispatchRecord) -> str:
     return sha256(canonical_bytes([
         id(record.host), record.host.host_id, record.host.run_id,
-        id(record.issued), id(record.row), record.row.row_authority_id,
+        id(record.issued), id(record.client), id(record.row), record.row.row_authority_id,
         record.row.batch.batch_id, record.row.row_index, id(record.permit),
         _permit_sha256(record.permit), id(record.target), record.target.kind,
         record.target.locator, record.target.resource_arn,
@@ -588,26 +590,30 @@ def _consume_grant(grant: object, *, row: VerifiedBatchRowAuthority,
 
 def consume_runtime_grant(grant: object, *, row: VerifiedBatchRowAuthority,
                           permit: FirstSendPermit, target: CanonicalTargetIdentity,
+                          client: object,
                           now_utc: datetime) -> object:
     """Validate a live grant and mint an opaque one-use Registry dispatch binding."""
     binding = _consume_grant(grant, row=row, permit=permit, target=target, now_utc=now_utc)
     if binding.provenance != LIVE_PROVENANCE:
         raise _blocked("synthetic grant cannot authorize a live SDK dispatch")
     host = require_verified_host(binding.issued.selection.host)
+    require_issued_sdk_client(binding.issued, client)
     token = _HostDispatchBinding(_MINT)
     record = _HostDispatchRecord(
-        host=host, issued=binding.issued, row=binding.row, permit=binding.permit,
-        target=target, grant=grant, provenance=binding.provenance, digest="")
+        host=host, issued=binding.issued, client=client, row=binding.row,
+        permit=binding.permit, target=target, grant=grant,
+        provenance=binding.provenance, digest="")
     record = _HostDispatchRecord(
-        host=record.host, issued=record.issued, row=record.row, permit=record.permit,
-        target=record.target, grant=record.grant, provenance=record.provenance,
-        digest=_host_dispatch_digest(record))
+        host=record.host, issued=record.issued, client=record.client, row=record.row,
+        permit=record.permit, target=record.target, grant=record.grant,
+        provenance=record.provenance, digest=_host_dispatch_digest(record))
     with _HOST_DISPATCH_BINDINGS_LOCK:
         _HOST_DISPATCH_BINDINGS[token] = record
     return token
 
 
 def consume_host_dispatch_binding(binding: object, *,
+                                  client: object,
                                   target: CanonicalTargetIdentity,
                                   name: str, kind: str) -> None:
     """Consume and validate the Host-minted binding before a Registry SDK dispatch."""
@@ -648,6 +654,7 @@ def consume_host_dispatch_binding(binding: object, *,
             and grant.scope_id == permit.writer_control_scope_id
             and grant.permit_sha256 == _permit_sha256(permit))
         if (record.digest != _host_dispatch_digest(record)
+                or record.client is not client
                 or not target_matches or not permit_matches or not grant_matches):
             raise _blocked("Host dispatch binding does not match the Registry write")
     except HostRuntimeBlocked:
