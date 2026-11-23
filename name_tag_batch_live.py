@@ -7,6 +7,9 @@ from typing import Final, Protocol, TypedDict
 
 from name_tag_batch_approval import VerifiedBatchRowAuthority
 from name_tag_batch_credentials import IssuedBatchSession
+from name_tag_kind_adapters import (
+    AdapterRejected, KindWriteAdapter, adapter_for_capability)
+from name_tag_kind_capabilities import resolve_kind_capability
 from name_tag_ledger import FirstSendPermit
 
 
@@ -54,6 +57,18 @@ def build_volume_create_tags_request(
         "Resources": [match.group("volume_id")],
         "Tags": [{"Key": "Name", "Value": approved_name}],
     }
+
+
+def protected_registry_adapter(kind: str) -> KindWriteAdapter:
+    """Protected Registry dispatch: only a genuine IMPLEMENTED_OFFLINE Kind yields an adapter.
+
+    Returning an adapter grants no authority and builds no client; the Host verifier
+    still authorizes the actual send. Everything else stays denied by default.
+    """
+    try:
+        return adapter_for_capability(resolve_kind_capability(kind))
+    except (ValueError, AdapterRejected) as exc:
+        raise LiveWriteBlocked(getattr(exc, "code", "WRITE_UNSUPPORTED")) from exc
 
 
 @dataclass(frozen=True, slots=True)
