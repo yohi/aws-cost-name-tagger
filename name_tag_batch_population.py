@@ -6,6 +6,8 @@ from typing import Mapping
 import math
 import re
 
+from name_tag_kind_capabilities import REGISTRY_KINDS
+
 MAX_CUR_ROWS = 2_000_000
 MAX_CUR_DISTINCT_RESOURCES = 250_000
 MAX_COST_DIGITS = 1_000
@@ -48,10 +50,27 @@ def exact_add(values) -> Decimal:
     return Decimal((1 if total<0 else 0,digits,scale))
 
 
-def _decimal_coefficient(value):
+def _aggregate_add(values) -> Decimal:
+    """Sum already-validated aggregate amounts under aggregate, not CUR-input, bounds."""
+    items=[]
+    for value in values:
+        if len(items)>=MAX_CUR_ROWS:
+            raise CurBudgetExceeded('CUR aggregate row budget exceeded')
+        items.append(_decimal_coefficient(value,max_digits=MAX_AGGREGATE_DIGITS))
+    if not items:return Decimal(0)
+    scale=min(exp for _,exp in items)
+    total=sum(n*10**(exp-scale) for n,exp in items)
+    if total==0:return Decimal(0)
+    digits=tuple(int(c) for c in str(abs(total)))
+    if len(digits)>MAX_AGGREGATE_DIGITS or abs(scale)>MAX_COST_SCALE:
+        raise CurBudgetExceeded('CUR aggregate precision/scale budget exceeded')
+    return Decimal((1 if total<0 else 0,digits,scale))
+
+
+def _decimal_coefficient(value, *, max_digits=MAX_COST_DIGITS):
     if isinstance(value,float):
         raise ValueError('Float is not a valid exact monetary source')
-    if isinstance(value,str) and (len(value)>MAX_COST_DIGITS+2 or _PLAIN_DECIMAL.fullmatch(value) is None):
+    if isinstance(value,str) and (len(value)>max_digits+2 or _PLAIN_DECIMAL.fullmatch(value) is None):
         raise ValueError('CUR monetary source is not a bounded plain decimal string')
     try:
         amount=Decimal(value) if isinstance(value,(str,int,Decimal)) else None
@@ -60,7 +79,7 @@ def _decimal_coefficient(value):
     if amount is None or not amount.is_finite():
         raise ValueError('CUR monetary amount must be finite decimal')
     sign,digits,exp=amount.as_tuple()
-    if abs(exp)>MAX_COST_SCALE or len(digits)>MAX_COST_DIGITS:
+    if abs(exp)>MAX_COST_SCALE or len(digits)>max_digits:
         raise CurBudgetExceeded('CUR decimal scale/precision budget exceeded')
     coefficient=int(''.join(map(str,digits))) if digits else 0
     return (-coefficient if sign else coefficient,exp)
@@ -147,6 +166,20 @@ def _canonical_cost(value):
     return d
 
 
+def _canonical_aggregate_cost(value):
+    if (type(value) is not str or len(value)>MAX_AGGREGATE_DIGITS+2
+            or _PLAIN_DECIMAL.fullmatch(value) is None):
+        raise ValueError('Expected exact aggregate decimal text')
+    try:d=Decimal(value)
+    except InvalidOperation as e:raise ValueError('Nondecimal aggregate cost') from e
+    if not d.is_finite() or _canonical_decimal(d)!=value:
+        raise ValueError('Noncanonical aggregate decimal cost')
+    _,digits,exp=d.as_tuple()
+    if len(digits)>MAX_AGGREGATE_DIGITS or abs(exp)>MAX_COST_SCALE:
+        raise CurBudgetExceeded('CUR aggregate precision/scale budget exceeded')
+    return d
+
+
 def validate_reason_details(details,population)->dict:
     """Shared rule: reason details must reconcile exactly with billing-class totals."""
     if type(details) is not dict:
@@ -156,7 +189,7 @@ def validate_reason_details(details,population)->dict:
                 or set(value)!={'billing_rows','cost_usd'}
                 or type(value['billing_rows']) is not int or value['billing_rows']<0):
             raise ValueError('Malformed CUR classification reason detail')
-        _canonical_cost(value['cost_usd'])
+        _canonical_aggregate_cost(value['cost_usd'])
     classes={name.upper() for name in _BILLING_CLASSES}
     if any(key.partition(':')[0] not in classes for key in details):
         raise ValueError('Unknown CUR reason detail class')
@@ -167,7 +200,7 @@ def validate_reason_details(details,population)->dict:
             if entries:raise ValueError('CUR reason details for unknown class')
             continue
         if (sum(v['billing_rows'] for v in entries)!=total['billing_rows']
-                or exact_add(_canonical_cost(v['cost_usd']) for v in entries)!=_canonical_cost(total['cost_usd'])):
+                or _aggregate_add(_canonical_aggregate_cost(v['cost_usd']) for v in entries)!=_canonical_aggregate_cost(total['cost_usd'])):
             raise ValueError('CUR reason details mismatch class total')
     return details
 
@@ -180,18 +213,88 @@ def validate_signed_population(plan:dict)->dict:
         raise ValueError('Incomplete or unknown Batch CUR accounting')
     kind_counts=('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')
     billing=('unattributable_cur','outside_requested_kinds','unsupported_kind')
-    cost=_canonical_cost
+    cost=_canonical_aggregate_cost
     _validate_resource_summaries(c,kind_counts,cost)
     _validate_billing_summaries(c,billing,cost)
     if not _population_is_conserved(c,cost):
         raise ValueError('Inexact CUR population conservation')
+    validate_kind_precap(plan,c)
     if 'cur_population_reason_details' in plan:
         validate_reason_details(plan['cur_population_reason_details'],c)
     if type(plan.get('count')) is not int or plan['count']!=len(plan.get('records',[])) or plan['count']!=c['lookup_selected']['count']:
         raise ValueError('Selected records contradict signed population')
-    if exact_add(record['effective_usage_cost_usd'] for record in plan['records']) != cost(c['lookup_selected']['cost_usd']):
+    if _aggregate_add(_canonical_aggregate_cost(record['effective_usage_cost_usd']) for record in plan['records']) != cost(c['lookup_selected']['cost_usd']):
         raise ValueError('Selected record costs contradict signed population')
     return c
+
+
+KIND_PRECAP_STAGES=('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')
+
+
+def build_kind_precap(aggregates, selected_keys, *, min_cost: float):
+    """Per-Kind pre-cap stages from the SAME aggregates/Decimals and the SAME selection as the totals."""
+    selected=set(selected_keys)
+    groups={kind:{stage:[] for stage in KIND_PRECAP_STAGES} for kind in REGISTRY_KINDS}
+    for key,aggregate in aggregates.items():
+        stages=groups[key[0]]  # KeyError: a non-registry Kind must never be silently dropped
+        stages['cur_recognized'].append(aggregate.exact_cost)
+        if aggregate.legacy_rank_cost<min_cost:
+            stages['below_min_cost'].append(aggregate.exact_cost)
+            continue
+        stages['above_min_cost'].append(aggregate.exact_cost)
+        stages['lookup_selected' if key in selected else 'max_resources_not_inspected'].append(aggregate.exact_cost)
+    return {'schema_version':1,'kinds':{
+        kind:{stage:{'count':len(values),'cost_usd':_canonical_decimal(_aggregate_add(values))}
+              for stage,values in stages.items()}
+        for kind,stages in groups.items()}}
+
+
+def validate_kind_precap(plan:dict,population:dict)->None:
+    """Optional authenticated Kind pre-cap field; absent (historical Plan) claims no Kind coverage."""
+    if 'cur_population_by_kind' not in plan:
+        return
+    field=plan['cur_population_by_kind']
+    if (type(field) is not dict or set(field)!={'schema_version','kinds'}
+            or type(field['schema_version']) is not int or field['schema_version']!=1
+            or type(field['kinds']) is not dict or tuple(sorted(field['kinds']))!=tuple(sorted(REGISTRY_KINDS))):
+        raise ValueError('Invalid Kind pre-cap population')
+    totals={stage:[0,[]] for stage in KIND_PRECAP_STAGES}
+    for kind in REGISTRY_KINDS:
+        stages=field['kinds'][kind]
+        if type(stages) is not dict or set(stages)!=set(KIND_PRECAP_STAGES):
+            raise ValueError('Invalid Kind pre-cap stages')
+        parsed={}
+        for stage in KIND_PRECAP_STAGES:
+            entry=stages[stage]
+            if (type(entry) is not dict or set(entry)!={'count','cost_usd'} or type(entry['count']) is not int
+                    or not 0<=entry['count']<=MAX_CUR_DISTINCT_RESOURCES):
+                raise ValueError('Invalid Kind pre-cap summary')
+            amount=_canonical_aggregate_cost(entry['cost_usd'])
+            if entry['count']==0 and amount!=0:
+                raise ValueError('Empty Kind pre-cap stage has nonzero cost')
+            parsed[stage]=(entry['count'],amount)
+            totals[stage][0]+=entry['count']
+            totals[stage][1].append(amount)
+        for whole,first,second in (('cur_recognized','below_min_cost','above_min_cost'),
+                                   ('above_min_cost','lookup_selected','max_resources_not_inspected')):
+            if (parsed[whole][0]!=parsed[first][0]+parsed[second][0]
+                    or parsed[whole][1]!=_aggregate_add((parsed[first][1],parsed[second][1]))):
+                raise ValueError('Kind pre-cap identity violated')
+    for stage in KIND_PRECAP_STAGES:
+        if totals[stage][0]!=population[stage]['count'] or _aggregate_add(totals[stage][1])!=_canonical_aggregate_cost(population[stage]['cost_usd']):
+            raise ValueError('Kind pre-cap does not reconcile with signed population')
+    selected_by_kind={kind:[0,[]] for kind in REGISTRY_KINDS}
+    for record in plan.get('records',[]):
+        kind=record.get('kind')
+        if kind not in selected_by_kind:
+            raise ValueError('Selected record has unknown Kind')
+        selected_by_kind[kind][0]+=1
+        selected_by_kind[kind][1].append(_canonical_aggregate_cost(record['effective_usage_cost_usd']))
+    for kind,selected in selected_by_kind.items():
+        declared=field['kinds'][kind]['lookup_selected']
+        if (selected[0]!=declared['count']
+                or _aggregate_add(selected[1])!=_canonical_aggregate_cost(declared['cost_usd'])):
+            raise ValueError('Kind selected records contradict signed population')
 
 
 def _validate_resource_summaries(population,names,cost):
@@ -221,5 +324,5 @@ def _validate_billing_summaries(population,names,cost):
 def _population_is_conserved(population,cost):
     def matches(total,first,second):
         return (population[total]['count']==population[first]['count']+population[second]['count']
-                and cost(population[total]['cost_usd'])==exact_add((cost(population[first]['cost_usd']),cost(population[second]['cost_usd']))))
+                and cost(population[total]['cost_usd'])==_aggregate_add((cost(population[first]['cost_usd']),cost(population[second]['cost_usd']))))
     return matches('cur_recognized','below_min_cost','above_min_cost') and matches('above_min_cost','lookup_selected','max_resources_not_inspected')

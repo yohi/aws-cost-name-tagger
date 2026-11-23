@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 import io, csv, json, re, hashlib
+import name_tag_kind_capabilities as _caps
 
 CSV_COLUMNS=('approved','proposal_id','kind','locator','region','effective_usage_cost_usd','status','name_state','name_key_present','name_raw_value','existing_name','confidence','proposed_name','evidence')
 VOLUME_ID_PATTERN=r'vol-(?:[0-9a-f]{8}|[0-9a-f]{17})'
@@ -93,10 +94,34 @@ def _validate_scope_declarations(scopes):
     if ids!=sorted(set(ids)):raise ValueError('unsorted/duplicate scopes')
 
 
+_SPECIAL_SCOPE_SHAPES=(('ec2','snapshot/','snapshot'),('s3','','s3_bucket'),('cloudfront','distribution/','cloudfront'),('apigateway','/restapis/','apigw_stage'))
+
+
+def _special_scope_kind(parts):
+    """Kind whose canonical ARN is regionless/accountless; None means the legacy generic rule."""
+    if len(parts)!=6 or parts[0]!='arn':return None
+    for service,prefix,kind in _SPECIAL_SCOPE_SHAPES:
+        if parts[2]==service and parts[5].startswith(prefix) and (service!='s3' or (not parts[3] and not parts[4])):
+            return kind
+    return None
+
+
+def _syntax_identity_ok(kind,arn,partition,account,scope_region):
+    """Syntax-only exact-Scope admission via the trusted Kind grammar; NOT a Host ownership proof."""
+    try:
+        _caps.canonical_target_identity(kind=kind,locator=arn,resource_arn=arn,partition=partition,account=account,scope_region=scope_region)
+    except ValueError:
+        return False
+    return True
+
+
 def _valid_declared_arn(arn,scope):
     if not isinstance(arn,str) or any(char.isspace() for char in arn) or '*' in arn:
         return False
     parts=arn.split(':',5)
+    special=_special_scope_kind(parts)
+    if special is not None:
+        return _syntax_identity_ok(special,arn,scope['partition'],scope['account'],scope['region'])
     if (len(parts)!=6 or parts[0]!='arn' or parts[1]!=scope['partition']
             or not parts[2] or parts[3]!=scope['region'] or parts[4]!=scope['account']
             or not parts[5]):
@@ -157,15 +182,24 @@ def _read_review_csv(csv_bytes:bytes)->list[list[str]]:
 
 
 def derive_declared_row_scope(plan:dict,row:dict)->str:
-    if row.get('kind')!='volume' or row.get('aws_operation')!='ec2:CreateTags':
+    kind=row.get('kind')
+    if kind!='volume':
+        if kind not in _caps.REGISTRY_KINDS or row.get('aws_operation')!=_caps.resolve_kind_capability(kind).write_operation:
+            raise BatchValidationError('Kind/API has no approved write implementation')
+    elif row.get('aws_operation')!='ec2:CreateTags':
         raise BatchValidationError('Kind/API has no approved write implementation')
     arn=row.get('resource_arn','')
     account=plan.get('account');partition=plan.get('partition');region=row.get('region')
     if type(arn) is not str or type(region) is not str:raise BatchValidationError('Bad ARN')
-    parts=arn.split(':',5)
-    if len(parts)!=6 or parts[:2]!=['arn',partition] or parts[3]!=region or parts[4]!=account:
-        raise BatchValidationError('ARN/account/partition/region mismatch')
-    if row.get('kind')=='volume':
+    if kind!='volume':
+        try:
+            _caps.canonical_target_identity(kind=kind,locator=arn,resource_arn=arn,partition=partition,account=account,scope_region=region)
+        except ValueError as error:
+            raise BatchValidationError('ARN/account/partition/region mismatch') from error
+    else:
+        parts=arn.split(':',5)
+        if len(parts)!=6 or parts[:2]!=['arn',partition] or parts[3]!=region or parts[4]!=account:
+            raise BatchValidationError('ARN/account/partition/region mismatch')
         match=re.fullmatch('volume/('+VOLUME_ID_PATTERN+')',parts[5],re.ASCII) if parts[2]=='ec2' else None
         if match is None:
             raise BatchValidationError('Malformed volume ARN')
@@ -176,23 +210,28 @@ def derive_declared_row_scope(plan:dict,row:dict)->str:
     return entries[0]['writer_control_scope_id']
 
 
-def _validate_name_eligibility(r,name):
-    """Re-check the v3 volume Name generation contract; never trust non-empty evidence alone."""
-    from aws_cost_name_tagger_v3 import meaningful
-    locator=r.get('locator')
-    if meaningful(name)!=name:
-        raise BatchValidationError('Proposed Name is not a meaningful generated Name')
-    evidence=r['evidence']
-    match=(re.fullmatch(
-        rf'EBS {re.escape(locator)} -> attachment (i-(?:[0-9a-f]{{8}}|[0-9a-f]{{17}})) '
-        rf'([a-z][a-z0-9-]*[a-z0-9]) -> EC2 \1 Name=(\S+?);.*',evidence)
-        if isinstance(locator,str) else None)
-    device=match.group(2) if match else None
-    anchor=match.group(3) if match else None
-    expected=(f'{anchor}-ebs-{device}-{locator[-7:]}'
-              if anchor is not None and device is not None else None)
-    if (anchor is None or meaningful(anchor)!=anchor or expected!=name):
-        raise BatchValidationError('Evidence does not support the generated Name')
+def _approved_target_identity(p,r):
+    """Canonical identity of the signed row; the row locator itself must identify the ARN resource."""
+    kind=r.get('kind')
+    if kind not in _caps.REGISTRY_KINDS:raise BatchValidationError('Kind/API is not proven eligible')
+    decision=_caps.resolve_kind_capability(kind)
+    if decision.status!='IMPLEMENTED_OFFLINE' or r.get('aws_operation')!=decision.write_operation:
+        raise BatchValidationError('Kind/API is not proven eligible')
+    try:
+        return _caps.canonical_target_identity(kind=kind,locator=r.get('locator'),resource_arn=r.get('resource_arn'),partition=p.get('partition'),account=p.get('account'),scope_region=r.get('region'))
+    except ValueError as error:
+        raise BatchValidationError('Locator/ARN/account/partition/region mismatch') from error
+
+
+def _validate_name_eligibility(p,r,name):
+    """Rederive the Name from the Plan record evidence with the trusted per-Kind verifier."""
+    import name_tag_kind_name_evidence as evidence_module
+    target=_approved_target_identity(p,r)
+    try:
+        verified=evidence_module.verified_generated_name(r,target)
+    except evidence_module.NameEvidenceNotProven as error:
+        raise BatchValidationError(str(error)) from error
+    if verified.generated_name!=name:raise BatchValidationError('Evidence does not support the generated Name')
 
 
 def validate_approved_batch_row(p,r,approved:str):
@@ -206,9 +245,7 @@ def validate_approved_batch_row(p,r,approved:str):
     if not isinstance(name,str) or not name or len(name)>256 or name!=name.strip() or any(ord(c)<32 or ord(c)==127 for c in name):raise BatchValidationError('Invalid proposed Name')
     if not isinstance(r.get('proposal_id'),str) or not r['proposal_id'] or not isinstance(r.get('evidence'),str) or not r['evidence']:
         raise BatchValidationError('No proposal/evidence')
-    _validate_name_eligibility(r,name)
-    if r.get('kind')!='volume' or r.get('aws_operation')!='ec2:CreateTags':
-        raise BatchValidationError('Kind/API is not proven eligible')
+    _validate_name_eligibility(p,r,name)
     scope=derive_declared_row_scope(p,r)
     return {**r,'approved':'YES','approved_name':name,'writer_control_scope_id':scope}
 

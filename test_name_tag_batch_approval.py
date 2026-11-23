@@ -105,6 +105,52 @@ class BatchApprovalTests(unittest.TestCase):
                 verified,0,trust=revoked,
                 now_utc=datetime(2026,11,19,12,tzinfo=timezone.utc))
 
+    def _precap(self,cost='1.5'):
+        from name_tag_kind_capabilities import REGISTRY_KINDS
+        zero={'count':0,'cost_usd':'0'};one={'count':1,'cost_usd':cost}
+        kinds={k:{s:dict(zero) for s in ('cur_recognized','below_min_cost','above_min_cost','lookup_selected','max_resources_not_inspected')} for k in REGISTRY_KINDS}
+        for stage in ('cur_recognized','above_min_cost','lookup_selected'):kinds['volume'][stage]=dict(one)
+        return {'schema_version':1,'kinds':kinds}
+
+    def _resign(self,plan_bytes):
+        self.plan=plan_bytes;self.csv=build_batch_review_projection(plan_bytes).replace(b',pid,',b'YES,pid,')
+        return self._signed_envelope()
+
+    def test_legacy_signed_volume_plan_without_kind_breakdown_verifies_original_bytes(self):
+        original=self.plan
+        self.assertNotIn(b'cur_population_by_kind',original)
+        envelope=self._signed_envelope()
+        verified=verify_batch_approval(original,self.csv,envelope,trust=self.trust,now_utc=datetime(2026,11,19,12,tzinfo=timezone.utc))
+        self.assertIs(verified.plan_bytes==original,True)
+        self.assertEqual(verified.payload['plan_sha256'],hashlib.sha256(original).hexdigest())
+        from name_tag_batch_state import validate_batch_draft
+        self.assertNotIn('cur_population_by_kind',validate_batch_draft(original,self.csv).plan)  # never fabricated/backfilled
+
+    def test_new_plan_v3_kind_breakdown_included_in_plan_sha256(self):
+        doc=json.loads(self.plan);doc['cur_population_by_kind']=self._precap()
+        new_plan=json.dumps(doc).encode()
+        self.assertNotEqual(new_plan,self.plan)  # no old/new byte equality is required
+        envelope=self._resign(new_plan)
+        now=datetime(2026,11,19,12,tzinfo=timezone.utc)
+        verified=verify_batch_approval(new_plan,self.csv,envelope,trust=self.trust,now_utc=now)
+        self.assertEqual(verified.payload['plan_sha256'],hashlib.sha256(new_plan).hexdigest())
+        self.assertIn(b'cur_population_by_kind',verified.plan_bytes)
+
+    def test_signed_kind_breakdown_mutation_rejects_owner_approval(self):
+        doc=json.loads(self.plan);doc['cur_population_by_kind']=self._precap()
+        signed_plan=json.dumps(doc).encode()
+        envelope=self._resign(signed_plan);csv=self.csv
+        now=datetime(2026,11,19,12,tzinfo=timezone.utc)
+        verify_batch_approval(signed_plan,csv,envelope,trust=self.trust,now_utc=now)
+        # Same-total re-labelling stays internally valid, so only the signed digest can catch it.
+        moved=json.loads(signed_plan);kinds=moved['cur_population_by_kind']['kinds']
+        for stage in ('cur_recognized','above_min_cost','lookup_selected'):
+            kinds['snapshot'][stage]=kinds['volume'][stage];kinds['volume'][stage]={'count':0,'cost_usd':'0'}
+        for label,mutated in {'relabel kind':json.dumps(moved).encode(),'dropped field':json.dumps({k:v for k,v in json.loads(signed_plan).items() if k!='cur_population_by_kind'}).encode(),'broken field':signed_plan.replace(b'"count": 1',b'"count": 2',1)}.items():
+            self.assertNotEqual(mutated,signed_plan,label)
+            with self.subTest(label),self.assertRaises(BatchAuthRejected):
+                verify_batch_approval(mutated,csv,envelope,trust=self.trust,now_utc=now)
+
     def test_csv_change_after_signature_is_rejected(self):
         envelope=self._signed_envelope()
         now=datetime(2026,11,19,12,tzinfo=timezone.utc)

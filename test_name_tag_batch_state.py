@@ -133,6 +133,14 @@ class StateTests(unittest.TestCase):
             validate_batch_csv(plan_bytes,build_batch_review_projection(plan_bytes))
 
 class SecurityBoundaryTests(unittest.TestCase):
+    def test_accountless_snapshot_scope_declaration_is_canonical_only(self):
+        from name_tag_batch_state import _valid_declared_arn
+        scope = {"partition": "aws", "account": "123456789012", "region": "ap-northeast-1"}
+        self.assertTrue(_valid_declared_arn(
+            "arn:aws:ec2:ap-northeast-1::snapshot/snap-0123456789abcdef0", scope))
+        self.assertFalse(_valid_declared_arn(
+            "arn:aws:ec2:ap-northeast-1:123456789012:snapshot/snap-0123456789abcdef0", scope))
+
     def test_variant_name_unicode_casefold_is_unknown(self):
         self.assertEqual(classify_batch_name({'nAmE':'Value'}).state,'UNKNOWN')
     def test_foreign_arn_cannot_be_approved_through_matching_declaration(self):
@@ -296,6 +304,74 @@ class ReasonDetailsDraftValidationTests(unittest.TestCase):
                     prepare_batch_approval(pb,cb,owner_principal_id='o',owner_key_fingerprint='SHA256:x',
                         authorized_role_arn='arn:aws:iam::123456789012:role/r',
                         issued_at_utc='2026-11-21T00:00:00Z',expires_at_utc='2026-11-22T00:00:00Z',batch_nonce='a'*32)
+
+
+class ScopeParserSyntaxTests(unittest.TestCase):
+    """Task 2 syntax-only Scope parser for Kind-allowlisted regionless/accountless ARNs."""
+    A='123456789012'
+    R='ap-northeast-1'
+    UUID='0a1b2c3d-0a1b-0a1b-0a1b-0a1b2c3d4e5f'
+
+    def scope(self,region,arns,account=None):
+        return {'writer_control_scope_id':'sc','account':account or self.A,'partition':'aws','region':region,'resource_arns':sorted(arns)}
+
+    def valid(self,region,arn,account=None):
+        from name_tag_batch_state import _validate_scope_declarations
+        try:_validate_scope_declarations([self.scope(region,[arn],account)])
+        except ValueError:return False
+        return True
+
+    def derive(self,kind,operation,region,arn,locator=None,scope_region=None):
+        from name_tag_batch_state import derive_declared_row_scope
+        plan={'account':self.A,'partition':'aws','scope_declarations':[self.scope(scope_region or region,[arn])]}
+        row={'kind':kind,'aws_operation':operation,'region':region,'resource_arn':arn,'locator':locator or arn}
+        return derive_declared_row_scope(plan,row)
+
+    def test_scope_parser_global_cloudfront_green_before_task3(self):
+        arn=f'arn:aws:cloudfront::{self.A}:distribution/E1ABCDEF234567'
+        self.assertTrue(self.valid('global',arn))
+        self.assertEqual(self.derive('cloudfront','cloudfront:TagResource','global',arn),'sc')
+        self.assertFalse(self.valid('us-east-1',arn))                      # no region alias
+        self.assertFalse(self.valid('global',arn,account='210987654321'))  # signed account strict
+        self.assertFalse(self.valid('global','arn:aws:cloudfront:us-east-1:'+self.A+':distribution/E1ABCDEF234567'))
+        self.assertFalse(self.valid('global',f'arn:aws:cloudfront::{self.A}:distribution/*'))
+        with self.assertRaises(BatchValidationError):
+            self.derive('cloudfront','cloudfront:TagResource','us-east-1',arn)
+        with self.assertRaises(BatchValidationError):  # wrong operation for the Kind
+            self.derive('cloudfront','ec2:CreateTags','global',arn)
+
+    def test_snapshot_accountless_owner_scope_syntax(self):
+        arn=f'arn:aws:ec2:{self.R}::snapshot/snap-0123456789abcdef0'
+        self.assertTrue(self.valid(self.R,arn))
+        self.assertEqual(self.derive('snapshot','ec2:CreateTags',self.R,arn,'snap-0123456789abcdef0'),'sc')
+        self.assertFalse(self.valid('us-east-1',arn))
+        self.assertFalse(self.valid('global',arn))
+        self.assertFalse(self.valid(self.R,f'arn:aws:ec2:{self.R}::snapshot/snap-xyz'))
+        stage=f'arn:aws:apigateway:{self.R}::/restapis/a1b2c3d4e5/stages/prod'
+        self.assertTrue(self.valid(self.R,stage))
+        self.assertFalse(self.valid('global',stage))
+        self.assertFalse(self.valid(self.R,f'arn:aws:apigateway:{self.R}:{self.A}:/restapis/a1b2c3d4e5/stages/prod'))
+
+    def test_s3_global_and_waf_regional_scope_no_alias(self):
+        s3='arn:aws:s3:::my-bucket-1'
+        self.assertTrue(self.valid('global',s3))
+        self.assertFalse(self.valid(self.R,s3))
+        self.assertEqual(self.derive('s3_bucket','s3control:TagResource','global',s3,'my-bucket-1'),'sc')
+        cf_waf=f'arn:aws:wafv2:us-east-1:{self.A}:global/webacl/web/{self.UUID}'
+        self.assertTrue(self.valid('us-east-1',cf_waf))                    # real region, not global
+        self.assertFalse(self.valid('global',cf_waf))
+        self.assertFalse(self.valid('ap-northeast-1',cf_waf))
+        self.assertEqual(self.derive('wafv2','wafv2:TagResource','us-east-1',cf_waf),'sc')
+        regional=f'arn:aws:wafv2:{self.R}:{self.A}:regional/webacl/web/{self.UUID}'
+        self.assertTrue(self.valid(self.R,regional))
+        self.assertFalse(self.valid('global',regional))
+        self.assertFalse(self.valid('us-east-1',regional))
+
+    def test_scope_uniqueness_stays_strict(self):
+        from name_tag_batch_state import _validate_scope_declarations
+        arn='arn:aws:s3:::my-bucket-1'
+        a=self.scope('global',[arn]);b={**self.scope('global',[arn]),'writer_control_scope_id':'sd'}
+        with self.assertRaises(ValueError):_validate_scope_declarations([a,b])
 
 
 if __name__=='__main__':unittest.main()

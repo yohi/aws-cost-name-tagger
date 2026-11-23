@@ -3,11 +3,33 @@ from decimal import Decimal
 
 from name_tag_batch_population import (
     CurCostAggregate, CurBudgetExceeded, partition_cur_population,
-    decimal_cost_of, classify_cur_row, exact_add, validate_signed_population,
+    decimal_cost_of, classify_cur_row, exact_add, validate_kind_precap,
+    build_kind_precap, validate_reason_details, _aggregate_add,
+    validate_signed_population, KIND_PRECAP_STAGES, MAX_AGGREGATE_DIGITS,
+    MAX_COST_DIGITS,
 )
+from name_tag_kind_capabilities import REGISTRY_KINDS
 from test_helpers import sample_population
 
 class PopulationTests(unittest.TestCase):
+    def kind_precap(self, selected):
+        kinds = {
+            kind: {
+                stage: {'count': 0, 'cost_usd': '0'}
+                for stage in KIND_PRECAP_STAGES
+            }
+            for kind in REGISTRY_KINDS
+        }
+        for kind, (count, amount) in selected.items():
+            kinds[kind] = {
+                'cur_recognized': {'count': count, 'cost_usd': amount},
+                'below_min_cost': {'count': 0, 'cost_usd': '0'},
+                'above_min_cost': {'count': count, 'cost_usd': amount},
+                'lookup_selected': {'count': count, 'cost_usd': amount},
+                'max_resources_not_inspected': {'count': 0, 'cost_usd': '0'},
+            }
+        return {'schema_version': 1, 'kinds': kinds}
+
     def test_precise_decimal_conservation_and_float_rank(self):
         a = {
             ('volume', 'vol-a', 'ap-northeast-1'): CurCostAggregate(Decimal('0.1'), 0.3),
@@ -74,6 +96,124 @@ class PopulationTests(unittest.TestCase):
     def test_aggregate_sum_allows_input_bound_times_maximum_rows(self):
         total=exact_add(['9' * 100, '9' * 100])
         self.assertEqual(total,Decimal('1' + '9' * 99 + '8'))
+
+    def test_kind_precap_accepts_aggregate_amount_over_cur_input_digit_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        precap=self.kind_precap({
+            'volume': (1, amount),
+            'instance': (1, '-' + amount),
+        })
+
+        validate_kind_precap(
+            {
+                'cur_population_by_kind': precap,
+                'records': [
+                    {'kind': 'volume', 'effective_usage_cost_usd': amount},
+                    {'kind': 'instance', 'effective_usage_cost_usd': '-' + amount},
+                ],
+            },
+            sample_population(count=2, cost='0'))
+
+    def test_kind_precap_reconciles_population_aggregate_over_cur_input_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        precap=self.kind_precap({'volume': (1, amount)})
+
+        validate_kind_precap(
+            {
+                'cur_population_by_kind': precap,
+                'records': [{'kind': 'volume', 'effective_usage_cost_usd': amount}],
+            },
+            sample_population(count=1, cost=amount))
+
+    def test_build_kind_precap_sums_aggregate_costs_over_cur_input_digit_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        aggregates={
+            ('volume','vol-a','ap-northeast-1'): CurCostAggregate(Decimal(amount), 1.0),
+            ('volume','vol-b','ap-northeast-1'): CurCostAggregate(Decimal(amount), 1.0),
+        }
+
+        precap=build_kind_precap(aggregates, aggregates, min_cost=0.0)
+
+        self.assertEqual(
+            precap['kinds']['volume']['cur_recognized']['cost_usd'],
+            format(_aggregate_add([Decimal(amount), Decimal(amount)]), 'f'))
+
+    def test_reason_details_accept_aggregate_billing_cost_over_cur_input_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        population=sample_population()
+        population['unattributable_cur']={
+            'known':True, 'billing_rows':1, 'cost_usd':amount,
+        }
+        details={'UNATTRIBUTABLE_CUR:missing':{
+            'billing_rows':1, 'cost_usd':amount,
+        }}
+
+        self.assertEqual(validate_reason_details(details, population), details)
+
+    def test_signed_population_accepts_record_aggregate_over_cur_input_digit_limit(self):
+        amount='9' * (MAX_COST_DIGITS + 1)
+        plan={
+            'count':1,
+            'records':[{'effective_usage_cost_usd':amount}],
+            'cur_population':sample_population(count=1, cost=amount),
+        }
+
+        self.assertEqual(validate_signed_population(plan), plan['cur_population'])
+
+    def test_signed_population_accepts_aggregate_summary_over_cur_input_limit(self):
+        record_cost='9' * MAX_COST_DIGITS
+        total=exact_add([record_cost, record_cost])
+        cost_text=format(total, 'f')
+        plan={
+            'count': 2,
+            'records': [
+                {'effective_usage_cost_usd': record_cost},
+                {'effective_usage_cost_usd': record_cost},
+            ],
+            'cur_population': sample_population(count=2, cost=cost_text),
+        }
+
+        self.assertEqual(validate_signed_population(plan), plan['cur_population'])
+
+    def test_kind_precap_rejects_aggregate_amount_over_aggregate_digit_limit(self):
+        amount='1' + '0' * MAX_AGGREGATE_DIGITS
+        precap=self.kind_precap({'volume': (1, amount)})
+
+        with self.assertRaises((ValueError, CurBudgetExceeded)):
+            validate_kind_precap(
+                {'cur_population_by_kind': precap},
+                sample_population(count=1, cost=amount))
+
+    def test_kind_precap_rejects_selected_record_count_mismatch(self):
+        precap=self.kind_precap({'instance': (1, '1')})
+        plan={
+            'count': 1,
+            'records': [{'kind': 'volume', 'effective_usage_cost_usd': '1'}],
+            'cur_population': sample_population(),
+            'cur_population_by_kind': precap,
+        }
+
+        with self.assertRaises(ValueError):
+            validate_signed_population(plan)
+
+    def test_kind_precap_rejects_selected_record_cost_mismatch(self):
+        precap=self.kind_precap({
+            'volume': (1, '2'),
+            'instance': (1, '1'),
+        })
+        plan={
+            'count': 2,
+            'records': [
+                {'kind': 'volume', 'effective_usage_cost_usd': '1'},
+                {'kind': 'instance', 'effective_usage_cost_usd': '2'},
+            ],
+            'cur_population': sample_population(count=2, cost='3'),
+            'cur_population_by_kind': precap,
+        }
+
+        with self.assertRaises(ValueError):
+            validate_signed_population(plan)
+
     def test_reason_details_rejected_for_unknown_billing_class(self):
         from name_tag_batch_population import validate_reason_details
         population=sample_population()
