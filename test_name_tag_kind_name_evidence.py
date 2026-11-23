@@ -126,6 +126,14 @@ class VolumeEvidenceTests(unittest.TestCase):
                 evidence_module.verified_generated_name({**_volume_record(), "proposed_name": name},
                                                         self.target())
 
+    def test_locator_mismatch_rejected_before_verifier(self):
+        verifier = mock.Mock()
+        with mock.patch.dict(evidence_module._VERIFIERS, {"volume": verifier}):
+            with self.assertRaises(evidence_module.NameEvidenceNotProven):
+                evidence_module.verified_generated_name(
+                    {**_volume_record(), "locator": "vol-0123456789abcdef0"}, self.target())
+        verifier.verify.assert_not_called()
+
     def test_volume_evidence_legacy_unchanged(self):
         plan = _plan([_volume_record()], [_scope([VOL_ARN])])
         row = _approve(plan).approved_rows[0]

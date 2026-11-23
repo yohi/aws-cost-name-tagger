@@ -2439,6 +2439,27 @@ class PaginationFailClosedPRBR3Tests(unittest.TestCase):
 
 
 
+class BatchReportArnIdentityTests(unittest.TestCase):
+    def test_batch_empty_arn_is_preserved_but_legacy_report_falls_back(self):
+        import csv
+        import tempfile
+        from pathlib import Path
+
+        record = {"kind": "volume", "locator": "vol-0123456789abcdef0",
+                  "region": "ap-northeast-1", "resource_arn": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = Path(tmp) / "batch.csv"
+            legacy = Path(tmp) / "legacy.csv"
+            t.write_action_csv(batch, [record], "123456789012", mode="batch-plan")
+            t.write_action_csv(legacy, [record], "123456789012", mode="plan")
+            with batch.open(encoding="utf-8-sig", newline="") as fh:
+                batch_arn = next(csv.DictReader(fh))["resource_arn"]
+            with legacy.open(encoding="utf-8-sig", newline="") as fh:
+                legacy_arn = next(csv.DictReader(fh))["resource_arn"]
+        self.assertEqual(batch_arn, "")
+        self.assertEqual(legacy_arn, "arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-0123456789abcdef0")
+
+
 class CURIntegrityBoundsPR13Tests(unittest.TestCase):
     """AUD-001/003: CUR input checks always run before AWS/session access."""
 

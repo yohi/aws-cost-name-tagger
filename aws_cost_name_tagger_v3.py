@@ -1651,11 +1651,14 @@ def _project_pre_sign_identity(record: dict, partition: str, account: str) -> No
     """
     from name_tag_kind_capabilities import project_pre_sign_kind_target
 
-    kind, locator = record["kind"], record["locator"]
+    kind, original_locator = record["kind"], record["locator"]
+    locator = original_locator
     target = str(record.get("write_target") or "")
     arn = target if target.startswith("arn:") else None
     if kind == "apigw_stage" and isinstance(locator, str) and locator.count("|") >= 2:
         arn = arn or locator.split("|", 2)[2]
+        locator = arn
+    elif kind == "rds_cluster" and arn:
         locator = arn
     try:
         projected = project_pre_sign_kind_target(
@@ -1671,6 +1674,10 @@ def _project_pre_sign_identity(record: dict, partition: str, account: str) -> No
     record["resource_arn"] = projected.identity.resource_arn
     record["region"] = projected.identity.scope_region
     record["aws_operation"] = projected.aws_operation
+    if kind == "apigw_stage":
+        record["locator"] = projected.identity.resource_arn
+    elif kind == "rds_cluster":
+        record["locator"] = original_locator
 
 
 def _reject_identity_collisions(records: list[dict]) -> None:
@@ -1712,7 +1719,8 @@ def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str
         for row in records:
             result = row.get("result", row.get("status", ""))
             new_name = row.get("name", row.get("proposed_name", ""))
-            arn = row.get("resource_arn") or resource_arn(row, account)
+            arn = (row.get("resource_arn", "") if mode == "batch-plan"
+                   else row.get("resource_arn") or resource_arn(row, account))
             values = {
                 "utc": timestamp, "account": account, "mode": mode,
                 "result": result, "resource_arn": arn,
