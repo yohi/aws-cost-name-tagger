@@ -175,6 +175,22 @@ def _thread_spawn(fn: Callable[[], None]) -> None:
     threading.Thread(target=fn, daemon=True).start()
 
 
+class _ConnectionSlotReservation:
+    """A connection-capacity slot with idempotent ownership transfer to one worker."""
+
+    def __init__(self, release: Callable[[], None]) -> None:
+        self._release_callback = release
+        self._guard = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        with self._guard:
+            if self._released:
+                return
+            self._released = True
+        self._release_callback()
+
+
 class ProtectedHostIPCServer:
     """The only Host listener and decoder dispatch; one serial active Batch."""
 
@@ -263,8 +279,18 @@ class ProtectedHostIPCServer:
                     conn, _addr = listener.accept()
                 except OSError:
                     return  # listener closed/failed: stop serving, never rebind
-                self._spawn(lambda c=conn: self.handle_connection(
-                    c, bootstrap=bootstrap, endpoint=endpoint))
+                reservation = self._reserve_connection_slot()
+                if reservation is None:
+                    code = IPC_PEER_REJECTED if not self._peer_admitted(conn) else IPC_BUSY
+                    self._send(conn, _pre_accept(None, code))
+                    self._close_connection(conn)
+                    continue
+                try:
+                    self._spawn(lambda c=conn, r=reservation: self.handle_connection(
+                        c, bootstrap=bootstrap, endpoint=endpoint, reservation=r))
+                except Exception:  # noqa: BLE001 - worker creation must not strand the accept loop
+                    reservation.release()
+                    self._close_connection(conn)
         finally:
             listener.close()
 
@@ -276,39 +302,58 @@ class ProtectedHostIPCServer:
             with self._guard:
                 self.response_write_failures += 1
 
-    def _slot(self) -> bool:
+    @staticmethod
+    def _close_connection(conn: object) -> None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - close failure cannot strand the accept loop
+            pass
+
+    def _reserve_connection_slot(self) -> _ConnectionSlotReservation | None:
         with self._guard:
             if self._connections >= self._max_connections:
-                return False
+                return None
             self._connections += 1
-            return True
+        return _ConnectionSlotReservation(self._release_connection_slot)
+
+    def _release_connection_slot(self) -> None:
+        with self._guard:
+            if self._connections <= 0:
+                raise RuntimeError("connection slot underflow")
+            self._connections -= 1
+
+    def _peer_admitted(self, conn: object) -> bool:
+        try:
+            return self._policy.admits(self._os.peer_credentials(conn))
+        except Exception:  # noqa: BLE001 - unreadable credentials are a rejection
+            return False
 
     def handle_connection(self, conn: object, *, bootstrap: HostBootstrapVerifier,
-                          endpoint: ProtectedHostCommandEndpoint) -> None:
+                          endpoint: ProtectedHostCommandEndpoint,
+                          reservation: _ConnectionSlotReservation | None = None) -> None:
         try:
-            self._serve_connection(conn, bootstrap, endpoint)
+            self._serve_connection(conn, bootstrap, endpoint, reservation)
         finally:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
+            self._close_connection(conn)
+            if reservation is not None:
+                reservation.release()
 
-    def _serve_connection(self, conn: object, bootstrap, endpoint) -> None:
-        try:
-            admitted = self._policy.admits(self._os.peer_credentials(conn))
-        except Exception:  # noqa: BLE001 - unreadable credentials are a rejection
-            admitted = False
-        if not admitted:
+    def _serve_connection(self, conn: object, bootstrap, endpoint,
+                          reservation: _ConnectionSlotReservation | None = None) -> None:
+        if not self._peer_admitted(conn):
             self._send(conn, _pre_accept(None, IPC_PEER_REJECTED))
             return
-        if not self._slot():  # only admitted peers are told BUSY by the connection cap
-            self._send(conn, _pre_accept(None, IPC_BUSY))
-            return
+        owns_reservation = reservation is None
+        if owns_reservation:
+            reservation = self._reserve_connection_slot()
+            if reservation is None:
+                self._send(conn, _pre_accept(None, IPC_BUSY))
+                return
         try:
             self._read_and_run(conn, bootstrap, endpoint)
         finally:
-            with self._guard:
-                self._connections -= 1
+            if owns_reservation:
+                reservation.release()
 
     def _read_and_run(self, conn: object, bootstrap, endpoint) -> None:
         try:
