@@ -2523,6 +2523,38 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
             self.assertEqual(population['unsupported_kind'],
                              {'known':True,'billing_rows':0,'cost_usd':'0'})
 
+    def test_batch_s3_regional_aliases_aggregate_before_threshold_and_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'cur.csv.gz'
+            bucket='regional-alias-bucket'
+            other='other-bucket'
+            self.write_cur(path,[
+                self.row(line_item_resource_id=bucket,line_item_product_code='AmazonS3',
+                         product_region_code='us-east-1',line_item_unblended_cost='0.6'),
+                self.row(line_item_resource_id=bucket,line_item_product_code='AmazonS3',
+                         product_region_code='eu-west-1',line_item_unblended_cost='0.6'),
+                self.row(line_item_resource_id=other,line_item_product_code='AmazonS3',
+                         product_region_code='us-west-2',line_item_unblended_cost='1.1'),
+            ])
+
+            _,candidates,population,_,kind_precap=t.cur_candidates_batch(
+                [str(path)],'2026-10',1,1,ACCOUNT,kind_filter={'s3_bucket'})
+
+            self.assertEqual(
+                [(row['locator'],row['region'],row['effective_usage_cost_usd'])
+                 for row in candidates],
+                [(bucket,'us-east-1','1.2')])
+            self.assertEqual(population['cur_recognized'],
+                             {'count':2,'cost_usd':'2.3'})
+            self.assertEqual(population['below_min_cost'],
+                             {'count':0,'cost_usd':'0'})
+            self.assertEqual(population['lookup_selected'],
+                             {'count':1,'cost_usd':'1.2'})
+            self.assertEqual(population['max_resources_not_inspected'],
+                             {'count':1,'cost_usd':'1.1'})
+            self.assertEqual(kind_precap['kinds']['s3_bucket']['lookup_selected'],
+                             {'count':1,'cost_usd':'1.2'})
+
     def test_batch_population_separates_unattributable_unsupported_and_filtered_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'cur.csv.gz'
