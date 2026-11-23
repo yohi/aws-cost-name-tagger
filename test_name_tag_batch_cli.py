@@ -215,4 +215,24 @@ class CliTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_offline_commands_never_build_the_live_ipc_client(self):
+        with tempfile.TemporaryDirectory() as d:
+            d=pathlib.Path(d)
+            for name in ('plan.json','review.csv','envelope.json'):
+                (d/name).write_text('{}');(d/name).chmod(0o600)
+            previous=pathlib.Path.cwd()
+            os.chdir(d)
+            try:
+                with patch('name_tag_batch_ipc.UnixBatchHostClient',
+                           side_effect=AssertionError('offline command reached IPC')), \
+                        contextlib.redirect_stderr(io.StringIO()), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    for argv in (['batch-dryrun','--plan','plan.json','--review','review.csv','--report-out','a.json'],
+                                 ['verify-batch','--plan','plan.json','--review','review.csv','--envelope','envelope.json','--report-out','b.json'],
+                                 ['batch-live','--plan','plan.json','--review','review.csv','--envelope','envelope.json','--report-out','c.json']):
+                        self.assertEqual(main(argv),2)  # batch-live without --live-opt-in
+                self.assertEqual(sorted(p.name for p in d.iterdir()),['envelope.json','plan.json','review.csv'])
+            finally:
+                os.chdir(previous)
+
 if __name__=='__main__':unittest.main()

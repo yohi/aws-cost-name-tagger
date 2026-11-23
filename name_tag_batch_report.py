@@ -2,17 +2,40 @@
 from __future__ import annotations
 from decimal import Decimal,InvalidOperation
 from hashlib import sha256
+from collections.abc import Mapping
 from datetime import datetime
 from types import MappingProxyType
 from typing import Final
 from name_tag_batch_state import validate_batch_draft, BatchValidationError
 from name_tag_batch_state import derive_declared_row_scope
 from name_tag_batch_approval import VerifiedBatchApproval, revalidate_verified_batch, BatchAuthRejected
-from name_tag_batch_outcomes import BatchOutcomeError,reconcile_batch_outcomes
+from name_tag_batch_outcomes import BatchOutcomeError,kind_outcome_partition,reconcile_batch_outcomes
+from name_tag_kind_capabilities import (
+    CNP_REASON_CODES, REGISTRY_KINDS, REGISTRY_VERSION, STATUSES, KindCapabilityDecision,
+    resolve_kind_capability)
 
 class ReportBlocked(ValueError):pass
 
 _WRITE_OPERATIONS:Final=MappingProxyType({'volume':'ec2:CreateTags'})
+
+COVERAGE_SCHEMA:Final='kind-capability-coverage/1'
+PRECAP_FROM_SIGNED_PLAN:Final='SIGNED_PLAN_CUR_POPULATION_BY_KIND'
+PRECAP_KIND_BREAKDOWN_NOT_AVAILABLE:Final='PRECAP_KIND_BREAKDOWN_NOT_AVAILABLE'
+LIVE_ACCEPTANCE_NOT_RUN:Final='NOT_RUN'
+# Mirrors name_tag_batch_live._LIVE_DISPATCH_BLOCKED (parity asserted in tests); kept local so
+# the no-send preview never imports the Ledger/live modules.
+_LIVE_NOT_DISPATCHABLE:Final=MappingProxyType({'s3_bucket':'TAG_SET_REPLACEMENT_NOT_PROVEN'})
+# Outcomes that only an approved (signed, validated) proven-Kind row can carry.
+_APPROVED_ROW_OUTCOMES:Final=frozenset({
+    'NOT_ATTEMPTED_UNSIGNED_PREVIEW','NOT_ATTEMPTED_OWNER_VERIFIED','NOT_ATTEMPTED_CAP',
+    'NOT_ATTEMPTED_BATCH_STOP','SKIPPED_NAME_CHANGED','APPLIED_VERIFIED','OUTCOME_UNKNOWN',
+    'UNRESOLVED_WRITE_INTENT',
+})
+_REPORTED_OUTCOMES:Final=_APPROVED_ROW_OUTCOMES|frozenset({
+    'UNAPPROVED','ALREADY_NAMED','WRITE_UNSUPPORTED','WRITE_OPERATION_UNRESOLVED',
+    'SCOPE_NOT_APPLIED','NAME_GENERATION_UNAVAILABLE','NAME_STATE_UNKNOWN',
+    'METADATA_READ_FAILED','MANUAL_REVIEW',
+})
 
 
 def _sum_exact(a,b):
@@ -89,8 +112,141 @@ def _validated_reason_details(plan,population):
     except ValueError as error:raise ReportBlocked(str(error)) from error
 
 
+def production_kind_decisions()->Mapping[str,KindCapabilityDecision]:
+    """The trusted Registry decisions, in stable Registry order."""
+    return MappingProxyType({kind:resolve_kind_capability(kind) for kind in REGISTRY_KINDS})
+
+
+def _row_capability(row):
+    kind=row.get('kind')
+    if kind not in REGISTRY_KINDS:
+        return None,None
+    decision=resolve_kind_capability(kind)
+    return decision.status,decision.reason_code
+
+
+def _validated_decisions(decisions):
+    if not isinstance(decisions,Mapping) or set(decisions)!=set(REGISTRY_KINDS):
+        raise ReportBlocked('Kind decisions must cover exactly the 18 Registry Kinds')
+    for kind in REGISTRY_KINDS:
+        decision=decisions[kind]
+        if (type(decision) is not KindCapabilityDecision or decision.kind!=kind
+                or decision.status not in STATUSES or decision.version!=REGISTRY_VERSION
+                or type(decision.reason_code) is not str or not decision.reason_code):
+            raise ReportBlocked('Malformed Kind capability decision')
+        if decision.status=='CAPABILITY_NOT_PROVEN' and decision.reason_code not in CNP_REASON_CODES:
+            raise ReportBlocked('Ungrounded CAPABILITY_NOT_PROVEN reason')
+        if decision.status in ('IMPLEMENTED_OFFLINE','LIVE_GATE_PENDING') and not decision.evidence_refs:
+            raise ReportBlocked('Kind capability claims lack evidence')
+    return decisions
+
+
+def _validated_row_outcomes(row_outcomes,count):
+    if (not isinstance(row_outcomes,Mapping) or any(type(i) is not int for i in row_outcomes)
+            or set(row_outcomes)!=set(range(count))
+            or any(row_outcomes[i] not in _REPORTED_OUTCOMES for i in range(count))):
+        raise ReportBlocked('Row outcomes must name one known outcome for every signed row')
+    return row_outcomes
+
+
+def _offline_dispatch(decision):
+    if decision.status!='IMPLEMENTED_OFFLINE':
+        reason=decision.reason_code
+    elif decision.tag_set_replacement:
+        reason='UNSUPPORTED_BY_POLICY'
+    else:
+        from name_tag_kind_adapters import _PROMOTION_BLOCKS
+        reason=_PROMOTION_BLOCKS.get(decision.kind) or _LIVE_NOT_DISPATCHABLE.get(decision.kind)
+    return {'dispatchable':reason is None,'block_reason':reason}
+
+
+def _checked_signed_rows(records,decisions,outcomes):
+    """Reject forged signed content; never downgrade it to an unsupported/unapproved skip."""
+    from name_tag_batch_population import exact_add as _exact_add
+    selected={kind:[] for kind in REGISTRY_KINDS}
+    rows=[]
+    for index,record in enumerate(records):
+        kind=record.get('kind') if type(record) is dict else None
+        if kind not in REGISTRY_KINDS:
+            raise ReportBlocked('Signed row Kind is not a Registry Kind')
+        decision=decisions[kind]
+        operation=record.get('aws_operation')
+        if operation is not None and (operation!=decision.write_operation
+                                      or decision.status!='IMPLEMENTED_OFFLINE'):
+            raise ReportBlocked('Signed row operation is not a proven Kind write')
+        if outcomes[index] in _APPROVED_ROW_OUTCOMES and (operation is None or record.get('status')!='proposed'):
+            raise ReportBlocked('Attempt outcome claimed for an unsignable row')
+        cost=_cost(record.get('effective_usage_cost_usd'))
+        selected[kind].append(cost)
+        rows.append({'kind':kind,'outcome':outcomes[index],
+                     'effective_usage_cost_usd':record['effective_usage_cost_usd']})
+    return {kind:{'count':len(costs),'cost_usd':_canonical(_exact_add(costs))}
+            for kind,costs in selected.items()},rows
+
+
+def _canonical(value):
+    from name_tag_batch_population import _canonical_decimal
+    return _canonical_decimal(value)
+
+
+def report_kind_capability_coverage(
+    plan:Mapping[str,object],
+    decisions:Mapping[str,KindCapabilityDecision],
+    row_outcomes:Mapping[int,str],
+)->dict[str,object]:
+    """18-Kind coverage: signed pre-cap source, capability axis and outcome axis kept apart.
+
+    Kind pre-cap totals come ONLY from the signed Plan v3 ``cur_population_by_kind``; a
+    historical Plan without it reports PRECAP_KIND_BREAKDOWN_NOT_AVAILABLE (never zeros).
+    Selected records/row outcomes add post-selection detail only. Live acceptance is NOT_RUN.
+    """
+    from name_tag_batch_population import KIND_PRECAP_STAGES,validate_signed_population
+    if type(plan) is not dict:
+        raise ReportBlocked('Plan must be a decoded Batch Plan object')
+    try:
+        population=validate_signed_population(plan)  # includes the Task 2 Kind pre-cap validator
+    except (KeyError,TypeError,ValueError) as error:
+        raise ReportBlocked(str(error)) from error
+    checked=_validated_decisions(decisions)
+    outcomes=_validated_row_outcomes(row_outcomes,len(plan['records']))
+    selected,rows=_checked_signed_rows(plan['records'],checked,outcomes)
+    partition=kind_outcome_partition(rows)
+    breakdown=plan['cur_population_by_kind']['kinds'] if 'cur_population_by_kind' in plan else None
+    status=PRECAP_FROM_SIGNED_PLAN if breakdown is not None else PRECAP_KIND_BREAKDOWN_NOT_AVAILABLE
+    kinds={}
+    for kind in REGISTRY_KINDS:
+        precap=None
+        if breakdown is not None:
+            precap={stage:dict(breakdown[kind][stage]) for stage in KIND_PRECAP_STAGES}
+            if (precap['lookup_selected']['count']!=selected[kind]['count']
+                    or _cost(precap['lookup_selected']['cost_usd'])!=_cost(selected[kind]['cost_usd'])):
+                raise ReportBlocked('Signed selected rows contradict the Kind pre-cap breakdown')
+        decision=checked[kind]
+        kinds[kind]={
+            'capability':{'status':decision.status,'reason_code':decision.reason_code,
+                          'registry_version':decision.version},
+            'offline_dispatch':_offline_dispatch(decision),
+            'live_acceptance':LIVE_ACCEPTANCE_NOT_RUN,
+            'precap_status':status,'precap':precap,
+            'selected':selected[kind],
+            'outcomes':partition.get(kind,{}),
+        }
+    return {
+        'schema':COVERAGE_SCHEMA,'precap_status':status,
+        'live_acceptance':LIVE_ACCEPTANCE_NOT_RUN,
+        'precap_total':{stage:dict(population[stage]) for stage in KIND_PRECAP_STAGES},
+        'selected_total':dict(population['lookup_selected']),
+        'kinds':kinds,
+    }
+
+
 def _write_support(row):
-    operation=_WRITE_OPERATIONS.get(row.get('kind'))
+    kind=row.get('kind')
+    operation=_WRITE_OPERATIONS.get(kind)
+    if operation is None and kind in REGISTRY_KINDS:
+        decision=resolve_kind_capability(kind)
+        if decision.status=='IMPLEMENTED_OFFLINE':  # vetted Registry Kind, not a name guess
+            operation=decision.write_operation
     if operation is None:
         return 'UNSUPPORTED_API'
     if row.get('aws_operation')==operation:
@@ -129,6 +285,7 @@ def _report_row(row,row_index,plan):
     write_support=_write_support(row)
     scope_id,scope_application=_scope_application(plan,row,arn,write_support)
     name_generation_state=_name_generation_state(row)
+    capability_status,capability_reason=_row_capability(row)
     report_row={
         'row_index':row_index,'proposal_id':row.get('proposal_id'),
         'kind':row.get('kind'),'locator':row.get('locator'),'region':row.get('region'),
@@ -138,6 +295,7 @@ def _report_row(row,row_index,plan):
         'existing_name':row.get('existing_name'),'proposed_name':row.get('proposed_name'),
         'name_generation_state':name_generation_state,'write_support':write_support,
         'scope_application':scope_application,'host_scope_verified':False,'approved':row.get('approved'),
+        'capability_status':capability_status,'capability_reason_code':capability_reason,
         'status':row.get('status'),'confidence':row.get('confidence'),
         'effective_usage_cost_usd':row.get('effective_usage_cost_usd'),
         'outcome':'NOT_ATTEMPTED_UNSIGNED_PREVIEW','execution_allowed':False,
@@ -174,7 +332,11 @@ def _report(draft,authentication_state):
             'name_generation_unavailable':name_generation_unavailable,
             'cur_population_reason_details':reason_details,
             'cur_population':c}
-    return reconcile_batch_outcomes(report)
+    report=reconcile_batch_outcomes(report)
+    report['kind_capability_coverage']=report_kind_capability_coverage(
+        draft.plan,production_kind_decisions(),
+        {index:row['outcome'] for index,row in enumerate(report['rows'])})
+    return report
 
 
 def build_batch_dry_run(plan_bytes:bytes,csv_bytes:bytes):

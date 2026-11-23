@@ -1767,8 +1767,12 @@ def _batch_plan_report_fields(row: dict, scope_declarations: list[dict], account
     else:
         name_state = "NOT_EVALUATED"
     operation = row.get("aws_operation")
-    support = ("SUPPORTED_API" if row.get("kind") == "volume" and operation == "ec2:CreateTags"
-               else "UNSUPPORTED_API")
+    from name_tag_kind_capabilities import REGISTRY_KINDS, resolve_kind_capability
+    support = "UNSUPPORTED_API"
+    if row.get("kind") in REGISTRY_KINDS:
+        decision = resolve_kind_capability(row["kind"])
+        if decision.status == "IMPLEMENTED_OFFLINE" and operation == decision.write_operation:
+            support = "SUPPORTED_API"
     matches = [scope for scope in scope_declarations
                if scope.get("account") == account
                and scope.get("partition") == _arn_partition(row.get("resource_arn"), row)

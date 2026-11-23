@@ -22,6 +22,7 @@ from name_tag_batch_credentials import validate_issued_batch_session
 from name_tag_batch_iam import IAMPolicyBlocked, KindPolicy, build_subset_session_policy
 from name_tag_batch_report import ReportBlocked, make_authenticated_batch_report
 from name_tag_batch_report import reconcile_batch_outcomes
+from name_tag_batch_outcomes import _refresh_kind_coverage
 from name_tag_batch_state import classify_batch_name
 from name_tag_batch_trust import load_current_protected_owner_trust
 from name_tag_batch_fake import (
@@ -637,11 +638,69 @@ def _advance_live_row(batch, row_index, position, state, ledger, runtime, report
     return _execute_live_row(batch, row_index, ledger, runtime, state, report)
 
 
+HOST_REPORTS_DIRNAME: Final = "batch-reports"  # <StateDirectory>/batch-reports/<batch_id>/
+HOST_REPORT_INDEX_NAME: Final = "index.json"  # protected Batch ID -> published digest index
+HOST_REPORT_SCHEMA: Final = _REPORT_SCHEMA
+HOST_REPORT_INDEX_SCHEMA: Final = "aws-cnt-host-batch-report-index-v1"
+
+
+def host_report_sha256(stored: bytes) -> str:
+    """report_sha256 over the *exact stored* report bytes (domain-separated SHA-256)."""
+    return sha256(b"aws-cnt-host-batch-report-v1\x00" + stored).hexdigest()
+
+
 def _report_digest(report: Mapping[str, JsonValue]) -> tuple[str, bytes]:
     from name_tag_batch_approval import canonical_bytes
 
     body = canonical_bytes({k: v for k, v in report.items() if k != "report_sha256"})
-    return sha256(b"aws-cnt-host-batch-report-v1\x00" + body).hexdigest(), body
+    return host_report_sha256(body), body
+
+
+def _publish_report_index(batch_dir, batch_id: str, digest: str, service_uid: int) -> bool:
+    """Atomically publish and verify the protected Batch ID -> report digest index."""
+    import os
+    import secrets
+    import stat as stat_module
+    from name_tag_batch_approval import canonical_bytes
+
+    body = canonical_bytes({"schema": HOST_REPORT_INDEX_SCHEMA, "batch_id": batch_id,
+                            "report_sha256": digest})
+    temp = batch_dir / f".index-{secrets.token_hex(8)}.tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600)
+    try:
+        try:
+            view = memoryview(body)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("report index write made no progress")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, batch_dir / HOST_REPORT_INDEX_NAME)
+    except BaseException:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    dir_fd = os.open(batch_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    read_fd = os.open(batch_dir / HOST_REPORT_INDEX_NAME,
+                      os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(read_fd)
+        stored = os.read(read_fd, len(body) + 1)
+    finally:
+        os.close(read_fd)
+    return (stored == body and stat_module.S_ISREG(info.st_mode)
+            and info.st_uid == service_uid and not info.st_mode & 0o077)
 
 
 def _persist_host_report(host, batch_id: str, report: Mapping[str, JsonValue]) -> str | None:
@@ -729,6 +788,8 @@ def _persist_host_report(host, batch_id: str, report: Mapping[str, JsonValue]) -
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
+        if not _publish_report_index(batch_dir, batch_id, digest, host.service_uid):
+            return None
         return digest
     except (OSError, TypeError, ValueError):
         return None
@@ -750,6 +811,10 @@ def _complete_live_result(report, state, batch, refusal_code: str | None) -> Bat
         else outcome for outcome in state.outcomes)
     if unresolved:
         report = dict(report)
+        rows = report["rows"]
+        for row_index, outcome in zip(batch.approved_row_indexes, truthful, strict=True):
+            rows[row_index]["outcome"] = outcome
+        _refresh_kind_coverage(report, rows)
         report["outcome_reconciliation"] = "UNRESOLVED"
         report["batch_state"] = state.state
         report["send_attempts_consumed"] = state.send_attempts_consumed

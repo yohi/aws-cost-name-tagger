@@ -150,6 +150,7 @@ class LiveHarness(RealLedgerV2Case):
         self.source = ScopeSource()
         self.evidence_kind = "live"
         self.evidence_calls = 0
+        self.evidence_ttl = timedelta(minutes=10)
         self.fail_evidence_on: set[int] = set()
         self.ledger = self.open()
         self.fx = host_fixture(self)
@@ -193,7 +194,7 @@ class LiveHarness(RealLedgerV2Case):
             resource_policy_sha256=H, session_grant_sha256=H, approved_allow=(arn, action, "Name"),
             deny_cases=_deny_cases(arn, action), source="PROTECTED_EVIDENCE_PRODUCER",
             captured_at_utc=self.clock_now - timedelta(minutes=1),
-            expires_at_utc=self.clock_now + timedelta(minutes=10), captured_state_sha256=H,
+            expires_at_utc=self.clock_now + self.evidence_ttl, captured_state_sha256=H,
             current_state_sha256=H, verifier_result="PASS")
         if self.evidence_kind == "synthetic" or self.evidence_calls in self.fail_evidence_on:
             return SyntheticIamEvidenceProducer().produce(**fields)
@@ -322,6 +323,20 @@ class LiveCoordinatorStepOneTests(LiveHarness):
         blocked = self.run_blocked(batch)
         self.assertEqual(blocked.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         self.assertEqual((self.intents(), self.cloud.writes), ([], []))
+
+    def test_expired_iam_evidence_refused_before_intent_and_sdk(self):
+        # IAM evidence already expired when the Host consumes it: refused before any
+        # Intent / create_batch_intent / SDK write; no send happens after expiry.
+        self.evidence_ttl = timedelta(seconds=-1)
+        batch = self.prepare()
+        with mock.patch.object(self.ledger, "create_batch_intent",
+                               wraps=self.ledger.create_batch_intent) as create_intent:
+            blocked = self.run_blocked(batch)
+        self.assertEqual(blocked.code, "AWS_RUNTIME_NOT_AUTHORIZED")
+        create_intent.assert_not_called()
+        self.assertEqual(self.intents(), [])
+        self.assertEqual(self.cloud.writes, [])
+        self.assertGreaterEqual(self.evidence_calls, 1)
 
     def test_valid_mock_proven_host_one_permit_one_send_readback(self):
         batch = self.prepare()
@@ -862,6 +877,19 @@ class LiveRefusalWindowTests(LiveHarness):
         self.assertEqual(result.outcomes[0], "UNRESOLVED_WRITE_INTENT")
         self.assertEqual(result.report["unresolved_rows"], [batch.approved_row_indexes[0]])
         self.assertEqual(result.report["outcome_reconciliation"], "UNRESOLVED")
+        final_outcomes = dict(result.report["row_ledger_outcomes"])
+        for row_index, outcome in final_outcomes.items():
+            self.assertEqual(result.report["rows"][row_index]["outcome"], outcome)
+        coverage = result.report["kind_capability_coverage"]["kinds"]
+        expected_by_kind = {kind: {} for kind in coverage}
+        for row in result.report["rows"]:
+            counts = expected_by_kind.setdefault(row["kind"], {})
+            counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+        actual_by_kind = {
+            kind: {outcome: details["count"] for outcome, details in entry["outcomes"].items()}
+            for kind, entry in coverage.items()
+        }
+        self.assertEqual(actual_by_kind, expected_by_kind)
 
     def test_post_intent_owner_scope_recheck_and_replay_denied(self):
         batch = self.prepare()
@@ -927,16 +955,33 @@ class HostReportPersistenceTests(unittest.TestCase):
                 mock.patch.object(os, "replace", wraps=os.replace) as replace_file:
             self.assertEqual(self._persist(batch_id, report), digest)
 
-        self.assertEqual(len(created), 1)
-        temp_path, flags, mode = created[0]
-        self.assertEqual(temp_path.parent, batch_dir)
-        self.assertNotEqual(temp_path, final_path)
-        self.assertTrue(flags & os.O_EXCL)
-        self.assertTrue(flags & os.O_NOFOLLOW)
-        self.assertEqual(mode, 0o600)
-        replace_file.assert_called_once_with(temp_path, final_path)
-        self.assertFalse(temp_path.exists())
+        self.assertEqual(len(created), 2)
+        report_temp, report_flags, report_mode = created[0]
+        index_temp, index_flags, index_mode = created[1]
+        index_path = batch_dir / batch_runtime.HOST_REPORT_INDEX_NAME
+        self.assertEqual(report_temp.parent, batch_dir)
+        self.assertNotEqual(report_temp, final_path)
+        self.assertTrue(report_flags & os.O_EXCL)
+        self.assertTrue(report_flags & os.O_NOFOLLOW)
+        self.assertEqual(report_mode, 0o600)
+        self.assertEqual(index_temp.parent, batch_dir)
+        self.assertNotEqual(index_temp, index_path)
+        self.assertTrue(index_flags & os.O_EXCL)
+        self.assertTrue(index_flags & os.O_NOFOLLOW)
+        self.assertEqual(index_mode, 0o600)
+        replace_file.assert_has_calls([
+            mock.call(report_temp, final_path),
+            mock.call(index_temp, index_path),
+        ])
+        self.assertEqual(replace_file.call_count, 2)
+        self.assertFalse(report_temp.exists())
+        self.assertFalse(index_temp.exists())
         self.assertEqual(final_path.read_bytes(), body)
+        self.assertEqual(json.loads(index_path.read_bytes()), {
+            "schema": batch_runtime.HOST_REPORT_INDEX_SCHEMA,
+            "batch_id": batch_id,
+            "report_sha256": digest,
+        })
 
     def test_write_file_fsync_and_replace_failures_clean_temp_and_allow_retry(self):
         failures = (("write", "write"), ("file_fsync", "fsync"),
@@ -989,15 +1034,19 @@ class HostReportPersistenceTests(unittest.TestCase):
             self.assertEqual(self._persist(batch_id, report), digest)
 
         self.assertTrue(sync_paths[0].name.startswith(f".{digest}."))
-        self.assertEqual(sync_paths[-4:],
+        self.assertEqual(sync_paths[1:5],
                          [final_path, batch_dir, report_root, self.state_directory])
+        self.assertTrue(sync_paths[5].name.startswith(".index-"))
+        self.assertEqual(sync_paths[6], batch_dir)
 
         descriptor_paths.clear()
         sync_paths.clear()
         with mock.patch.object(os, "open", side_effect=capture_open), \
                 mock.patch.object(os, "fsync", side_effect=capture_fsync):
             self.assertEqual(self._persist(batch_id, report), digest)
-        self.assertEqual(sync_paths, [final_path, batch_dir, report_root, self.state_directory])
+        self.assertEqual(sync_paths[:4], [final_path, batch_dir, report_root, self.state_directory])
+        self.assertTrue(sync_paths[4].name.startswith(".index-"))
+        self.assertEqual(sync_paths[5], batch_dir)
 
     def test_reused_digest_requires_exact_verification_and_successful_syncs(self):
         batch_id = "e" * 64

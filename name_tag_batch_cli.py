@@ -1,12 +1,22 @@
-"""Offline Batch CLI. Simulation uses an isolated fixture Ledger and fake only."""
+"""Offline Batch CLI. Simulation uses an isolated fixture Ledger and fake only.
+
+``batch-live`` is only an *untrusted local client* of the protected Host service: it sends
+the exact Plan/CSV/Owner envelope bytes over the Task 6 IPC v1 client (literal socket path)
+once and records a bounded local summary of the reply. It holds no Host, Owner or AWS
+authority and never verifies, executes, retries or reconnects by itself.
+"""
 from __future__ import annotations
 import argparse,json,sys
 import os
+import secrets
 import stat
 from datetime import datetime,timezone
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
+import name_tag_batch_ipc
 from name_tag_batch_approval import prepare_batch_approval, BatchAuthRejected
+from name_tag_batch_approval import BATCH_NAMESPACE, canonical_bytes
 from name_tag_batch_approval import verify_batch_approval
 from name_tag_batch_state import BatchValidationError
 from name_tag_batch_state import _unique_object
@@ -194,7 +204,7 @@ def parse_offline_runtime(raw:bytes)->BatchOfflineRuntime:
 
 
 def _build_parser():
-    pa=argparse.ArgumentParser(prog='name_tag_batch_cli',description='Offline planning only; AWS/STS/write operations not available')
+    pa=argparse.ArgumentParser(prog='name_tag_batch_cli',description='Offline planning; batch-live is only an untrusted client of the protected Host service')
     subs=pa.add_subparsers(dest='command',required=True)
     for cmd in ('prepare-batch','batch-dryrun','verify-batch','batch-simulate'):
         p=subs.add_parser(cmd)
@@ -207,6 +217,10 @@ def _build_parser():
             if cmd=='batch-simulate':
                 p.add_argument('--ledger-path',required=True)
                 p.add_argument('--runtime-evidence',required=True)
+    # No socket, Host runtime, grant, row/subset, policy or request-id option exists by design.
+    live=subs.add_parser('batch-live',allow_abbrev=False)
+    for flag in ('--plan','--review','--envelope','--report-out'):live.add_argument(flag,required=True)
+    live.add_argument('--live-opt-in',action='store_true')
     return pa
 
 
@@ -218,7 +232,7 @@ def _resolve_arguments(args):
         args.manifest_out = _resolve_cli_path(args.manifest_out)
     else:
         args.report_out = _resolve_cli_path(args.report_out)
-        if args.command in ('verify-batch','batch-simulate'):
+        if args.command in ('verify-batch','batch-simulate','batch-live'):
             args.envelope = _resolve_cli_path(args.envelope)
         if args.command=='batch-simulate':
             args.ledger_path=_resolve_cli_path(args.ledger_path)
@@ -238,7 +252,85 @@ def _prepare_batch(args,plan,review):
     _write_new(args.manifest_out,_pretty(result.manifest))
 
 
+_LIVE_EXIT={'COMPLETE':0,'BLOCKED':2,'UNKNOWN':3}
+_LIVE_STATUS_MEANING={
+    'COMPLETE':('The accepted command reached a verified durable Host report, not that every '
+                'row was applied. Read the protected Host report for per-row outcomes.'),
+    'BLOCKED':('The Host refused this command or could not continue it safely. Earlier rows '
+               'of this Batch may already be durably APPLIED_VERIFIED; read the protected '
+               'Host report. Do not resubmit automatically.'),
+    'UNKNOWN':('The command outcome or its reply could not be established; Host writes may '
+               'have happened. Do not resubmit; use the Owner-authenticated read-only report '
+               'recovery.'),
+}
+
+
+def _local_live_shape_check(plan:bytes,review:bytes,envelope:bytes)->None:
+    """Deny-only local pre-check. It is never authorization: the Host re-verifies everything."""
+    try:
+        doc=json.loads(envelope.decode('utf-8'),object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError,json.JSONDecodeError,BatchValidationError) as error:
+        raise ValueError('Live envelope is not a Batch envelope JSON object') from error
+    if (type(doc) is not dict or set(doc)!={'payload','batch_id','signature_ref'}
+            or type(doc['payload']) is not dict):
+        raise ValueError('Live envelope is not a Batch envelope JSON object')
+    payload=doc['payload']
+    if (payload.get('purpose')!=BATCH_NAMESPACE
+            or payload.get('plan_sha256')!=sha256(plan).hexdigest()
+            or payload.get('csv_sha256')!=sha256(review).hexdigest()
+            or doc['batch_id']!=sha256(canonical_bytes(payload)).hexdigest()):
+        raise ValueError('Live envelope does not bind these exact Plan/CSV bytes')
+
+
+def _live_summary(response)->dict:
+    """Bounded local summary of the six-field Host reply; never a Host report or grant."""
+    return {
+        'schema':'aws-cnt-batch-live-client-summary-v1',
+        'summary_kind':'LOCAL_UNTRUSTED_HOST_REPLY_SUMMARY',
+        'request_id':response.request_id,'status':response.status,'code':response.code,
+        'batch_id':response.batch_id,'report_sha256':response.report_sha256,
+        'status_meaning':_LIVE_STATUS_MEANING[response.status],
+        'zero_writes_implied':False,'all_rows_applied_implied':False,
+        'applied_verified_asserted':False,
+        'authoritative_report':'HOST_PROTECTED_REPORT_ONLY','execution_allowed':False,
+    }
+
+
+def _batch_live(args):
+    if args.live_opt_in is not True:
+        raise ValueError('batch-live requires --live-opt-in (and the protected Host decides)')
+    if args.report_out.exists() or args.report_out.is_symlink():
+        raise ValueError('Refusing overwrite of existing output')
+    plan=_read_private(args.plan)
+    review=_read_private(args.review)
+    envelope=_read_private(args.envelope)
+    _local_live_shape_check(plan,review,envelope)
+    client=name_tag_batch_ipc.UnixBatchHostClient()
+    try:
+        response=client.execute(plan_bytes=plan,csv_bytes=review,owner_envelope_bytes=envelope,
+                                request_id=secrets.token_hex(16))
+    except name_tag_batch_ipc.IPCError as error:  # local bounds: nothing was sent
+        raise ValueError(f'Live inputs exceed IPC v1 bounds: {error.code}') from error
+    summary=_live_summary(response)
+    line=(f"batch-live: status={response.status} code={response.code} "
+          f"batch_id={response.batch_id} report_sha256={response.report_sha256}")
+    try:
+        _write_new(args.report_out,_pretty(summary))
+    except (OSError,ValueError) as error:  # e.g. output created after the precheck
+        print(f'Local summary was NOT written ({error}); the Host reply status='
+              f'{response.status} code={response.code} above stands.',
+              file=sys.stderr)
+    for output in (line, summary['status_meaning']):
+        try:
+            print(output)
+        except OSError:
+            pass  # stdout failure does not change the already-received Host outcome
+    return _LIVE_EXIT[response.status]
+
+
 def _run_command(args):
+    if args.command=='batch-live':
+        return _batch_live(args)
     plan=_read_private(args.plan)
     review=_read_private(args.review)
     if args.command=='batch-dryrun':
