@@ -225,8 +225,8 @@
     },
     {
       "path": "name_tag_batch_iam.py",
-      "sha256": "fd3c4820b8478443f5f9b389eba8ac9e0056300000a2d9754d7eee6ecc7fc284",
-      "bytes": 4954
+      "sha256": "fba10a2a031797568af96c902cf4c02ebfc0feef596c97e8a7accc077b70bff2",
+      "bytes": 8298
     },
     {
       "path": "name_tag_batch_ledger.py",
