@@ -654,7 +654,7 @@ class TombstoneTests(unittest.TestCase):
                 with self.assertRaises(HostRuntimeBlocked):
                     journal.scan()
 
-    def test_scan_rejects_malformed_finalize_temp_with_canonical_tombstone(self):
+    def test_scan_discards_malformed_finalize_temp_with_pending_tombstone(self):
         h = IssuerHarness(self, sts_kwargs={"crash": True})
         with self.assertRaises(_Crash):
             h.issue()
@@ -669,8 +669,11 @@ class TombstoneTests(unittest.TestCase):
         temp.write_bytes(b"malformed")
         temp.chmod(0o600)
 
-        with self.assertRaises(HostRuntimeBlocked):
-            journal.scan()
+        self.assertEqual(journal.scan(), (pending,))
+        self.assertFalse(temp.exists())
+        with self.assertRaises(HostRuntimeBlocked) as caught:
+            journal.assert_row_unattempted(h.batch.batch_id, 0)
+        self.assertEqual(caught.exception.code, "BLOCKED_ISSUANCE_ATTEMPT_EXISTS")
 
     def test_issuance_attempt_fsynced_before_assume_role(self):
         h = IssuerHarness(self)

@@ -489,7 +489,7 @@ class IssuanceAttemptJournal:
         return _validate_record(record, batch_id=batch_id, row_index=int(match.group(1)),
                                 row_authority_id=match.group(2))
 
-    def _read_record_file(self, path: Path) -> dict:
+    def _read_record_bytes(self, path: Path) -> bytes:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             info = os.fstat(fd)
@@ -499,6 +499,11 @@ class IssuanceAttemptJournal:
             raw = os.read(fd, _MAX_RECORD_BYTES + 1)
         finally:
             os.close(fd)
+
+        return raw
+
+    @staticmethod
+    def _parse_record_bytes(raw: bytes) -> dict:
         try:
             record = _strict_json(raw)
             if canonical_bytes(record) != raw:
@@ -506,6 +511,9 @@ class IssuanceAttemptJournal:
         except (ValueError, UnicodeDecodeError) as error:
             raise _blocked("issuance record is corrupt") from error
         return record
+
+    def _read_record_file(self, path: Path) -> dict:
+        return self._parse_record_bytes(self._read_record_bytes(path))
 
     def _validate_finalize_temp(self, path: Path, *, batch_id: str) -> None:
         match = _FINALIZE_TEMP_NAME.fullmatch(path.name)
@@ -515,12 +523,25 @@ class IssuanceAttemptJournal:
             int(match.group(1)), match.group(2), match.group(3))
         record_name = f"{match.group(1)}-{row_authority_id}.json"
         canonical = self._read_path(path.parent / record_name, batch_id=batch_id)
-        temporary = _validate_record(
-            self._read_record_file(path), batch_id=batch_id, row_index=row_index,
-            row_authority_id=row_authority_id)
+        if canonical["attempt_id"] != attempt_id:
+            raise _blocked("finalization temp does not match its canonical tombstone")
+        recoverable_pending = canonical["status"] == ISSUANCE_PENDING
+        raw = self._read_record_bytes(path)
+        try:
+            temporary = _validate_record(
+                self._parse_record_bytes(raw), batch_id=batch_id, row_index=row_index,
+                row_authority_id=row_authority_id)
+        except HostRuntimeBlocked:
+            if not recoverable_pending:
+                raise
+            try:
+                os.unlink(path)
+                self._sync_dir(path.parent)
+            except OSError as error:
+                raise _blocked("incomplete finalization temp could not be removed") from error
+            return
         if (temporary["status"] not in _FINAL_STATES
                 or temporary["attempt_id"] != attempt_id
-                or canonical["attempt_id"] != attempt_id
                 or (canonical["status"] == ISSUANCE_PENDING
                     and any(temporary[key] != canonical[key]
                             for key in ("batch_id", "row_index", "row_authority_id",
