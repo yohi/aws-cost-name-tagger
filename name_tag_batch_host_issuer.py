@@ -16,8 +16,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields as dataclass_fields
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from threading import Lock
 from typing import Final, Protocol
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 from name_tag_batch_approval import canonical_bytes
 from name_tag_batch_host_runtime import (
@@ -336,14 +337,55 @@ class HostIssuedSession(_NonCopyable):
         """Read/write/readback clients from the same explicit triplet and session."""
         require_issued_session(self, self._host, now_utc)
         akid, secret, token = self._triplet
-        return self._factory.create(service, region, access_key_id=akid,
-                                    secret_access_key=secret, session_token=token)
+        client = self._factory.create(service, region, access_key_id=akid,
+                                      secret_access_key=secret, session_token=token)
+        _register_issued_sdk_client(self, client)
+        return client
 
 
 _SESSION_MINT: Final = object()
 _SESSIONS: WeakKeyDictionary = WeakKeyDictionary()
 _INTENT_ADMITTED: WeakKeyDictionary = WeakKeyDictionary()
 _NAME_BINDINGS: dict[str, tuple[str, str]] = {}
+_ISSUED_SDK_CLIENTS: list[tuple[object, object]] = []
+_ISSUED_SDK_CLIENTS_LOCK = Lock()
+
+
+def _register_issued_sdk_client(issued: HostIssuedSession, client: object) -> None:
+    try:
+        client_ref, issued_ref = ref(client), ref(issued)
+    except TypeError as error:
+        raise _blocked("SDK client cannot be bound to its Host-issued session") from error
+    with _ISSUED_SDK_CLIENTS_LOCK:
+        retained = []
+        already_registered = False
+        for registered_client_ref, registered_issued_ref in _ISSUED_SDK_CLIENTS:
+            registered_client = registered_client_ref()
+            registered_issued = registered_issued_ref()
+            if registered_client is None or registered_issued is None:
+                continue
+            if registered_client is client:
+                if registered_issued is not issued:
+                    raise _blocked("SDK client is already bound to another issued session")
+                already_registered = True
+            retained.append((registered_client_ref, registered_issued_ref))
+        if not already_registered:
+            retained.append((client_ref, issued_ref))
+        _ISSUED_SDK_CLIENTS[:] = retained
+
+
+def require_issued_sdk_client(issued: object, client: object) -> object:
+    """Accept only the exact SDK client registered by this live issued session."""
+    if type(issued) is not HostIssuedSession:
+        raise _blocked("SDK client is not bound to a Host-issued session")
+    require_issued_session(issued, issued._host, None)
+    with _ISSUED_SDK_CLIENTS_LOCK:
+        registered = any(
+            registered_client_ref() is client and registered_issued_ref() is issued
+            for registered_client_ref, registered_issued_ref in _ISSUED_SDK_CLIENTS)
+    if not registered:
+        raise _blocked("SDK client was not created by this Host-issued session")
+    return client
 
 
 def require_issued_session(issued: object, host: object, now_utc: datetime | None
@@ -498,6 +540,7 @@ class HostBatchCredentialIssuer:
         if (fresh.batch_id != selection.batch.batch_id
                 or fresh.canonical_payload_bytes != selection.batch.canonical_payload_bytes):
             raise _blocked("batch differs from the Host selection", "BLOCKED_OWNER_AUTHN")
+        self._recheck_selection_state(selection, fresh, host)
         authority = selection.row_authority
         kind = authority.row["kind"]
         try:
@@ -583,6 +626,24 @@ class HostBatchCredentialIssuer:
             _SESSIONS.pop(session, None)
             raise
         return session
+
+    @staticmethod
+    def _recheck_selection_state(selection, fresh, host) -> None:
+        """Pre-STS: a stale selection never reaches the tombstone or AssumeRole."""
+        from name_tag_batch_host_runtime import bound_ledger, read_batch_snapshot
+
+        ledger = bound_ledger(host)
+        snapshot = read_batch_snapshot(ledger, fresh, signed_cap=selection.signed_cap,
+                                       row_count=len(fresh.approved_row_indexes))
+        if snapshot != selection.snapshot:
+            raise _blocked("Ledger state changed since selection", "BLOCKED_SCOPE_STATE_UNKNOWN")
+        for scope_id in sorted({row["writer_control_scope_id"] for row in fresh.approved_rows}):
+            try:
+                scope_state = ledger.effective_scope_state(scope_id)  # type: ignore[attr-defined]
+            except Exception as error:  # noqa: BLE001
+                raise _blocked("Scope state unreadable", "BLOCKED_SCOPE_STATE_UNKNOWN") from error
+            if scope_state != "CLEARED":
+                raise _blocked("signed Scope not CLEARED", "BLOCKED_SCOPE_HOLD")
 
     @staticmethod
     def _unresolved(journal, pending, now: datetime) -> None:

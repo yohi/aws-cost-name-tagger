@@ -292,7 +292,7 @@ class RuntimeGrantTests(unittest.TestCase):
                 attempt(grant)
         with self.assertRaises(HostRuntimeBlocked) as caught:
             consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW)  # the dispatch boundary is live-only
+                                  client=object(), now_utc=NOW)  # the dispatch boundary is live-only
         self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         with self.assertRaises(HostRuntimeBlocked):  # consumed even by the refused attempt
             consume_offline_synthetic_grant(grant, row=g.authority, permit=permit,
@@ -393,7 +393,7 @@ class GrantFixRoundTests(unittest.TestCase):
     def test_dispatch_boundary_has_no_live_flag_and_synthetic_cannot_dispatch(self):
         import inspect
         self.assertEqual(sorted(inspect.signature(consume_runtime_grant).parameters),
-                         ["grant", "now_utc", "permit", "row", "target"])
+                         ["client", "grant", "now_utc", "permit", "row", "target"])
         g = GrantHarness(self)
         grant, scope, permit = g.grant()
         with self.assertRaises(TypeError):
@@ -401,7 +401,7 @@ class GrantFixRoundTests(unittest.TestCase):
                                   now_utc=NOW, require_live=False)
         with self.assertRaises(HostRuntimeBlocked) as caught:
             consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW)
+                                  client=object(), now_utc=NOW)
         self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         g2 = GrantHarness(self)
         grant2, scope2, permit2 = g2.grant()
@@ -414,7 +414,7 @@ class GrantFixRoundTests(unittest.TestCase):
         object.__setattr__(grant, "provenance", LIVE_PROVENANCE)
         with self.assertRaises(HostRuntimeBlocked):
             consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW)
+                                  client=object(), now_utc=NOW)
         for verifier in (ProtectedHostRuntimeVerifier, OfflineSyntheticRuntimeVerifier):
             with self.subTest(verifier=verifier.__name__):
                 g = GrantHarness(self)

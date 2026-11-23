@@ -120,8 +120,8 @@
     },
     {
       "path": "name_tag_ledger.py",
-      "sha256": "cfe0df86fce12848a8e63465637a9f7cc3285c7684b276b19af1ffcda013e7a2",
-      "bytes": 106513
+      "sha256": "cc48b19b260e03d5cccd5f4effe425ce7462258aa17a596645c96aa2909d83ce",
+      "bytes": 115595
     },
     {
       "path": "name_tag_ledger_anchor.py",
@@ -260,8 +260,8 @@
     },
     {
       "path": "name_tag_batch_runtime.py",
-      "sha256": "ede5f8f5e69f9cd6dda4706f724bdd789a9fcc2905a841dbb3e423322ab5bd35",
-      "bytes": 14036
+      "sha256": "a7cb7e93f16fee22bf50c02ef506023f9375619f003c3450a38e00bd2b9770cb",
+      "bytes": 40481
     },
     {
       "path": "name_tag_batch_trust.py",
@@ -295,8 +295,8 @@
     },
     {
       "path": "test_name_tag_batch_ledger.py",
-      "sha256": "01f581fa9c3fc6e04d070ccdbc2f7925efcd33a2f9bfa7bb49f6cf165d039f6f",
-      "bytes": 7060
+      "sha256": "1168cd1f1e5fb8708c0e485a7d056073165f269f43133cf00b63811987b9a913",
+      "bytes": 37284
     },
     {
       "path": "test_name_tag_batch_migration.py",

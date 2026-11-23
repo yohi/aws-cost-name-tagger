@@ -21,6 +21,7 @@ from dataclasses import dataclass, fields as dataclass_fields
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from types import MappingProxyType
 from typing import Final, Protocol
 from weakref import WeakKeyDictionary
@@ -50,12 +51,35 @@ _ROLE_ARN = re.compile(r"arn:(aws|aws-cn|aws-us-gov):iam::\d{12}:role/[A-Za-z0-9
 
 
 class HostRuntimeBlocked(RuntimeError):
-    """A Host gate is missing or failed; nothing downstream (STS/Intent/Permit) may run."""
+    """A Host gate is missing or failed; nothing downstream (STS/Intent/Permit) may run.
 
-    def __init__(self, code: str = AWS_RUNTIME_NOT_AUTHORIZED, detail: str = "") -> None:
+    ``batch_id``/``report_sha256`` (hex64 or None) identify a protected durable partial
+    report when the refusal happened after earlier rows reached a durable outcome
+    (RG-PRC-008); malformed values are dropped, never forwarded.
+    """
+
+    def __init__(self, code: str = AWS_RUNTIME_NOT_AUTHORIZED, detail: str = "", *,
+                 batch_id: str | None = None, report_sha256: str | None = None) -> None:
         super().__init__(code if not detail else f"{code}: {detail}")
         self.code = code
         self.detail = detail
+        valid = (lambda v: v if type(v) is str and _HEX64.fullmatch(v) else None)
+        self.batch_id = valid(batch_id)
+        self.report_sha256 = valid(report_sha256) if self.batch_id is not None else None
+
+
+class HostOutcomeUnknown(HostRuntimeBlocked):
+    """A possible send happened but its outcome/report is not durably verified.
+
+    Maps to IPC status UNKNOWN (never BLOCKED): the Owner must not read it as "nothing
+    happened". It never carries a report digest.
+    """
+
+    ipc_status = "UNKNOWN"
+
+    def __init__(self, code: str = "OUTCOME_UNKNOWN", detail: str = "", *,
+                 batch_id: str | None = None) -> None:
+        super().__init__(code, detail, batch_id=batch_id, report_sha256=None)
 
 
 def _blocked(detail: str, code: str = AWS_RUNTIME_NOT_AUTHORIZED) -> HostRuntimeBlocked:
@@ -176,6 +200,8 @@ class _HostBinding:
 
 
 _HOSTS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_EXECUTION_LOCKS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_EXECUTION_LOCKS_GUARD = Lock()
 
 
 def _context_digest(host: VerifiedHostContext) -> str:
@@ -205,6 +231,17 @@ def bound_ledger(host: VerifiedHostContext) -> object:
 
 def bound_journal(host: VerifiedHostContext) -> "IssuanceAttemptJournal":
     return _HOSTS[require_verified_host(host)].journal
+
+
+def host_execution_lock(host: VerifiedHostContext) -> Lock:
+    """Return the process-local serialization lock for one verified Host context."""
+    host = require_verified_host(host)
+    with _HOST_EXECUTION_LOCKS_GUARD:
+        lock = _HOST_EXECUTION_LOCKS.get(host)
+        if lock is None:
+            lock = Lock()
+            _HOST_EXECUTION_LOCKS[host] = lock
+        return lock
 
 
 def _require_hex(value: object, pattern: re.Pattern[str], what: str) -> str:
@@ -681,9 +718,16 @@ class IssuanceAttemptJournal:
 
 
 # ---------------------------------------------------------------- RG-PRC-005 selector
-_TERMINAL_ROW_OUTCOMES: Final = frozenset({
-    "APPLIED_VERIFIED", "SKIPPED_NAME_CHANGED", "SKIPPED_IAM_UNSUPPORTED", "NOT_ATTEMPTED_CAP"})
+# The Ledger's real terminal row outcomes. Only APPLIED_VERIFIED can be terminal while the
+# Batch stays ACTIVE after a consumed send (every other post-send terminal STOPs the Batch),
+# so the send counter must equal the APPLIED_VERIFIED count. The no-send terminals (proven
+# skip, cap, finalizer NOT_ATTEMPTED_BATCH_STOP) never consumed a send and never wedge the
+# selector; WRITE_INTENT_RECORDED, SEND_ATTEMPT_CONSUMED and OUTCOME_UNKNOWN still block.
+_NO_SEND_TERMINALS: Final = frozenset({
+    "SKIPPED_NAME_CHANGED", "SKIPPED_IAM_UNSUPPORTED", "NOT_ATTEMPTED_CAP",
+    "NOT_ATTEMPTED_BATCH_STOP"})
 _SEND_CONSUMING_TERMINALS: Final = frozenset({"APPLIED_VERIFIED"})
+_TERMINAL_ROW_OUTCOMES: Final = _NO_SEND_TERMINALS | _SEND_CONSUMING_TERMINALS
 _NONCE = re.compile(r"[0-9a-f]{32,128}")
 
 
@@ -715,6 +759,14 @@ def _lookup_selection(spec: object, host: object, *, pop: bool) -> HostSelection
     if pop:
         del _SELECTIONS[id(spec)]
     return selection
+
+
+def clear_selections(host: VerifiedHostContext) -> int:
+    """End of an accepted command: drop every unconsumed selection made for ``host``."""
+    stale = [key for key, selection in _SELECTIONS.items() if selection.host is host]
+    for key in stale:
+        del _SELECTIONS[key]
+    return len(stale)
 
 
 def peek_selection(spec: object, host: VerifiedHostContext) -> HostSelection:
@@ -915,16 +967,107 @@ class ProtectedBatchHostEndpoint:
         if type(self._issuer) is not HostBatchCredentialIssuer or self._coordinator is None:
             raise _blocked("no protected Host issuer/Coordinator is wired")
         now = require_aware_utc(self._clock())
+        from name_tag_ledger_errors import LedgerError
+
         try:
             batch = approval.verify_batch_approval(
                 plan_bytes, csv_bytes, owner_envelope_bytes,
                 trust=load_current_protected_owner_trust(), now_utc=now)
         except (approval.BatchAuthRejected, OSError, ValueError, TypeError) as error:
             raise _blocked("Owner verification failed", "BLOCKED_OWNER_AUTHN") from error
-        return self._coordinator.run_signed_batch(batch, host=host, issuer=self._issuer,
-                                                  now_utc=now)
+        try:
+            return self._coordinator.run_signed_batch(batch, host=host, issuer=self._issuer,
+                                                      now_utc=now)
+        except LedgerError as error:  # pre-send Ledger refusals keep their code
+            raise HostRuntimeBlocked(error.code, "Ledger refused the command") from error
+        finally:
+            with host_execution_lock(host):
+                clear_selections(host)
 
 
 def production_host_endpoint() -> ProtectedBatchHostEndpoint:
     """Production wiring in this phase: no protected issuer/Coordinator -> fail closed."""
     return ProtectedBatchHostEndpoint()
+
+
+# ---------------------------------------------------------------- Task 7 verified runtime
+HOST_PROTECTED_DISPATCH_OPT_IN: Final = "AWS_CNT_HOST_PROTECTED_DISPATCH_V1"
+
+
+class VerifiedHostRuntime(_NonCopyable):
+    """Host-only bundle for ``execute_batch_live`` (RG-PRC-004).
+
+    Holds the protected issuer, Scope verifier, effective-IAM verifier and its protected
+    evidence source, the one-shot runtime verifier, the vetted IAM Kind registry and the
+    clock. Only ``open_verified_host_runtime`` with the explicit opt-in mints one, and only
+    a registered, unaltered instance is accepted. It confers no authority by itself: every
+    send still needs the Ledger Permit and a live-only grant consumed at SDK dispatch.
+    The production wiring (``production_host_runtime``) fails closed in this phase.
+    """
+
+    __slots__ = ("host", "issuer", "scope_verifier", "iam_verifier", "iam_evidence_source",
+                 "runtime_verifier", "kind_registry", "clock", "_opted_in", "__weakref__")
+
+    def __init__(self, *, _mint: object = None, **values) -> None:
+        if _mint is not _RUNTIME_MINT:
+            raise _blocked("Host runtime is minted only by open_verified_host_runtime")
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name, value):
+        raise _blocked("Host runtime is immutable")
+
+
+_RUNTIME_MINT: Final = object()
+_RUNTIMES: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def _runtime_digest(runtime: VerifiedHostRuntime) -> tuple:
+    return tuple(id(getattr(runtime, name)) for name in VerifiedHostRuntime.__slots__[:-1])
+
+
+def open_verified_host_runtime(*, host: VerifiedHostContext, issuer: object,
+                               scope_verifier: object, iam_verifier: object,
+                               iam_evidence_source: Callable[..., object],
+                               runtime_verifier: object, kind_registry: Mapping[str, object],
+                               clock: Callable[[], datetime], opt_in: str
+                               ) -> VerifiedHostRuntime:
+    """Explicit Host opt-in; only protected (production-class) verifiers are accepted."""
+    from name_tag_batch_host_issuer import HostBatchCredentialIssuer
+    from name_tag_batch_iam_evidence import (
+        ProtectedEffectiveIamEvidenceVerifier, ProtectedHostRuntimeVerifier,
+        ProtectedHostScopeVerifier)
+
+    host = require_verified_host(host)
+    if opt_in != HOST_PROTECTED_DISPATCH_OPT_IN:
+        raise _blocked("explicit Host protected-dispatch opt-in missing")
+    if (type(issuer) is not HostBatchCredentialIssuer
+            or type(scope_verifier) is not ProtectedHostScopeVerifier
+            or type(iam_verifier) is not ProtectedEffectiveIamEvidenceVerifier
+            or type(runtime_verifier) is not ProtectedHostRuntimeVerifier
+            or not callable(iam_evidence_source) or not callable(clock)
+            or not isinstance(kind_registry, Mapping) or not kind_registry):
+        raise _blocked("Host runtime requires the protected issuer/verifiers only")
+    runtime = VerifiedHostRuntime(
+        _mint=_RUNTIME_MINT, host=host, issuer=issuer, scope_verifier=scope_verifier,
+        iam_verifier=iam_verifier, iam_evidence_source=iam_evidence_source,
+        runtime_verifier=runtime_verifier, kind_registry=MappingProxyType(dict(kind_registry)),
+        clock=clock, _opted_in=True)
+    _RUNTIMES[runtime] = (host, _runtime_digest(runtime))
+    return runtime
+
+
+def require_verified_host_runtime(runtime: object) -> VerifiedHostRuntime:
+    if type(runtime) is not VerifiedHostRuntime:
+        raise _blocked("runtime is not a protected VerifiedHostRuntime")
+    binding = _RUNTIMES.get(runtime)
+    if (binding is None or binding[0] is not runtime.host or binding[1] != _runtime_digest(runtime)
+            or runtime._opted_in is not True):
+        raise _blocked("Host runtime is not registered or was altered")
+    require_verified_host(runtime.host)
+    return runtime
+
+
+def production_host_runtime() -> VerifiedHostRuntime:
+    """Production in this phase: no live evidence producer exists -> fail closed."""
+    raise _blocked("protected Host dispatch runtime NOT_VERIFIED (Owner HOLD)")

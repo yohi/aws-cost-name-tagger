@@ -87,11 +87,33 @@ class AuthorizedBatchRuntimePolicy:
     permit_identity: int
 
 
-class AuthorizedBatchWritePort:
-    """Issue one injected EC2 call only when a trusted runtime gate exists."""
+# Obligation (g): the S3 adapter's tag-set-replacement property is UNPROVEN, so S3 is never a
+# dispatchable live Kind here even if a Registry decision were promoted.
+_LIVE_DISPATCH_BLOCKED: Final = {"s3_bucket": "TAG_SET_REPLACEMENT_NOT_PROVEN"}
 
-    def __init__(self, client: EC2CreateTagsClient) -> None:
+
+def live_dispatch_adapter(kind: str) -> KindWriteAdapter:
+    """Protected Registry adapter for a live dispatch; S3 stays non-dispatchable."""
+    if kind in _LIVE_DISPATCH_BLOCKED:
+        raise LiveWriteBlocked(_LIVE_DISPATCH_BLOCKED[kind])
+    return protected_registry_adapter(kind)
+
+
+class AuthorizedBatchWritePort:
+    """Issue one injected SDK call only when a genuine one-shot runtime grant is consumed.
+
+    A caller-constructed ``AuthorizedBatchRuntimePolicy`` (or anything that is not the
+    Host verifier's ``VerifiedRuntimeGrant``) is always refused. With a grant, the live-only
+    ``consume_runtime_grant`` is called at this same dispatch, before the client is touched;
+    the test-only synthetic consumer is never imported or reachable from here.
+    """
+
+    def __init__(self, client: object, *, adapter: KindWriteAdapter | None = None,
+                 target: object = None, clock=None) -> None:
         self._client = client
+        self._adapter = adapter
+        self._target = target
+        self._clock = clock
 
     def write_once(
         self,
@@ -101,5 +123,25 @@ class AuthorizedBatchWritePort:
         permit: FirstSendPermit,
         runtime: AuthorizedBatchRuntimePolicy,
     ) -> None:
-        """Refuse until a protected host verifier can mint policy provenance."""
-        raise LiveWriteBlocked("AWS_RUNTIME_NOT_AUTHORIZED")
+        from name_tag_batch_host_issuer import HostIssuedSession
+        from name_tag_batch_host_runtime import HostRuntimeBlocked
+        from name_tag_batch_iam_evidence import VerifiedRuntimeGrant, consume_runtime_grant
+
+        grant = runtime
+        if (type(grant) is not VerifiedRuntimeGrant or self._adapter is None
+                or self._target is None or self._clock is None):
+            raise LiveWriteBlocked("AWS_RUNTIME_NOT_AUTHORIZED")
+        if (type(session) is not HostIssuedSession
+                or grant.receipt_sha256 != session.receipt.receipt_sha256
+                or type(permit) is not FirstSendPermit
+                or permit.approved_name != grant.approved_name
+                or permit.resource_arn != grant.resource_arn):
+            raise LiveWriteBlocked("AWS_RUNTIME_NOT_AUTHORIZED")
+        try:
+            dispatch_binding = consume_runtime_grant(
+                grant, row=row, permit=permit, target=self._target, client=self._client,
+                now_utc=self._clock())
+        except HostRuntimeBlocked as error:
+            raise LiveWriteBlocked(error.code) from error
+        self._adapter.write_once(
+            self._client, self._target, permit.approved_name, dispatch_binding)
