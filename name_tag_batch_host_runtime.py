@@ -395,8 +395,6 @@ _RECORD_FIELDS: Final = frozenset({
     "role_session_name", "policy_sha256", "name_evidence_sha256", "attempt_id",
     "created_at_utc", "updated_at_utc", "receipt_sha256", "response_sha256", "refusal_code",
 })
-_FIXED_ON_FINALIZE: Final = _RECORD_FIELDS - {
-    "status", "updated_at_utc", "receipt_sha256", "response_sha256", "refusal_code"}
 _RECORD_NAME = re.compile(r"(0|[1-9][0-9]{0,8})-([0-9a-f]{64})\.json")
 _MAX_RECORD_BYTES: Final = 65536
 _TOMBSTONE_BLOCKED: Final = "BLOCKED_ISSUANCE_ATTEMPT_EXISTS"

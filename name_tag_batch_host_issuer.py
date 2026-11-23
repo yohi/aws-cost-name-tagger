@@ -474,7 +474,7 @@ class HostBatchCredentialIssuer:
     def issue(self, batch, subset, host: VerifiedHostContext, now_utc: datetime
               ) -> HostIssuedSession:
         from name_tag_batch_host_runtime import (
-            ISSUANCE_REFUSED, ISSUANCE_UNRESOLVED, ISSUED_VERIFIED, _current_owner_batch,
+            ISSUANCE_REFUSED, ISSUED_VERIFIED, _current_owner_batch,
             bound_journal, take_selection)
         from name_tag_batch_iam import (
             POLICY_PLAINTEXT_LIMIT, IAMPolicyBlocked, build_subset_session_policy,
