@@ -93,15 +93,22 @@ def proven(kind):
 
 
 class Ec2AdapterTests(unittest.TestCase):
-    def test_ec2_exact_one_name_request_per_7_kinds(self):
+    def test_ec2_write_rejects_unverified_grant_before_sdk_call(self):
         for kind, c in EC2_CASES.items():
             with self.subTest(kind=kind):
                 adapter = candidate_adapter(kind)
                 target = ec2_target(kind)
                 client = FakeClient()
-                adapter.write_once(client, target, "app-prod-name", GRANT)
-                self.assertEqual(client.calls, [("create_tags", {
-                    "Resources": [c["rid"]], "Tags": [{"Key": "Name", "Value": "app-prod-name"}]})])
+                for grant in (GRANT, object(), "verified"):
+                    with self.subTest(grant_type=type(grant).__name__):
+                        with self.assertRaises(AdapterRejected) as cm:
+                            adapter.write_once(client, target, "app-prod-name", grant)
+                        self.assertEqual(cm.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
+                self.assertEqual(client.calls, [])
+                self.assertEqual(adapter._spec.write_kwargs(target, "app-prod-name"), {
+                    "Resources": [c["rid"]],
+                    "Tags": [{"Key": "Name", "Value": "app-prod-name"}],
+                })
                 op, kwargs = c["read"]
                 for tags, state in ((tl(), "ABSENT"), (tl(("Name", "x"), ("Env", "p")), "NONEMPTY")):
                     rc = FakeClient({op: c["resp"](c["rid"], tags)})

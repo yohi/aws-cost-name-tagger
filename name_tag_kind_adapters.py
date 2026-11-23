@@ -30,6 +30,11 @@ _NAME_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _PROMOTION_BLOCKS = {"apigw_stage": "IAM_CONDITION_NOT_PROVEN"}
 
 
+def _is_host_issued_runtime_grant(grant: object) -> bool:
+    """Fail closed until the protected Host-side grant registry is integrated."""
+    return False
+
+
 class AdapterRejected(RuntimeError):
     def __init__(self, code: str, kind: str = "") -> None:
         super().__init__(code)
@@ -182,6 +187,8 @@ class SingleNameAdapter:
             raise AdapterRejected("NAME_INVALID", self.kind)
         if self._spec.needs_ownership_proof and not target.ownership_proof_ref:
             raise AdapterRejected("ARN_OWNER_NOT_PROVEN", self.kind)
+        if not _is_host_issued_runtime_grant(grant):
+            raise AdapterRejected("AWS_RUNTIME_NOT_AUTHORIZED", self.kind)
         self._preflight_write(client, target)
         kwargs = self._spec.write_kwargs(target, name)
         self._invoke(client, self._spec.service, self._spec.write_operation, kwargs)
