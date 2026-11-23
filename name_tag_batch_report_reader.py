@@ -372,3 +372,7 @@ def main(argv=None, *, reader: HostReportReader | None = None) -> int:
 __all__ = ["READ_NAMESPACE", "HostReportReader", "ReportReadDenied",
            "VerifiedReportReadAuthorization", "prepare_report_read_authorization",
            "production_report_reader", "verify_report_read_authorization", "main"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

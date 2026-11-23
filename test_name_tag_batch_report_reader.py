@@ -12,6 +12,9 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
+import sys
+import unittest
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
@@ -330,6 +333,21 @@ class ReportRecoveryTests(ReaderHarness):
         self.assertEqual(json.loads(out.read_bytes())["recovery_status"], "VERIFIED")
         with self.trusted(), mock.patch("sys.stderr"):
             self.assertEqual(reader_mod.main(argv, reader=self.reader()), 2)  # never overwrite
+
+
+class ReportReaderEntrypointTests(unittest.TestCase):
+    def test_script_entrypoint_validates_required_arguments(self):
+        script = Path(reader_mod.__file__)
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=script.parent,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: name_tag_batch_report_reader", result.stderr)
 
 
 if __name__ == "__main__":
