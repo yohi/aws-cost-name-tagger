@@ -208,6 +208,7 @@ def validate_response(response: object) -> HostIPCResponse:
     ok = (response.protocol_version == PROTOCOL_VERSION
           and type(response.protocol_version) is int
           and type(response.request_id) is str and _HEX32.fullmatch(response.request_id)
+          and type(response.status) is str
           and response.status in STATUSES
           and type(response.code) is str and _CODE.fullmatch(response.code)
           and (response.batch_id is None

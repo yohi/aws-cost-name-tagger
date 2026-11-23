@@ -12,11 +12,14 @@ import contextlib
 import json
 import os
 import sqlite3
+import tempfile
+import threading
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from unittest import mock
 
 import name_tag_batch_host_runtime as host_runtime
@@ -467,6 +470,129 @@ class LiveCoordinatorStepOneTests(LiveHarness):
 
 # ============================================================== RG-PRC-005
 class LiveSelectionLedgerTests(LiveHarness):
+    def test_same_host_live_executions_serialize_selection_cleanup(self):
+        batch = self.prepare()
+        runtime = self.runtime()
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        second_selection_preserved = threading.Event()
+        call_count = 0
+        errors = []
+
+        def fake_run_live(_batch, _ledger, active_runtime):
+            nonlocal call_count
+            call_number = call_count
+            call_count += 1
+            spec = object()
+            selection = host_runtime.HostSelection(
+                host=active_runtime.host, batch=batch, spec=spec, row_authority=None,
+                snapshot=None, signed_cap=1, scope_id="scope-1", capability=None,
+                target=None, name_evidence_sha256="a" * 64, selected_at_utc=self.now)
+            host_runtime._SELECTIONS[id(spec)] = selection
+            if call_number == 0:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise AssertionError("first execution was not released")
+            else:
+                second_entered.set()
+                if not release_second.wait(5):
+                    raise AssertionError("second execution was not released")
+                try:
+                    self.assertIs(host_runtime.peek_selection(spec, active_runtime.host),
+                                  selection)
+                    second_selection_preserved.set()
+                except BaseException as error:
+                    errors.append(error)
+                    raise
+            return object()
+
+        def execute():
+            try:
+                execute_batch_live(batch, self.ledger, runtime)
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=execute)
+        second = threading.Thread(target=execute)
+        with mock.patch.object(batch_runtime, "_run_live", side_effect=fake_run_live):
+            first.start()
+            self.assertTrue(first_entered.wait(5))
+            second.start()
+            try:
+                self.assertFalse(second_entered.wait(0.1))
+            finally:
+                release_first.set()
+            first.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertTrue(second_entered.wait(5))
+            release_second.set()
+            second.join(5)
+
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_selection_preserved.is_set())
+
+    def test_endpoint_selection_cleanup_uses_host_execution_lock(self):
+        batch = self.prepare(cap=1, records=[volume_record(0)])
+        endpoint = self.endpoint()
+        lock = host_runtime.host_execution_lock(self.host)
+        clear_lock_states = []
+        real_clear_selections = host_runtime.clear_selections
+
+        def clear_while_recording_lock(host):
+            self.assertIs(host, self.host)
+            clear_lock_states.append(lock.locked())
+            return real_clear_selections(host)
+
+        with self.trusted(), \
+                mock.patch("name_tag_batch_approval.verify_batch_approval",
+                           return_value=batch), \
+                mock.patch.object(host_runtime, "clear_selections",
+                                  side_effect=clear_while_recording_lock):
+            endpoint.execute_signed_batch(
+                plan_bytes=batch.plan_bytes, csv_bytes=batch.csv_bytes,
+                owner_envelope_bytes=b"{}", host=self.host)
+
+        self.assertEqual(clear_lock_states, [True, True])
+
+    def _verified_scope(self, batch):
+        record = batch.approved_rows[0]
+        arn_parts = record["resource_arn"].split(":", 5)
+        target = caps.canonical_target_identity(
+            kind=record["kind"], locator=record["locator"],
+            resource_arn=record["resource_arn"], partition=arn_parts[1],
+            account=arn_parts[4], scope_region=record["region"])
+        verifier = self.runtime().scope_verifier
+        return verifier, verifier.resolve("scope-1", target, self.host, self.now)
+
+    def test_scope_reconfirmation_accepts_reordered_valid_evidence(self):
+        batch = self.prepare()
+        verifier, verified_scope = self._verified_scope(batch)
+        self.source.effects = tuple(reversed(self.source.effects))
+
+        verifier.reconfirm(verified_scope, self.now)
+
+    def test_scope_reconfirmation_rejects_invalid_or_changed_evidence(self):
+        batch = self.prepare()
+        verifier, verified_scope = self._verified_scope(batch)
+        original = self.source.effects
+        cases = {
+            "wrong element type": ("not-side-effect-evidence", *original[1:]),
+            "duplicate target": (original[0], original[0]),
+            "missing target": original[:-1],
+            "changed content": (replace(original[0], evidence_references=("changed://evidence",)),
+                                *original[1:]),
+        }
+
+        for label, effects in cases.items():
+            with self.subTest(case=label):
+                self.source.effects = effects
+                with self.assertRaises(HostRuntimeBlocked):
+                    verifier.reconfirm(verified_scope, self.now)
+        self.source.effects = original
+
     def test_signed_row_indexes_ascending_singleton_selection(self):
         batch = self.prepare()
         self.run_live(batch)
@@ -474,7 +600,19 @@ class LiveSelectionLedgerTests(LiveHarness):
         self.assertEqual([r["row_index"] for r in self.journal()],
                          list(batch.approved_row_indexes))
         policies = [json.loads(json.loads(call)["Policy"]) for call in self.sts.calls]
-        for policy, arn in zip(policies, VOLUMES):
+        self.assertEqual(len(self.sts.calls), len(batch.approved_row_indexes))
+        self.assertEqual(len(policies), len(batch.approved_row_indexes))
+        write_arns = []
+        for policy in policies:
+            writes = [statement for statement in policy["Statement"]
+                      if "ec2:CreateTags" in statement["Action"]]
+            self.assertEqual(len(writes), 1)
+            self.assertEqual(len(writes[0]["Resource"]), 1)
+            write_arns.append(writes[0]["Resource"][0])
+        self.assertCountEqual(write_arns, [batch.approved_rows[i]["resource_arn"]
+                                           for i in batch.approved_row_indexes])
+        for position, policy in enumerate(policies):
+            arn = batch.approved_rows[batch.approved_row_indexes[position]]["resource_arn"]
             dumped = json.dumps(policy)
             self.assertIn(arn.rsplit("/", 1)[1], dumped)
             self.assertNotIn([a for a in VOLUMES if a != arn][0].rsplit("/", 1)[1], dumped)
@@ -531,6 +669,47 @@ class LiveSelectionLedgerTests(LiveHarness):
         self.assertEqual(again.batch_state, "COMPLETED")
         self.assertEqual((len(self.sts.calls), len(self.cloud.writes)), (2, 2))
 
+    def test_initial_ledger_state_error_is_unknown_with_batch_id(self):
+        batch = self.prepare()
+        runtime = self.runtime()
+        with self.trusted(), mock.patch.object(
+                self.ledger, "batch_execution_state",
+                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")):
+            with self.assertRaises(HostOutcomeUnknown) as caught:
+                execute_batch_live(batch, self.ledger, runtime)
+
+        self.assertEqual(caught.exception.batch_id, batch.batch_id)
+
+    def test_stopped_unresolved_permit_retries_scope_hold_without_resend(self):
+        batch = self.prepare([volume_record(0)], cap=1)
+        real_hold_scope = self.ledger.hold_scope
+        hold_attempts = []
+
+        def fail_first_hold(scope_id, *, reason):
+            hold_attempts.append((scope_id, reason))
+            if len(hold_attempts) == 1:
+                raise LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")
+            return real_hold_scope(scope_id, reason=reason)
+
+        with self.trusted(), mock.patch.object(
+                self.ledger, "record_readback",
+                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")), mock.patch.object(
+                    self.ledger, "hold_scope", side_effect=fail_first_hold):
+            with self.assertRaises(HostOutcomeUnknown) as caught:
+                execute_batch_live(batch, self.ledger, self.runtime())
+            self.assertEqual(caught.exception.batch_id, batch.batch_id)
+            self.assertEqual(self.state(batch).state, "STOPPED")
+            self.assertEqual(self.scope_state(), "CLEARED")
+            sends_after_first_attempt = len(self.cloud.writes)
+            sts_after_first_attempt = len(self.sts.calls)
+            result = execute_batch_live(batch, self.ledger, self.runtime())
+
+        self.assertEqual(result.batch_state, "STOPPED")
+        self.assertEqual(self.scope_state(), "HOLD")
+        self.assertEqual(len(hold_attempts), 2)
+        self.assertEqual(len(self.cloud.writes), sends_after_first_attempt)
+        self.assertEqual(len(self.sts.calls), sts_after_first_attempt)
+
 
 class LiveFirstRegistrationTests(LiveHarness):
     def test_valid_first_unregistered_sts_to_active_intent_permit(self):
@@ -578,8 +757,9 @@ class LiveFirstRegistrationTests(LiveHarness):
         with mock.patch.object(self.ledger, "batch_execution_state",
                                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")):
             blocked = self.run_blocked(batch)
-        self.assertEqual(blocked.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
-        self.assertNotIsInstance(blocked, HostOutcomeUnknown)  # pre-send: BLOCKED
+        self.assertEqual(blocked.code, "OUTCOME_UNKNOWN")
+        self.assertIsInstance(blocked, HostOutcomeUnknown)
+        self.assertEqual(blocked.batch_id, batch.batch_id)
         self.assertEqual((self.sts.calls, self.intents()), ([], []))
 
     def test_first_scope_hold_or_pending_intent_denied(self):
@@ -638,6 +818,18 @@ class LiveRefusalWindowTests(LiveHarness):
         stored = self.report_file(batch.batch_id, blocked.report_sha256)
         self.assertEqual(stored["applied_verified_count"], 0)
         self.assertEqual(stored["row_ledger_outcomes"][0][1], "NOT_ATTEMPTED_BATCH_STOP")
+        self.assertEqual(self.cloud.writes, [])
+
+    def test_report_failure_after_proven_no_send_remains_blocked(self):
+        batch = self.prepare()
+        with mock.patch.object(
+                self.ledger, "consume_first_send",
+                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")), \
+                mock.patch.object(batch_runtime, "_persist_host_report", return_value=None):
+            blocked = self.run_blocked(batch)
+
+        self.assertNotIsInstance(blocked, HostOutcomeUnknown)
+        self.assertEqual(blocked.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
         self.assertEqual(self.cloud.writes, [])
 
     def test_post_intent_uncertain_permit_stays_unresolved_and_blocks(self):
@@ -713,6 +905,166 @@ class LiveRefusalWindowTests(LiveHarness):
 
 
 # ============================================================== RG-PRC-008
+class HostReportPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_directory = Path(self._temporary.name)
+        self.host = SimpleNamespace(state_directory=str(self.state_directory),
+                                    service_uid=os.getuid())
+
+    @staticmethod
+    def _report(batch_id):
+        return {"batch_id": batch_id, "batch_state": "COMPLETED",
+                "applied_verified_count": 1}
+
+    def _paths(self, batch_id, report):
+        digest, body = batch_runtime._report_digest(report)
+        batch_dir = self.state_directory / "batch-reports" / batch_id
+        return digest, body, batch_dir, batch_dir / f"{digest}.json"
+
+    def _persist(self, batch_id, report):
+        return batch_runtime._persist_host_report(self.host, batch_id, report)
+
+    def test_new_report_uses_exclusive_temp_file_and_same_directory_replace(self):
+        batch_id = "b" * 64
+        report = self._report(batch_id)
+        digest, body, batch_dir, final_path = self._paths(batch_id, report)
+        created = []
+        real_open = os.open
+
+        def capture_open(path, flags, mode=0o777):
+            if flags & os.O_CREAT:
+                created.append((Path(path), flags, mode))
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "replace", wraps=os.replace) as replace_file:
+            self.assertEqual(self._persist(batch_id, report), digest)
+
+        self.assertEqual(len(created), 2)
+        report_temp, report_flags, report_mode = created[0]
+        index_temp, index_flags, index_mode = created[1]
+        index_path = batch_dir / batch_runtime.HOST_REPORT_INDEX_NAME
+        self.assertEqual(report_temp.parent, batch_dir)
+        self.assertNotEqual(report_temp, final_path)
+        self.assertTrue(report_flags & os.O_EXCL)
+        self.assertTrue(report_flags & os.O_NOFOLLOW)
+        self.assertEqual(report_mode, 0o600)
+        self.assertEqual(index_temp.parent, batch_dir)
+        self.assertNotEqual(index_temp, index_path)
+        self.assertTrue(index_flags & os.O_EXCL)
+        self.assertTrue(index_flags & os.O_NOFOLLOW)
+        self.assertEqual(index_mode, 0o600)
+        replace_file.assert_has_calls([
+            mock.call(report_temp, final_path),
+            mock.call(index_temp, index_path),
+        ])
+        self.assertEqual(replace_file.call_count, 2)
+        self.assertFalse(report_temp.exists())
+        self.assertFalse(index_temp.exists())
+        self.assertEqual(final_path.read_bytes(), body)
+        self.assertEqual(json.loads(index_path.read_bytes()), {
+            "schema": batch_runtime.HOST_REPORT_INDEX_SCHEMA,
+            "batch_id": batch_id,
+            "report_sha256": digest,
+        })
+
+    def test_write_file_fsync_and_replace_failures_clean_temp_and_allow_retry(self):
+        failures = (("write", "write"), ("file_fsync", "fsync"),
+                    ("replace", "replace"))
+        for position, (name, operation) in enumerate(failures, start=1):
+            with self.subTest(failure=name):
+                batch_id = f"{position:064x}"
+                report = self._report(batch_id)
+                digest, _body, batch_dir, final_path = self._paths(batch_id, report)
+                with mock.patch.object(os, operation, side_effect=OSError(name)):
+                    self.assertIsNone(self._persist(batch_id, report))
+                self.assertEqual(list(batch_dir.glob(f".{digest}.*.tmp")), [])
+                self.assertFalse(final_path.exists())
+                self.assertEqual(self._persist(batch_id, report), digest)
+
+    def test_cleanup_failure_does_not_block_retry_with_unique_temp_name(self):
+        batch_id = "c" * 64
+        report = self._report(batch_id)
+        digest, _body, batch_dir, final_path = self._paths(batch_id, report)
+        with mock.patch.object(os, "replace", side_effect=OSError("replace failed")), \
+                mock.patch.object(os, "unlink", side_effect=OSError("cleanup failed")):
+            self.assertIsNone(self._persist(batch_id, report))
+        stale_temps = list(batch_dir.glob(f".{digest}.*.tmp"))
+        self.assertEqual(len(stale_temps), 1)
+
+        self.assertEqual(self._persist(batch_id, report), digest)
+        self.assertTrue(final_path.is_file())
+        self.assertIn(stale_temps[0], list(batch_dir.glob(f".{digest}.*.tmp")))
+
+    def test_new_and_reused_reports_sync_file_then_directory_ancestry_bottom_up(self):
+        batch_id = "d" * 64
+        report = self._report(batch_id)
+        digest, _body, batch_dir, final_path = self._paths(batch_id, report)
+        report_root = batch_dir.parent
+        real_open, real_fsync = os.open, os.fsync
+        descriptor_paths = {}
+        sync_paths = []
+
+        def capture_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            descriptor_paths[fd] = Path(path)
+            return fd
+
+        def capture_fsync(fd):
+            sync_paths.append(descriptor_paths[fd])
+            return real_fsync(fd)
+
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "fsync", side_effect=capture_fsync):
+            self.assertEqual(self._persist(batch_id, report), digest)
+
+        self.assertTrue(sync_paths[0].name.startswith(f".{digest}."))
+        self.assertEqual(sync_paths[1:5],
+                         [final_path, batch_dir, report_root, self.state_directory])
+        self.assertTrue(sync_paths[5].name.startswith(".index-"))
+        self.assertEqual(sync_paths[6], batch_dir)
+
+        descriptor_paths.clear()
+        sync_paths.clear()
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "fsync", side_effect=capture_fsync):
+            self.assertEqual(self._persist(batch_id, report), digest)
+        self.assertEqual(sync_paths[:4], [final_path, batch_dir, report_root, self.state_directory])
+        self.assertTrue(sync_paths[4].name.startswith(".index-"))
+        self.assertEqual(sync_paths[5], batch_dir)
+
+    def test_reused_digest_requires_exact_verification_and_successful_syncs(self):
+        batch_id = "e" * 64
+        report = self._report(batch_id)
+        digest, body, batch_dir, final_path = self._paths(batch_id, report)
+        self.assertEqual(self._persist(batch_id, report), digest)
+
+        final_path.write_bytes(b"x" * len(body))
+        self.assertIsNone(self._persist(batch_id, report))
+        final_path.write_bytes(body)
+
+        real_open, real_fsync = os.open, os.fsync
+        descriptor_paths = {}
+
+        def capture_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            descriptor_paths[fd] = Path(path)
+            return fd
+
+        def fail_batch_directory_sync(fd):
+            if descriptor_paths[fd] == batch_dir:
+                raise OSError("directory sync failed")
+            return real_fsync(fd)
+
+        with mock.patch.object(os, "open", side_effect=capture_open), \
+                mock.patch.object(os, "fsync", side_effect=fail_batch_directory_sync):
+            self.assertIsNone(self._persist(batch_id, report))
+
+        self.assertEqual(self._persist(batch_id, report), digest)
+
+
 class LivePartialReportTests(LiveHarness):
     def _partial(self):
         batch = self.prepare()
@@ -869,6 +1221,7 @@ class CarriedObligationTests(unittest.TestCase):
 
     def test_map_endpoint_failure_after_run_is_unknown_not_escaped(self):
         from name_tag_batch_host_server import HOST_COMMAND_UNKNOWN
+        from name_tag_batch_fake import BatchRunResult
         server = ProtectedHostIPCServer(os_facade=UnavailableListenerOS(),
                                         peer_policy=PeerPolicy(frozenset(), frozenset()),
                                         host_check=lambda host: host)
@@ -877,14 +1230,32 @@ class CarriedObligationTests(unittest.TestCase):
             def verify_process(self, *, now_utc):
                 return object()
 
+        class FailingOutcomes:
+            def __init__(self):
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                raise RuntimeError("mapping bug")
+
+        outcomes = FailingOutcomes()
+        result = BatchRunResult("COMPLETED", 0, 1, 1, outcomes, False,
+                                MappingProxyType({}))
+
         class Endpoint:
+            calls = 0
+
             def execute_signed_batch(self, **kwargs):
-                return "ran"
+                self.calls += 1
+                return result
+
+        endpoint = Endpoint()
         request = HostIPCRequest(1, "1" * 32, b"p", b"c", b"e")
-        with mock.patch("name_tag_batch_host_server.map_endpoint_result",
-                        side_effect=RuntimeError("mapping bug")):
-            response = server._run_accepted(request, Bootstrap(), Endpoint())
+        response = server._run_accepted(request, Bootstrap(), endpoint)
+
         self.assertEqual((response.status, response.code), ("UNKNOWN", HOST_COMMAND_UNKNOWN))
+        self.assertEqual(response.request_id, request.request_id)
+        self.assertEqual((endpoint.calls, outcomes.iterations), (1, 1))
 
 
 if __name__ == "__main__":

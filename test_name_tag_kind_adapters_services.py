@@ -139,12 +139,11 @@ class ServiceAdapterTests(unittest.TestCase):
                 resp = c["resp"](c["arn"], tl(("Name", "x"), ("Env", "p")))
                 self.assertEqual(adapter.readback(client_for(kind, resp), target).state, "NONEMPTY")
                 wclient = client_for(kind, resp)
-                adapter.write_once(wclient, target, N, GRANT)
-                writes = [x for x in all_calls(wclient) if x[0] in ("tag_resource", "add_tags", "add_tags_to_resource")]
-                self.assertEqual(writes, [(c["write"][0], c["write"][1](c["arn"]))])
-                # exactly one write-class call and never put_bucket_tagging
-                self.assertEqual(len(writes), 1)
-                self.assertNotIn("put_bucket_tagging", [x[0] for x in all_calls(wclient)])
+                with self.assertRaises(AdapterRejected) as cm:
+                    adapter.write_once(wclient, target, N, GRANT)
+                self.assertEqual(cm.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
+                self.assertEqual(all_calls(wclient), [])
+                self.assertEqual(adapter._spec.write_kwargs(target, N), c["write"][1](c["arn"]))
 
     def test_registry_dispatch_rejects_all_11_cnp_with_reason(self):
         for kind in CASES:
@@ -219,7 +218,7 @@ class ServiceAdapterTests(unittest.TestCase):
         self.assertEqual(adapter.read_current(client, target).state, "UNKNOWN")
         with self.assertRaises(AdapterRejected) as cm:
             adapter.write_once(client, target, N, GRANT)
-        self.assertEqual(cm.exception.code, "TAG_STATE_UNKNOWN")
+        self.assertEqual(cm.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         self.assertNotIn("tag_resource", [op for op, _ in client.calls])
         # Registry/dispatch: remains CNP even when a decision claims IMPLEMENTED_OFFLINE
         with proven("apigw_stage"), self.assertRaises(AdapterUnavailable) as cm:
@@ -249,18 +248,22 @@ class ServiceAdapterTests(unittest.TestCase):
         for label, (bundle, target, code) in bundles.items():
             with self.subTest(case=label), self.assertRaises(AdapterRejected) as cm:
                 adapter.write_once(bundle, target, N, GRANT)
-            self.assertEqual(cm.exception.code, code)
-            self.assertEqual([op for op, _ in bundle.s3control.calls if op == "tag_resource"], [])
+            self.assertEqual(
+                cm.exception.code,
+                "ARN_OWNER_NOT_PROVEN" if label == "no_owner_proof" else "AWS_RUNTIME_NOT_AUTHORIZED",
+            )
+            self.assertEqual(all_calls(bundle), [])
 
     def test_s3_put_bucket_tagging_never_used(self):
         adapter = candidate_adapter("s3_bucket")
         bundle = s3_bundle({"list_tags_for_resource": {"Tags": tl(("Name", "old"), ("Keep", "me"))}})
         self.assertEqual(adapter.read_current(bundle, tgt("s3_bucket")).state, "NONEMPTY")
-        adapter.write_once(bundle, tgt("s3_bucket"), N, GRANT)
+        with self.assertRaises(AdapterRejected) as cm:
+            adapter.write_once(bundle, tgt("s3_bucket"), N, GRANT)
+        self.assertEqual(cm.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         every = [op for op, _ in bundle.s3.calls + bundle.s3control.calls]
         self.assertNotIn("put_bucket_tagging", every)
-        self.assertEqual(bundle.s3control.calls[-1][0], "tag_resource")
-        self.assertEqual(bundle.s3control.calls[-1][1]["Tags"], tl(("Name", N)))
+        self.assertNotIn("tag_resource", every)
         # the adapter refuses the forbidden operation even if routed to it internally
         with self.assertRaises(AdapterRejected):
             adapter._invoke(bundle, "s3", "put_bucket_tagging", {})

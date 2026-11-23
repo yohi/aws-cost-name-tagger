@@ -72,6 +72,8 @@ def verified_generated_name(record: Mapping[str, object],
     """Rederive the Name via the trusted per-Kind verifier selected by the signed Kind/ARN."""
     if not isinstance(target, CanonicalTargetIdentity) or record.get("kind") != target.kind:
         raise NameEvidenceNotProven(NAME_EVIDENCE_NOT_PROVEN)
+    if record.get("locator") != target.locator:
+        raise NameEvidenceNotProven(NAME_EVIDENCE_NOT_PROVEN)
     if record.get("resource_arn") != target.resource_arn:
         raise NameEvidenceNotProven(NAME_EVIDENCE_NOT_PROVEN)
     decision = _caps.resolve_kind_capability(target.kind)

@@ -363,13 +363,18 @@ class _SendTracker:
     by this command, or the Ledger already shows consumed sends for this Batch)."""
 
     def __init__(self) -> None:
-        self.possible_send = False
+        self.observed_send = False
+        self.attempt_pending = False
+
+    @property
+    def possible_send(self) -> bool:
+        return self.observed_send or self.attempt_pending
 
     def observe(self, state: BatchExecutionState) -> None:
         if state.send_attempts_consumed > 0 or any(
                 outcome in ("SEND_ATTEMPT_CONSUMED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN")
                 for outcome in state.outcomes):
-            self.possible_send = True
+            self.observed_send = True
 
 
 _TRACKER: ContextVar[_SendTracker | None] = ContextVar("aws_cnt_live_send_tracker",
@@ -379,7 +384,13 @@ _TRACKER: ContextVar[_SendTracker | None] = ContextVar("aws_cnt_live_send_tracke
 def _mark_possible_send() -> None:
     tracker = _TRACKER.get()
     if tracker is not None:
-        tracker.possible_send = True
+        tracker.attempt_pending = True
+
+
+def _clear_unsent_attempt() -> None:
+    tracker = _TRACKER.get()
+    if tracker is not None:
+        tracker.attempt_pending = False
 
 
 def _outcome_unknown(code: str, detail: str, **identity):
@@ -437,6 +448,8 @@ def _finalize_unsent_intent(ledger, batch, handle, code: str, scope_id: str):
         ledger._host_finalize_unsent_batch_intent(handle, reason_code=code, sdk_dispatches=0)
     except LedgerError:
         _durable_stop_and_hold(ledger, batch, code, scope_id)
+    else:
+        _clear_unsent_attempt()
     raise _LiveRefusal(code)
 
 
@@ -601,7 +614,7 @@ def _advance_live_row(batch, row_index, position, state, ledger, runtime, report
             report["unresolved_send_owner"] = (
                 "CURRENT_EXECUTION" if owned is True else
                 "OTHER_EXECUTION" if owned is False else "UNKNOWN")
-            if state.state == "ACTIVE":
+            if state.state in ("ACTIVE", "STOPPED"):
                 # A consumed Permit without a durable disposition: retry STOP/HOLD (never a
                 # resend). Failure keeps the Host blocked with an UNKNOWN outcome.
                 scope_id = batch.approved_rows[position].get("writer_control_scope_id")
@@ -643,7 +656,7 @@ def _report_digest(report: Mapping[str, JsonValue]) -> tuple[str, bytes]:
 
 
 def _publish_report_index(batch_dir, batch_id: str, digest: str, service_uid: int) -> bool:
-    """Atomically publish ``index.json`` (temp + fsync + rename + dir fsync), then verify it."""
+    """Atomically publish and verify the protected Batch ID -> report digest index."""
     import os
     import secrets
     import stat as stat_module
@@ -658,20 +671,28 @@ def _publish_report_index(batch_dir, batch_id: str, digest: str, service_uid: in
         try:
             view = memoryview(body)
             while view:
-                view = view[os.write(fd, view):]
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("report index write made no progress")
+                view = view[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
         os.replace(temp, batch_dir / HOST_REPORT_INDEX_NAME)
     except BaseException:
-        temp.unlink(missing_ok=True)
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
-    dir_fd = os.open(batch_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    dir_fd = os.open(batch_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
-    read_fd = os.open(batch_dir / HOST_REPORT_INDEX_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    read_fd = os.open(batch_dir / HOST_REPORT_INDEX_NAME,
+                      os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         info = os.fstat(read_fd)
         stored = os.read(read_fd, len(body) + 1)
@@ -682,61 +703,101 @@ def _publish_report_index(batch_dir, batch_id: str, digest: str, service_uid: in
 
 
 def _persist_host_report(host, batch_id: str, report: Mapping[str, JsonValue]) -> str | None:
-    """Protected durable report in the verified StateDirectory; None when unverifiable.
-
-    The digest is returned only after the report file *and* the Batch ID -> digest index are
-    durable and verified (Design §5.2.1), so a response digest is never published early.
-    """
+    """Protected durable report in the verified StateDirectory; None when unverifiable."""
     import os
+    import secrets
     import stat as stat_module
     from pathlib import Path
 
+    temp_path = None
     try:
         digest, body = _report_digest(report)
-        root = Path(host.state_directory) / HOST_REPORTS_DIRNAME
+        state_directory = Path(host.state_directory)
+        root = state_directory / "batch-reports"
         batch_dir = root / batch_id
-        for directory in (root, batch_dir):
-            try:
-                os.mkdir(directory, 0o700)
-            except FileExistsError:
-                pass
+        for directory in (state_directory, root, batch_dir):
+            if directory != state_directory:
+                try:
+                    os.mkdir(directory, 0o700)
+                except FileExistsError:
+                    pass
             info = os.lstat(directory)
             if (not stat_module.S_ISDIR(info.st_mode) or info.st_uid != host.service_uid
                     or info.st_mode & 0o077):
                 return None
         path = batch_dir / f"{digest}.json"
+
+        verify_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                         | os.O_CLOEXEC, 0o600)
-        except FileExistsError:
-            fd = None
-        if fd is not None:
+            verify_fd = os.open(path, verify_flags)
+        except FileNotFoundError:
+            verify_fd = None
+        if verify_fd is None:
+            temp_fd = None
+            for _attempt in range(8):
+                candidate = batch_dir / f".{digest}.{secrets.token_hex(16)}.tmp"
+                try:
+                    temp_fd = os.open(
+                        candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                        | os.O_CLOEXEC, 0o600)
+                except FileExistsError:
+                    continue
+                temp_path = candidate
+                break
+            if temp_fd is None:
+                return None
             try:
                 view = memoryview(body)
                 while view:
-                    view = view[os.write(fd, view):]
-                os.fsync(fd)
+                    written = os.write(temp_fd, view)
+                    if written <= 0:
+                        raise OSError("report write made no progress")
+                    view = view[written:]
+                os.fsync(temp_fd)
             finally:
-                os.close(fd)
-            dir_fd = os.open(batch_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                os.close(temp_fd)
+            os.replace(temp_path, path)
+            temp_path = None
+            verify_fd = os.open(path, verify_flags)
+
+        try:
+            info = os.fstat(verify_fd)
+            if (not stat_module.S_ISREG(info.st_mode) or info.st_uid != host.service_uid
+                    or info.st_mode & 0o077 or info.st_size != len(body)):
+                return None
+            stored = bytearray()
+            while len(stored) <= len(body):
+                chunk = os.read(verify_fd, len(body) + 1 - len(stored))
+                if not chunk:
+                    break
+                stored.extend(chunk)
+            stored_bytes = bytes(stored)
+            if (stored_bytes != body
+                    or sha256(b"aws-cnt-host-batch-report-v1\x00" + stored_bytes).hexdigest()
+                    != digest):
+                return None
+            os.fsync(verify_fd)
+        finally:
+            os.close(verify_fd)
+
+        for directory in (batch_dir, root, state_directory):
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                             | os.O_CLOEXEC)
             try:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        read_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            info = os.fstat(read_fd)
-            stored = os.read(read_fd, len(body) + 1)
-        finally:
-            os.close(read_fd)
-        if (stored != body or info.st_uid != host.service_uid or info.st_mode & 0o077
-                or host_report_sha256(stored) != digest):
-            return None
         if not _publish_report_index(batch_dir, batch_id, digest, host.service_uid):
             return None
         return digest
     except (OSError, TypeError, ValueError):
         return None
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def _complete_live_result(report, state, batch, refusal_code: str | None) -> BatchRunResult:
@@ -790,7 +851,12 @@ def _run_live(batch: VerifiedBatchApproval, ledger: IntentLedger, runtime) -> Ba
     refusal: str | None = None
     tracker = _TRACKER.get()
     for position, row_index in enumerate(fresh.approved_row_indexes):
-        state = ledger.batch_execution_state(fresh)
+        try:
+            state = ledger.batch_execution_state(fresh)
+        except LedgerError as error:
+            raise _outcome_unknown(
+                "OUTCOME_UNKNOWN", "initial Batch execution state is unknown",
+                batch_id=fresh.batch_id) from error
         if tracker is not None:
             tracker.observe(state)
         try:
@@ -832,7 +898,8 @@ def execute_batch_live(batch: VerifiedBatchApproval, ledger: IntentLedger,
                        runtime) -> BatchRunResult:
     """Host-only protected dispatch; a distinct API that never replaces the Offline API."""
     from name_tag_batch_host_runtime import (
-        HostRuntimeBlocked, bound_ledger, clear_selections, require_verified_host_runtime)
+        HostRuntimeBlocked, bound_ledger, clear_selections, host_execution_lock,
+        require_verified_host_runtime)
 
     verified = require_verified_host_runtime(runtime)
     if (type(batch) is not VerifiedBatchApproval or type(ledger) is not IntentLedger
@@ -840,28 +907,29 @@ def execute_batch_live(batch: VerifiedBatchApproval, ledger: IntentLedger,
         raise _blocked_live("BLOCKED_SCOPE_STATE_UNKNOWN", "not the Host-bound Ledger")
     from name_tag_batch_host_runtime import HostOutcomeUnknown
 
-    tracker = _SendTracker()
-    token = _TRACKER.set(tracker)
-    try:
-        return _run_live(batch, ledger, verified)
-    except HostOutcomeUnknown:
-        raise
-    except HostRuntimeBlocked as error:
-        # BLOCKED may coexist with earlier durable sends only with a verified report digest.
-        if tracker.possible_send and error.report_sha256 is None:
-            raise _outcome_unknown("OUTCOME_UNKNOWN", "refusal after a possible send",
-                                   batch_id=getattr(error, "batch_id", None)) from error
-        raise
-    except Exception as error:  # noqa: BLE001
-        if tracker.possible_send:
-            raise _outcome_unknown("OUTCOME_UNKNOWN", "failure after a possible send",
-                                   batch_id=batch.batch_id) from error
-        if isinstance(error, LedgerError):  # pre-send Ledger refusal keeps its code
-            raise _blocked_live(error.code, "Ledger refused the command") from error
-        raise
-    finally:
-        _TRACKER.reset(token)
-        clear_selections(verified.host)
+    with host_execution_lock(verified.host):
+        tracker = _SendTracker()
+        token = _TRACKER.set(tracker)
+        try:
+            return _run_live(batch, ledger, verified)
+        except HostOutcomeUnknown:
+            raise
+        except HostRuntimeBlocked as error:
+            # BLOCKED may coexist with earlier durable sends only with a verified report digest.
+            if tracker.possible_send and error.report_sha256 is None:
+                raise _outcome_unknown("OUTCOME_UNKNOWN", "refusal after a possible send",
+                                       batch_id=getattr(error, "batch_id", None)) from error
+            raise
+        except Exception as error:  # noqa: BLE001
+            if tracker.possible_send:
+                raise _outcome_unknown("OUTCOME_UNKNOWN", "failure after a possible send",
+                                       batch_id=batch.batch_id) from error
+            if isinstance(error, LedgerError):  # pre-send Ledger refusal keeps its code
+                raise _blocked_live(error.code, "Ledger refused the command") from error
+            raise
+        finally:
+            _TRACKER.reset(token)
+            clear_selections(verified.host)
 
 
 class HostLedgerBatchCoordinator:

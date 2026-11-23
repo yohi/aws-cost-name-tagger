@@ -103,6 +103,25 @@ class PlanFixture(unittest.TestCase):
 
 
 class IdentityProjectionTests(PlanFixture):
+    def test_apigateway_locator_is_projected_before_proposal_key(self):
+        arn = f"arn:aws:apigateway:{R}::/restapis/abcdefghij/stages/prod"
+        record = {"kind": "apigw_stage", "locator": f"abcdefghij|prod|{arn}",
+                  "region": R, "write_target": arn, "status": "proposed",
+                  "proposed_name": "api-prod", "evidence": ""}
+        old_key = t.proposal_key(record)
+        t._project_pre_sign_identity(record, "aws", ACCT)
+        self.assertEqual(record["locator"], arn)
+        self.assertNotEqual(t.proposal_key(record), old_key)
+
+    def test_rds_cluster_projection_keeps_cur_locator(self):
+        arn = f"arn:aws:rds:{R}:{ACCT}:cluster:orders"
+        record = {"kind": "rds_cluster", "locator": "cluster-0123456789abcdef0",
+                  "region": R, "write_target": arn, "status": "proposed",
+                  "proposed_name": "orders-rds", "evidence": ""}
+        t._project_pre_sign_identity(record, "aws", ACCT)
+        self.assertEqual(record["locator"], "cluster-0123456789abcdef0")
+        self.assertEqual(record["resource_arn"], arn)
+
     def test_cloudfront_presign_scope_global_and_arn_region_empty(self):
         doc = self.run_plan([cur_row(CF_ARN, region="us-east-1")],
                             {CF_ARN: info_for("cloudfront", CF_ARN)},

@@ -139,6 +139,7 @@ from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 from types import MappingProxyType as _MPT, SimpleNamespace as _NS
 
 import name_tag_kind_capabilities as _caps
+import name_tag_kind_adapters as _adapters
 import name_tag_kind_name_evidence as _evidence_module
 import name_tag_ledger as _ledger_module
 import test_name_tag_batch_migration as _mig
@@ -449,10 +450,14 @@ class NonEc2BatchValidatorTests(RealLedgerV2Case):
                         validator(batch, volume)
         apigw = _dataclasses.replace(_caps.resolve_kind_capability("apigw_stage"),
                                      status="IMPLEMENTED_OFFLINE")
+        stage = {**volume, "kind": "apigw_stage", "locator": "abc123def4/prod",
+                 "resource_arn": f"arn:aws:apigateway:{REGION}::/restapis/abc123def4/stages/prod",
+                 "aws_operation": "apigateway:PATCH"}
         with mock.patch.object(_caps, "_DECISIONS", _MPT({**_caps._DECISIONS, "apigw_stage": apigw})):
             with self.assertRaises(_LedgerError):
-                validator(batch, {**volume, "kind": "apigw_stage",
-                                  "aws_operation": "apigateway:PATCH"})
+                validator(batch, stage)
+            with mock.patch.object(_adapters, "_PROMOTION_BLOCKS", {}):
+                self.assertEqual(validator(batch, stage), "apigateway:PATCH")
 
     def test_forged_row_authority_denied(self):
         with self.trusted():

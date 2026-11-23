@@ -314,6 +314,65 @@ class StartupTests(unittest.TestCase):
         rig.server.serve(bootstrap=rig.bootstrap, endpoint=rig.endpoint)
         self.assertEqual(len(rig.endpoint.calls), 1)
 
+    def test_serve_reserves_connection_slot_before_starting_worker(self):
+        rig = Rig(endpoint_kwargs={"result": run_result()})
+        conn = rig.conn()
+        rig.os.conns = [conn]
+        reservations_at_spawn = []
+
+        def spawn(worker):
+            reservations_at_spawn.append(rig.server._connections)
+            worker()
+
+        rig.server._spawn = spawn
+        rig.server.serve(bootstrap=rig.bootstrap, endpoint=rig.endpoint)
+
+        self.assertEqual(reservations_at_spawn, [1])
+        self.assertEqual(rig.server._connections, 0)
+        self.assertEqual(conn.reply().status, "COMPLETE")
+
+    def test_serve_keeps_over_capacity_busy_inline_without_spawning(self):
+        rig = Rig()
+        denied, admitted = rig.conn(uid=OPERATOR_UID + 7), rig.conn()
+        rig.os.conns = [denied, admitted]
+        spawned = []
+        rig.server._max_connections = 0
+        rig.server._spawn = spawned.append
+
+        rig.server.serve(bootstrap=rig.bootstrap, endpoint=rig.endpoint)
+
+        self.assertEqual(spawned, [])
+        self.assertEqual((denied.reply().code, admitted.reply().code),
+                         ("IPC_PEER_REJECTED", "IPC_BUSY"))
+        self.assertEqual((denied.sizes, admitted.sizes), ([], []))
+        self.assertTrue(denied.closed)
+        self.assertTrue(admitted.closed)
+        self.assertEqual(rig.server._connections, 0)
+
+    def test_spawn_failure_closes_connection_and_accept_loop_continues(self):
+        rig = Rig(endpoint_kwargs={"result": run_result()})
+        failed, accepted = rig.conn(), rig.conn()
+        rig.os.conns = [failed, accepted]
+        spawn_calls = 0
+
+        def spawn(worker):
+            nonlocal spawn_calls
+            spawn_calls += 1
+            if spawn_calls == 1:
+                raise RuntimeError("worker creation failed")
+            worker()
+
+        rig.server._spawn = spawn
+        rig.server.serve(bootstrap=rig.bootstrap, endpoint=rig.endpoint)
+
+        self.assertEqual(spawn_calls, 2)
+        self.assertTrue(failed.closed)
+        self.assertIsNone(failed.reply())
+        self.assertTrue(accepted.closed)
+        self.assertEqual(accepted.reply().status, "COMPLETE")
+        self.assertEqual(len(rig.endpoint.calls), 1)
+        self.assertEqual(rig.server._connections, 0)
+
     def test_unavailable_production_server_fails_closed(self):
         prod = server_mod.production_ipc_server()
         with self.assertRaises(HostRuntimeBlocked) as caught:
@@ -380,9 +439,14 @@ class PreAcceptTests(unittest.TestCase):
 # ---------------------------------------------------------------- accepted-command lifecycle
 class AcceptedTests(unittest.TestCase):
     def test_accepted_command_called_once_with_exact_bytes_after_marker(self):
-        rig = Rig(endpoint_kwargs={"result": run_result()})
-        reply = rig.handle(rig.conn())
+        result = run_result()
+        request = ipc.HostIPCRequest(ipc.PROTOCOL_VERSION, RID, PLAN, CSV, ENV)
+        rig = Rig(endpoint_kwargs={"result": result})
+        with mock.patch.object(server_mod, "map_endpoint_result",
+                               wraps=server_mod.map_endpoint_result) as map_result:
+            reply = rig.handle(rig.conn())
         self.assertEqual(rig.events, ["IPC_REQUEST_ACCEPTED", "verify_process", "endpoint"])
+        map_result.assert_called_once_with(request.request_id, result)
         (call,) = rig.endpoint.calls
         self.assertEqual((call["plan_bytes"], call["csv_bytes"], call["owner_envelope_bytes"]),
                          (PLAN, CSV, ENV))
@@ -482,6 +546,33 @@ class AcceptedTests(unittest.TestCase):
         reply = rig.handle(conn)
         self.assertEqual(reply.code, "IPC_BUSY")
         self.assertEqual(conn.sizes, [])
+        self.assertEqual(rig.endpoint.calls, [])
+
+    def test_reserved_connection_slots_release_after_rejection_and_worker_busy(self):
+        rig = Rig()
+        rejected, busy = rig.conn(uid=OPERATOR_UID + 7), rig.conn()
+        rig.os.conns = [rejected, busy]
+        workers = []
+        rig.server._max_connections = 2
+        rig.server._spawn = workers.append
+
+        rig.server.serve(bootstrap=rig.bootstrap, endpoint=rig.endpoint)
+        self.assertEqual(rig.server._connections, 2)
+        self.assertEqual(len(workers), 2)
+
+        workers[0]()
+        self.assertEqual(rig.server._connections, 1)
+        self.assertEqual(rejected.reply().code, "IPC_PEER_REJECTED")
+        self.assertTrue(rejected.closed)
+
+        self.assertTrue(rig.server._batch_slot.acquire(blocking=False))
+        try:
+            workers[1]()
+        finally:
+            rig.server._batch_slot.release()
+        self.assertEqual(rig.server._connections, 0)
+        self.assertEqual(busy.reply().code, "IPC_BUSY")
+        self.assertTrue(busy.closed)
         self.assertEqual(rig.endpoint.calls, [])
 
     def test_post_accept_bootstrap_reverification_failure_blocks_before_endpoint(self):

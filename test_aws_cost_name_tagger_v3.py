@@ -2439,6 +2439,27 @@ class PaginationFailClosedPRBR3Tests(unittest.TestCase):
 
 
 
+class BatchReportArnIdentityTests(unittest.TestCase):
+    def test_batch_empty_arn_is_preserved_but_legacy_report_falls_back(self):
+        import csv
+        import tempfile
+        from pathlib import Path
+
+        record = {"kind": "volume", "locator": "vol-0123456789abcdef0",
+                  "region": "ap-northeast-1", "resource_arn": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = Path(tmp) / "batch.csv"
+            legacy = Path(tmp) / "legacy.csv"
+            t.write_action_csv(batch, [record], "123456789012", mode="batch-plan")
+            t.write_action_csv(legacy, [record], "123456789012", mode="plan")
+            with batch.open(encoding="utf-8-sig", newline="") as fh:
+                batch_arn = next(csv.DictReader(fh))["resource_arn"]
+            with legacy.open(encoding="utf-8-sig", newline="") as fh:
+                legacy_arn = next(csv.DictReader(fh))["resource_arn"]
+        self.assertEqual(batch_arn, "")
+        self.assertEqual(legacy_arn, "arn:aws:ec2:ap-northeast-1:123456789012:volume/vol-0123456789abcdef0")
+
+
 class CURIntegrityBoundsPR13Tests(unittest.TestCase):
     """AUD-001/003: CUR input checks always run before AWS/session access."""
 
@@ -2522,6 +2543,38 @@ class CURIntegrityBoundsPR13Tests(unittest.TestCase):
                              {'count':2,'cost_usd':'5'})
             self.assertEqual(population['unsupported_kind'],
                              {'known':True,'billing_rows':0,'cost_usd':'0'})
+
+    def test_batch_s3_regional_aliases_aggregate_before_threshold_and_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'cur.csv.gz'
+            bucket='regional-alias-bucket'
+            other='other-bucket'
+            self.write_cur(path,[
+                self.row(line_item_resource_id=bucket,line_item_product_code='AmazonS3',
+                         product_region_code='us-east-1',line_item_unblended_cost='0.6'),
+                self.row(line_item_resource_id=bucket,line_item_product_code='AmazonS3',
+                         product_region_code='eu-west-1',line_item_unblended_cost='0.6'),
+                self.row(line_item_resource_id=other,line_item_product_code='AmazonS3',
+                         product_region_code='us-west-2',line_item_unblended_cost='1.1'),
+            ])
+
+            _,candidates,population,_,kind_precap=t.cur_candidates_batch(
+                [str(path)],'2026-10',1,1,ACCOUNT,kind_filter={'s3_bucket'})
+
+            self.assertEqual(
+                [(row['locator'],row['region'],row['effective_usage_cost_usd'])
+                 for row in candidates],
+                [(bucket,'us-east-1','1.2')])
+            self.assertEqual(population['cur_recognized'],
+                             {'count':2,'cost_usd':'2.3'})
+            self.assertEqual(population['below_min_cost'],
+                             {'count':0,'cost_usd':'0'})
+            self.assertEqual(population['lookup_selected'],
+                             {'count':1,'cost_usd':'1.2'})
+            self.assertEqual(population['max_resources_not_inspected'],
+                             {'count':1,'cost_usd':'1.1'})
+            self.assertEqual(kind_precap['kinds']['s3_bucket']['lookup_selected'],
+                             {'count':1,'cost_usd':'1.2'})
 
     def test_batch_population_separates_unattributable_unsupported_and_filtered_lines(self):
         with tempfile.TemporaryDirectory() as tmp:

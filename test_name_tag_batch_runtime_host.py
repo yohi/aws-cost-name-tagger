@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import pickle
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -22,11 +23,12 @@ from name_tag_batch_iam_evidence import (
     IamDenyCase, OfflineSyntheticIamEvidenceVerifier, OfflineSyntheticRuntimeVerifier,
     ProtectedEffectiveIamEvidenceVerifier, ProtectedHostRuntimeVerifier,
     LIVE_PROVENANCE, ProtectedHostScopeVerifier, SyntheticIamEvidenceProducer,
-    VerifiedRuntimeGrant, consume_offline_synthetic_grant, consume_runtime_grant)
+    VerifiedRuntimeGrant, consume_offline_synthetic_grant, consume_runtime_grant,
+    ownership_proof_ref)
 from name_tag_ledger import FirstSendPermit
 from name_tag_scope import ScopeEvidence, SideEffectEvidence
 from test_name_tag_batch_host_issuer import IssuerHarness
-from test_name_tag_batch_host_runtime import NOW, VOL0, owner_verified
+from test_name_tag_batch_host_runtime import NOW, VOL0, VOL1, owner_verified
 
 H = "a" * 64
 
@@ -131,6 +133,22 @@ class GrantHarness:
 
 
 class ScopeVerifierTests(unittest.TestCase):
+    def test_scope_retains_verified_evidence_for_every_controlled_arn(self):
+        g = GrantHarness(self)
+        g.source.scope = replace(g.source.scope, controlled_arns=frozenset({VOL0, VOL1}))
+        g.source.effects += (SideEffectEvidence(
+            target_arn=VOL1, iam_abac_resource_tag_assessment="PASS", iac_assessment="PASS",
+            event_automation_assessment="PASS", evidence_references=("ref-2",),
+            not_before_utc=NOW - timedelta(minutes=10),
+            not_after_utc=NOW + timedelta(minutes=10)),)
+
+        scope = g.scope()
+
+        self.assertEqual(
+            tuple(effect.target_arn for effect in scope.side_effects), (VOL0, VOL1))
+        self.assertEqual(scope.target.ownership_proof_ref,
+                         ownership_proof_ref(g.h.host, scope.scope, VOL0))
+
     def test_scope_binds_ownership_proof_to_target(self):
         g = GrantHarness(self)
         scope = g.scope()
@@ -159,6 +177,13 @@ class EffectiveIamEvidenceTests(unittest.TestCase):
     def test_foreign_arn_tagkey_and_alternate_api_evidence_rejected(self):
         g = GrantHarness(self)
         foreign, other_key, alt_api = _deny_cases()
+        approved = (VOL0, "ec2:CreateTags", "Name")
+        self.assertEqual((foreign.resource_arn, foreign.action, foreign.tag_key),
+                         (VOL0.replace("vol-0123", "vol-9999"), approved[1], approved[2]))
+        self.assertEqual((other_key.resource_arn, other_key.action, other_key.tag_key),
+                         (approved[0], approved[1], "Owner"))
+        self.assertEqual((alt_api.resource_arn, alt_api.action, alt_api.tag_key),
+                         (approved[0], "ec2:DeleteTags", approved[2]))
         bad = [
             dict(approved_allow=(VOL0.replace("vol-0123", "vol-9999"), "ec2:CreateTags", "Name")),
             dict(approved_allow=(VOL0, "ec2:CreateTags", "Owner")),
@@ -168,8 +193,12 @@ class EffectiveIamEvidenceTests(unittest.TestCase):
             dict(deny_cases=(foreign, other_key)),
             dict(deny_cases=(replace(foreign, decision="ALLOW"), other_key, alt_api)),
             dict(deny_cases=(replace(foreign, resource_arn=VOL0), other_key, alt_api)),
+            dict(deny_cases=(replace(foreign, tag_key="Owner"), other_key, alt_api)),
+            dict(deny_cases=(replace(foreign, action="ec2:DeleteTags"), other_key, alt_api)),
             dict(deny_cases=(foreign, replace(other_key, tag_key="Name"), alt_api)),
+            dict(deny_cases=(foreign, replace(other_key, action="ec2:DeleteTags"), alt_api)),
             dict(deny_cases=(foreign, other_key, replace(alt_api, action="ec2:CreateTags"))),
+            dict(deny_cases=(foreign, other_key, replace(alt_api, tag_key="Owner"))),
             dict(principal_arn="arn:aws:sts::123456789012:assumed-role/Batch/other"),
             dict(source="POLICY_SIMULATOR"),
             dict(source="GET_CALLER_IDENTITY"),
@@ -185,7 +214,7 @@ class EffectiveIamEvidenceTests(unittest.TestCase):
                     g.deny(g.evidence(**change))
         self.assertEqual(g.deny().provenance, "OFFLINE_SYNTHETIC_NOT_STS")
 
-    def test_runtime_evidence_window_and_late_clock_refused(self):
+    def test_runtime_evidence_expired_no_intent(self):
         g = GrantHarness(self)
         expired = g.evidence(captured_at_utc=NOW - timedelta(hours=2),
                              expires_at_utc=NOW - timedelta(seconds=1))
@@ -197,6 +226,7 @@ class EffectiveIamEvidenceTests(unittest.TestCase):
         late = OfflineSyntheticRuntimeVerifier(clock=lambda: NOW + timedelta(minutes=11))
         with self.assertRaises(HostRuntimeBlocked):
             late.authorize_once(g.authority, g.issued, g.scope(), deny, g.permit())
+        self.assertNotIn("create_batch_intent", g.h.fx.ledger.calls)
 
     def test_evidence_is_protected_reference_not_fields(self):
         g = GrantHarness(self)
@@ -218,6 +248,34 @@ class EffectiveIamEvidenceTests(unittest.TestCase):
 
 
 class RuntimeGrantTests(unittest.TestCase):
+    def test_concurrent_authorize_once_mints_only_one_grant_per_row(self):
+        g = GrantHarness(self)
+        scope = g.scope()
+        denies = (g.deny(scope=scope), g.deny(scope=scope))
+        permit = g.permit()
+        verifier = OfflineSyntheticRuntimeVerifier(clock=g.clock)
+        barrier = threading.Barrier(2)
+
+        outcomes = []
+
+        def authorize(deny):
+            try:
+                barrier.wait(timeout=5)
+                outcomes.append(("grant", verifier.authorize_once(
+                    g.authority, g.issued, scope, deny, permit)))
+            except HostRuntimeBlocked as error:
+                outcomes.append(("blocked", error))
+
+        threads = [threading.Thread(target=authorize, args=(deny,)) for deny in denies]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual([kind for kind, _ in outcomes].count("grant"), 1)
+        self.assertEqual([kind for kind, _ in outcomes].count("blocked"), 1)
+
     def test_synthetic_grant_is_one_shot_bound_and_never_live(self):
         g = GrantHarness(self)
         scope = g.scope()
@@ -234,7 +292,7 @@ class RuntimeGrantTests(unittest.TestCase):
                 attempt(grant)
         with self.assertRaises(HostRuntimeBlocked) as caught:
             consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW)  # the dispatch boundary is live-only
+                                  client=object(), now_utc=NOW)  # the dispatch boundary is live-only
         self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         with self.assertRaises(HostRuntimeBlocked):  # consumed even by the refused attempt
             consume_offline_synthetic_grant(grant, row=g.authority, permit=permit,
@@ -335,7 +393,7 @@ class GrantFixRoundTests(unittest.TestCase):
     def test_dispatch_boundary_has_no_live_flag_and_synthetic_cannot_dispatch(self):
         import inspect
         self.assertEqual(sorted(inspect.signature(consume_runtime_grant).parameters),
-                         ["grant", "now_utc", "permit", "row", "target"])
+                         ["client", "grant", "now_utc", "permit", "row", "target"])
         g = GrantHarness(self)
         grant, scope, permit = g.grant()
         with self.assertRaises(TypeError):
@@ -343,7 +401,7 @@ class GrantFixRoundTests(unittest.TestCase):
                                   now_utc=NOW, require_live=False)
         with self.assertRaises(HostRuntimeBlocked) as caught:
             consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW)
+                                  client=object(), now_utc=NOW)
         self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
         g2 = GrantHarness(self)
         grant2, scope2, permit2 = g2.grant()
@@ -356,7 +414,7 @@ class GrantFixRoundTests(unittest.TestCase):
         object.__setattr__(grant, "provenance", LIVE_PROVENANCE)
         with self.assertRaises(HostRuntimeBlocked):
             consume_runtime_grant(grant, row=g.authority, permit=permit, target=scope.target,
-                                  now_utc=NOW)
+                                  client=object(), now_utc=NOW)
         for verifier in (ProtectedHostRuntimeVerifier, OfflineSyntheticRuntimeVerifier):
             with self.subTest(verifier=verifier.__name__):
                 g = GrantHarness(self)

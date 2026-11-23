@@ -51,25 +51,10 @@ jobs:
           uv run --locked --no-build python -c 'import boto3, awscrt; assert boto3.__version__ == "1.43.116", boto3.__version__; print("boto3:", boto3.__version__)'
 
       - name: Validate SHA-256 manifest
-        run: |
-          uv run --locked --no-build python - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
+        run: uv run --locked --no-build python scripts/validate_sha256_manifest.py
 
-          manifest = json.loads(Path("SHA256_MANIFEST.json").read_text(encoding="utf-8"))
-          files = manifest["files"]
-          assert len({entry["path"] for entry in files}) == len(files), "duplicate manifest path"
-          for entry in files:
-              path = Path(entry["path"])
-              assert path.is_file(), f"missing: {path}"
-              content = path.read_bytes()
-              assert hashlib.sha256(content).hexdigest() == entry["sha256"], f"SHA-256 mismatch: {path}"
-              assert len(content) == entry["bytes"], f"size mismatch: {path}"
-          for required in ("uv.lock", ".github/workflows/ci.yml"):
-              assert required in {entry["path"] for entry in files}, f"not listed: {required}"
-          print(f"SHA256 manifest PASS ({len(files)} files)")
-          PY
+      - name: Test SHA-256 manifest validator
+        run: uv run --locked --no-build python -m unittest -q test_validate_sha256_manifest
 
       - name: Validate offline Sonar report converter
         run: uv run --locked --no-build python -m unittest -q test_trace_to_sonar_generic

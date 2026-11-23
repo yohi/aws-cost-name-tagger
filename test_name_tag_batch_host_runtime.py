@@ -8,12 +8,14 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import inspect
 import json
 import os
 import pickle
 import stat
 import tempfile
 import unittest
+import weakref
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,8 +49,8 @@ _RUN_COUNTER = iter(range(1, 1 << 30))
 def next_invocation_id() -> str:
     """Each Fake Host start (or restart) is a distinct systemd invocation, as on a real Host."""
     return f"{next(_RUN_COUNTER):032x}"
-SVC_UID = os.getuid()
-SVC_GID = os.getgid()
+SVC_UID = 1000
+SVC_GID = 1000
 
 
 def _sha(data: bytes) -> str:
@@ -220,8 +222,9 @@ class HostFixture:
         self.events.append("fsync_dir" if stat.S_ISDIR(mode) else "fsync_file")
         os.fsync(fd)
 
-    def verify(self):
-        return self.verifier.verify_process(now_utc=NOW)
+    def verify(self, *, now_utc=NOW):
+        with mock.patch("name_tag_batch_host_runtime.os.getuid", return_value=SVC_UID):
+            return self.verifier.verify_process(now_utc=now_utc)
 
     def repin(self) -> None:
         """Root re-provisions the manifest and its pin (test-only Host acceptance step)."""
@@ -259,6 +262,15 @@ class HostBootstrapTests(unittest.TestCase):
     def test_host_bootstrap_validated_systemd_context_mock(self):
         fx = host_fixture(self)
         host = fx.verify()
+        self.assertNotIn("weakref_slot", inspect.getsource(VerifiedHostContext))
+        self.assertIs(weakref.ref(host)(), host)
+        equal_fields = {name: getattr(host, name) for name in VerifiedHostContext.__slots__
+                        if not name.startswith("__")}
+        same_values = VerifiedHostContext(**equal_fields)
+        self.assertIsNot(same_values, host)
+        self.assertNotEqual(same_values, host)
+        with self.assertRaises(HostRuntimeBlocked):
+            require_verified_host(same_values)
         self.assertIs(type(host), VerifiedHostContext)
         self.assertIs(require_verified_host(host), host)
         self.assertEqual(host.service_unit, "aws-cnt-batch.service")
@@ -333,9 +345,9 @@ class HostBootstrapTests(unittest.TestCase):
             require_verified_host(genuine)
 
     def test_host_service_not_installed_or_started_by_offline_tests(self):
-        with mock.patch("subprocess.run", side_effect=AssertionError("subprocess")), \
-                mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess")), \
-                mock.patch("socket.socket", side_effect=AssertionError("socket")):
+        with mock.patch("subprocess.run", side_effect=AssertionError("subprocess")) as run, \
+                mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess")) as popen, \
+                mock.patch("socket.socket", side_effect=AssertionError("socket")) as socket_factory:
             fx = host_fixture(self)
             fx.verify()
             production = SystemdHostBootstrapVerifier(
@@ -344,7 +356,9 @@ class HostBootstrapTests(unittest.TestCase):
             with self.assertRaises(HostRuntimeBlocked) as caught:
                 production.verify_process(now_utc=NOW)
         self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
-        self.assertFalse(Path("/run/aws-cnt/host.sock").exists())
+        run.assert_not_called()
+        popen.assert_not_called()
+        socket_factory.assert_not_called()
 
     def test_production_default_probe_fails_closed(self):
         verifier = host_runtime.production_bootstrap_verifier()
@@ -355,7 +369,7 @@ class HostBootstrapTests(unittest.TestCase):
     def test_naive_time_and_corrupt_existing_tombstone_block_startup(self):
         fx = host_fixture(self)
         with self.assertRaises(HostRuntimeBlocked):
-            fx.verifier.verify_process(now_utc=NOW.replace(tzinfo=None))
+            fx.verify(now_utc=NOW.replace(tzinfo=None))
         root = Path(fx.os.state_dir) / "issuance-attempts" / ("a" * 64)
         root.mkdir(parents=True, mode=0o700)
         os.chmod(root.parent, 0o700)

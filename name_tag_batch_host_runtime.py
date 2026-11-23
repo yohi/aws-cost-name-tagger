@@ -21,6 +21,7 @@ from dataclasses import dataclass, fields as dataclass_fields
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from types import MappingProxyType
 from typing import Final, Protocol
 from weakref import WeakKeyDictionary
@@ -112,6 +113,10 @@ class _NonCopyable:
         raise _blocked("protected reference cannot be serialized")
 
 
+class _WeakRefableNonCopyable(_NonCopyable):
+    __slots__ = ("__weakref__",)
+
+
 # ---------------------------------------------------------------- OS probe contract
 @dataclass(frozen=True)
 class HostProcessFacts:
@@ -165,8 +170,8 @@ class UnavailableHostOSProbe:
 
 
 # ---------------------------------------------------------------- protected Host context
-@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
-class VerifiedHostContext(_NonCopyable):
+@dataclass(frozen=True, slots=True, eq=False)
+class VerifiedHostContext(_WeakRefableNonCopyable):
     """Process-local reference; valid only while registered by the bootstrap verifier."""
 
     host_id: str
@@ -195,6 +200,8 @@ class _HostBinding:
 
 
 _HOSTS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_EXECUTION_LOCKS: WeakKeyDictionary = WeakKeyDictionary()
+_HOST_EXECUTION_LOCKS_GUARD = Lock()
 
 
 def _context_digest(host: VerifiedHostContext) -> str:
@@ -224,6 +231,17 @@ def bound_ledger(host: VerifiedHostContext) -> object:
 
 def bound_journal(host: VerifiedHostContext) -> "IssuanceAttemptJournal":
     return _HOSTS[require_verified_host(host)].journal
+
+
+def host_execution_lock(host: VerifiedHostContext) -> Lock:
+    """Return the process-local serialization lock for one verified Host context."""
+    host = require_verified_host(host)
+    with _HOST_EXECUTION_LOCKS_GUARD:
+        lock = _HOST_EXECUTION_LOCKS.get(host)
+        if lock is None:
+            lock = Lock()
+            _HOST_EXECUTION_LOCKS[host] = lock
+        return lock
 
 
 def _require_hex(value: object, pattern: re.Pattern[str], what: str) -> str:
@@ -421,6 +439,8 @@ _RECORD_FIELDS: Final = frozenset({
 _FIXED_ON_FINALIZE: Final = _RECORD_FIELDS - {
     "status", "updated_at_utc", "receipt_sha256", "response_sha256", "refusal_code"}
 _RECORD_NAME = re.compile(r"(0|[1-9][0-9]{0,8})-([0-9a-f]{64})\.json")
+_FINALIZE_TEMP_NAME = re.compile(
+    r"\.(0|[1-9][0-9]{0,8})-([0-9a-f]{64})\.json\.([0-9a-f]{64})\.tmp")
 _MAX_RECORD_BYTES: Final = 65536
 _TOMBSTONE_BLOCKED: Final = "BLOCKED_ISSUANCE_ATTEMPT_EXISTS"
 
@@ -474,10 +494,13 @@ class IssuanceAttemptJournal:
                 return False
             os.mkdir(path, 0o700)
             info = os.lstat(path)
-            self._sync_dir(path.parent)
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != self._uid
                 or info.st_mode & 0o077):
             raise _blocked("issuance journal directory is not private")
+        if create:
+            # A previous attempt may have created the directory before its parent fsync
+            # failed. Re-sync the parent on retries before any PENDING write can proceed.
+            self._sync_dir(path.parent)
         return True
 
     def _sync_dir(self, path: Path) -> None:
@@ -501,6 +524,11 @@ class IssuanceAttemptJournal:
         match = _RECORD_NAME.fullmatch(path.name)
         if match is None:
             raise _blocked("unexpected file in issuance journal")
+        record = self._read_record_file(path)
+        return _validate_record(record, batch_id=batch_id, row_index=int(match.group(1)),
+                                row_authority_id=match.group(2))
+
+    def _read_record_bytes(self, path: Path) -> bytes:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             info = os.fstat(fd)
@@ -510,18 +538,59 @@ class IssuanceAttemptJournal:
             raw = os.read(fd, _MAX_RECORD_BYTES + 1)
         finally:
             os.close(fd)
+
+        return raw
+
+    @staticmethod
+    def _parse_record_bytes(raw: bytes) -> dict:
         try:
             record = _strict_json(raw)
             if canonical_bytes(record) != raw:
                 raise ValueError("noncanonical record")
         except (ValueError, UnicodeDecodeError) as error:
             raise _blocked("issuance record is corrupt") from error
-        return _validate_record(record, batch_id=batch_id, row_index=int(match.group(1)),
-                                row_authority_id=match.group(2))
+        return record
+
+    def _read_record_file(self, path: Path) -> dict:
+        return self._parse_record_bytes(self._read_record_bytes(path))
+
+    def _validate_finalize_temp(self, path: Path, *, batch_id: str) -> None:
+        match = _FINALIZE_TEMP_NAME.fullmatch(path.name)
+        if match is None:
+            raise _blocked("unexpected file in issuance journal")
+        row_index, row_authority_id, attempt_id = (
+            int(match.group(1)), match.group(2), match.group(3))
+        record_name = f"{match.group(1)}-{row_authority_id}.json"
+        canonical = self._read_path(path.parent / record_name, batch_id=batch_id)
+        if canonical["attempt_id"] != attempt_id:
+            raise _blocked("finalization temp does not match its canonical tombstone")
+        recoverable_pending = canonical["status"] == ISSUANCE_PENDING
+        raw = self._read_record_bytes(path)
+        try:
+            temporary = _validate_record(
+                self._parse_record_bytes(raw), batch_id=batch_id, row_index=row_index,
+                row_authority_id=row_authority_id)
+        except HostRuntimeBlocked:
+            if not recoverable_pending:
+                raise
+            try:
+                os.unlink(path)
+                self._sync_dir(path.parent)
+            except OSError as error:
+                raise _blocked("incomplete finalization temp could not be removed") from error
+            return
+        if (temporary["status"] not in _FINAL_STATES
+                or temporary["attempt_id"] != attempt_id
+                or (canonical["status"] == ISSUANCE_PENDING
+                    and any(temporary[key] != canonical[key]
+                            for key in ("batch_id", "row_index", "row_authority_id",
+                                        "run_id", "scope_id", "host_id", "attempt_id")))
+                or (canonical["status"] != ISSUANCE_PENDING and canonical != temporary)):
+            raise _blocked("finalization temp is not paired with its canonical tombstone")
 
     # -- read-only reconciliation --------------------------------------------------
     def scan(self) -> tuple[dict, ...]:
-        """Validate every record (startup / pre-selection). Any doubt raises."""
+        """Validate records; paired finalize temps are checked but never exposed as records."""
         try:
             if not self._secure_dir(self._root, create=False):
                 return ()
@@ -531,7 +600,10 @@ class IssuanceAttemptJournal:
                     raise _blocked("unexpected entry in issuance journal")
                 self._secure_dir(batch_dir, create=False)
                 for path in sorted(batch_dir.iterdir()):
-                    records.append(self._read_path(path, batch_id=batch_dir.name))
+                    if _RECORD_NAME.fullmatch(path.name):
+                        records.append(self._read_path(path, batch_id=batch_dir.name))
+                    else:
+                        self._validate_finalize_temp(path, batch_id=batch_dir.name)
             return tuple(records)
         except HostRuntimeBlocked:
             raise
@@ -911,7 +983,8 @@ class ProtectedBatchHostEndpoint:
         except LedgerError as error:  # pre-send Ledger refusals keep their code
             raise HostRuntimeBlocked(error.code, "Ledger refused the command") from error
         finally:
-            clear_selections(host)
+            with host_execution_lock(host):
+                clear_selections(host)
 
 
 def production_host_endpoint() -> ProtectedBatchHostEndpoint:

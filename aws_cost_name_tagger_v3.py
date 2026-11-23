@@ -545,6 +545,11 @@ def _accumulate_other_batch_cur_row(state,category,reason,exact_amount,exact_add
 def _accumulate_recognized_batch_cur_row(state,row,key,exact_amount,exact_add):
     if key is None:
         raise ValueError("CUR recognized identity missing")
+    kind, locator, region = key
+    selection_key, candidate_identity = _batch_selection_identity(
+        kind, locator, region, state.account)
+    key = selection_key
+    state.candidate_identity.setdefault(key, candidate_identity)
     current=state.aggregates.get(key)
     legacy_amount=cost_of(row)
     legacy_total=legacy_amount if current is None else current.legacy_rank_cost+legacy_amount
@@ -559,6 +564,21 @@ def _accumulate_recognized_batch_cur_row(state,row,key,exact_amount,exact_add):
     state.provenance[key]["services"].add(row["line_item_product_code"])
     state.provenance[key]["billing_rows"]+=1
     state.provenance[key]["currency"].add(row["line_item_currency_code"])
+
+
+def _batch_selection_identity(kind, locator, region, account):
+    """Use canonical global identity for selection while retaining the CUR locator."""
+    original_key=(kind,locator,region)
+    from name_tag_kind_capabilities import project_unsigned_scope_region
+
+    arn=resource_arn({"kind":kind,"locator":locator,"region":region},account)
+    if not arn:
+        return original_key,(locator,region)
+    scope_region=project_unsigned_scope_region(
+        kind=kind,classified_region=region,canonical_arn=arn)
+    if scope_region!="global":
+        return original_key,(locator,region)
+    return (kind,arn,scope_region),(locator,region)
 
 
 def _accumulate_batch_cur_row(state,row):
@@ -580,7 +600,7 @@ def _cur_scan_batch_aggregates(paths, receipts, active_month, account, kind_filt
     """Scan the same bounded CUR input for exact Batch accounting and legacy rank."""
     from decimal import Decimal
 
-    state = _CurBatchAggregateState(active_month,account,kind_filter,{},
+    state = _CurBatchAggregateState(active_month,account,kind_filter,{}, {},
         defaultdict(lambda: {"services": set(), "billing_rows": 0, "currency": set()}),{
         "UNATTRIBUTABLE_CUR": {"billing_rows": 0, "exact_cost": Decimal(0)},
         "OUTSIDE_REQUESTED_KINDS": {"billing_rows": 0, "exact_cost": Decimal(0)},
@@ -592,7 +612,8 @@ def _cur_scan_batch_aggregates(paths, receipts, active_month, account, kind_filt
         receipt = _scan_cur_file(path, second_budget,lambda row:_accumulate_batch_cur_row(state,row))
         if receipts[index] != receipt:
             raise ValueError("CUR content or metadata changed between passes")
-    return state.aggregates,state.provenance,state.billing,state.reasons
+    return (state.aggregates,state.provenance,state.billing,state.reasons,
+            state.candidate_identity)
 
 
 def cur_candidates_batch(
@@ -611,7 +632,7 @@ def cur_candidates_batch(
     if month is None and not periods:
         raise ValueError("CUR input contains no billing rows; specify --month")
     active_month = month or max(periods)
-    aggregates, provenance, billing, reasons = _cur_scan_batch_aggregates(
+    aggregates, provenance, billing, reasons, candidate_identity = _cur_scan_batch_aggregates(
         paths, receipts, active_month, account, kind_filter)
     population = partition_cur_population(
         aggregates, min_cost=min_cost, max_resources=max_resources)
@@ -620,8 +641,9 @@ def cur_candidates_batch(
     candidates = []
     for key in selected_keys:
         aggregate = aggregates[key]
+        locator, region = candidate_identity[key]
         candidates.append({
-            "kind": key[0], "locator": key[1], "region": key[2],
+            "kind": key[0], "locator": locator, "region": region,
             "effective_usage_cost_usd": _canonical_decimal(aggregate.exact_cost),
             "legacy_rank_cost": aggregate.legacy_rank_cost,
             "source_services": sorted(provenance[key]["services"]),
@@ -762,6 +784,7 @@ class _CurBatchAggregateState:
     account: str
     kind_filter: set[str] | None
     aggregates: dict
+    candidate_identity: dict
     provenance: dict
     billing: dict
     reasons: dict
@@ -1628,11 +1651,14 @@ def _project_pre_sign_identity(record: dict, partition: str, account: str) -> No
     """
     from name_tag_kind_capabilities import project_pre_sign_kind_target
 
-    kind, locator = record["kind"], record["locator"]
+    kind, original_locator = record["kind"], record["locator"]
+    locator = original_locator
     target = str(record.get("write_target") or "")
     arn = target if target.startswith("arn:") else None
     if kind == "apigw_stage" and isinstance(locator, str) and locator.count("|") >= 2:
         arn = arn or locator.split("|", 2)[2]
+        locator = arn
+    elif kind == "rds_cluster" and arn:
         locator = arn
     try:
         projected = project_pre_sign_kind_target(
@@ -1648,6 +1674,10 @@ def _project_pre_sign_identity(record: dict, partition: str, account: str) -> No
     record["resource_arn"] = projected.identity.resource_arn
     record["region"] = projected.identity.scope_region
     record["aws_operation"] = projected.aws_operation
+    if kind == "apigw_stage":
+        record["locator"] = projected.identity.resource_arn
+    elif kind == "rds_cluster":
+        record["locator"] = original_locator
 
 
 def _reject_identity_collisions(records: list[dict]) -> None:
@@ -1689,7 +1719,8 @@ def write_action_csv(path: Path, records: list[dict], account: str, *, mode: str
         for row in records:
             result = row.get("result", row.get("status", ""))
             new_name = row.get("name", row.get("proposed_name", ""))
-            arn = row.get("resource_arn") or resource_arn(row, account)
+            arn = (row.get("resource_arn", "") if mode == "batch-plan"
+                   else row.get("resource_arn") or resource_arn(row, account))
             values = {
                 "utc": timestamp, "account": account, "mode": mode,
                 "result": result, "resource_arn": arn,

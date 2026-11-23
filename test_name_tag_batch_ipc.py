@@ -209,6 +209,18 @@ class CodecTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(IPCError):
                 codec.encode_response(bad)
 
+    def test_non_string_wire_response_status_raises_ipc_error(self):
+        payload = json.dumps({
+            "protocol_version": 1, "request_id": RID, "status": [],
+            "code": "COMPLETE", "batch_id": None, "report_sha256": None,
+        }, separators=(",", ":")).encode()
+        clock = FakeClock()
+        stream = FakeStream(framed(payload), clock)
+
+        with self.assertRaises(IPCError):
+            StrictBatchHostIPCCodec(clock=clock).read_response(
+                stream, ipc.Deadline(clock, 120))
+
     def test_deadlines_header_5s_body_eof_30s_monotonic(self):
         good = request_frame()
         clock = FakeClock()

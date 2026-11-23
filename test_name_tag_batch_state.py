@@ -133,6 +133,14 @@ class StateTests(unittest.TestCase):
             validate_batch_csv(plan_bytes,build_batch_review_projection(plan_bytes))
 
 class SecurityBoundaryTests(unittest.TestCase):
+    def test_accountless_snapshot_scope_declaration_is_canonical_only(self):
+        from name_tag_batch_state import _valid_declared_arn
+        scope = {"partition": "aws", "account": "123456789012", "region": "ap-northeast-1"}
+        self.assertTrue(_valid_declared_arn(
+            "arn:aws:ec2:ap-northeast-1::snapshot/snap-0123456789abcdef0", scope))
+        self.assertFalse(_valid_declared_arn(
+            "arn:aws:ec2:ap-northeast-1:123456789012:snapshot/snap-0123456789abcdef0", scope))
+
     def test_variant_name_unicode_casefold_is_unknown(self):
         self.assertEqual(classify_batch_name({'nAmE':'Value'}).state,'UNKNOWN')
     def test_foreign_arn_cannot_be_approved_through_matching_declaration(self):

@@ -126,6 +126,14 @@ class VolumeEvidenceTests(unittest.TestCase):
                 evidence_module.verified_generated_name({**_volume_record(), "proposed_name": name},
                                                         self.target())
 
+    def test_locator_mismatch_rejected_before_verifier(self):
+        verifier = mock.Mock()
+        with mock.patch.dict(evidence_module._VERIFIERS, {"volume": verifier}):
+            with self.assertRaises(evidence_module.NameEvidenceNotProven):
+                evidence_module.verified_generated_name(
+                    {**_volume_record(), "locator": "vol-0123456789abcdef0"}, self.target())
+        verifier.verify.assert_not_called()
+
     def test_volume_evidence_legacy_unchanged(self):
         plan = _plan([_volume_record()], [_scope([VOL_ARN])])
         row = _approve(plan).approved_rows[0]
@@ -417,7 +425,13 @@ class SignedNonVolumeTests(PlanFixture):
                 partition=doc["partition"], account=doc["account"], scope_region=row["region"])
             client = FakeEc2()
             self.assertEqual(adapter.read_current(client, target).state, "ABSENT")
-            adapter.write_once(client, target, row["approved_name"], grant=object())
+            dispatch_binding = object()
+            with mock.patch(
+                    "name_tag_batch_iam_evidence.consume_host_dispatch_binding") as consume:
+                adapter.write_once(client, target, row["approved_name"], dispatch_binding)
+            consume.assert_called_once_with(
+                dispatch_binding, client=client, target=target,
+                name=row["approved_name"], kind="instance")
             observed = adapter.readback(client, target)
             self.assertEqual((observed.state, observed.name_raw_value), ("NONEMPTY", INSTANCE_NAME))
             self.assertEqual([c for c in client.calls if c[0] == "create_tags"],

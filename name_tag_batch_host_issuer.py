@@ -16,8 +16,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields as dataclass_fields
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from threading import Lock
 from typing import Final, Protocol
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 from name_tag_batch_approval import canonical_bytes
 from name_tag_batch_host_runtime import (
@@ -42,6 +43,10 @@ def _parse_iso_z(value: object) -> datetime:
 
 def _iso_z(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class ProtectedBootstrapCredentials(_NonCopyable):
@@ -202,7 +207,11 @@ class ExplicitSdkClientFactory(Protocol):
 
 
 class IndependentEvidenceGate(Protocol):
-    """Independent IAM/G1/G2 evidence, checked pre-STS and against the issued identity."""
+    """Independent IAM/G1/G2 evidence checked at the STS and identity boundaries.
+
+    ``check_pre_sts`` must re-read the selected Scope's current state at invocation time
+    and reject anything other than CLEARED. Selection-time evidence is not sufficient.
+    """
 
     def check_pre_sts(self, selection: HostSelection, *, now_utc: datetime) -> None: ...
     def check_issued(self, issued: "HostIssuedSession", *, now_utc: datetime) -> None: ...
@@ -328,14 +337,55 @@ class HostIssuedSession(_NonCopyable):
         """Read/write/readback clients from the same explicit triplet and session."""
         require_issued_session(self, self._host, now_utc)
         akid, secret, token = self._triplet
-        return self._factory.create(service, region, access_key_id=akid,
-                                    secret_access_key=secret, session_token=token)
+        client = self._factory.create(service, region, access_key_id=akid,
+                                      secret_access_key=secret, session_token=token)
+        _register_issued_sdk_client(self, client)
+        return client
 
 
 _SESSION_MINT: Final = object()
 _SESSIONS: WeakKeyDictionary = WeakKeyDictionary()
 _INTENT_ADMITTED: WeakKeyDictionary = WeakKeyDictionary()
 _NAME_BINDINGS: dict[str, tuple[str, str]] = {}
+_ISSUED_SDK_CLIENTS: list[tuple[object, object]] = []
+_ISSUED_SDK_CLIENTS_LOCK = Lock()
+
+
+def _register_issued_sdk_client(issued: HostIssuedSession, client: object) -> None:
+    try:
+        client_ref, issued_ref = ref(client), ref(issued)
+    except TypeError as error:
+        raise _blocked("SDK client cannot be bound to its Host-issued session") from error
+    with _ISSUED_SDK_CLIENTS_LOCK:
+        retained = []
+        already_registered = False
+        for registered_client_ref, registered_issued_ref in _ISSUED_SDK_CLIENTS:
+            registered_client = registered_client_ref()
+            registered_issued = registered_issued_ref()
+            if registered_client is None or registered_issued is None:
+                continue
+            if registered_client is client:
+                if registered_issued is not issued:
+                    raise _blocked("SDK client is already bound to another issued session")
+                already_registered = True
+            retained.append((registered_client_ref, registered_issued_ref))
+        if not already_registered:
+            retained.append((client_ref, issued_ref))
+        _ISSUED_SDK_CLIENTS[:] = retained
+
+
+def require_issued_sdk_client(issued: object, client: object) -> object:
+    """Accept only the exact SDK client registered by this live issued session."""
+    if type(issued) is not HostIssuedSession:
+        raise _blocked("SDK client is not bound to a Host-issued session")
+    require_issued_session(issued, issued._host, None)
+    with _ISSUED_SDK_CLIENTS_LOCK:
+        registered = any(
+            registered_client_ref() is client and registered_issued_ref() is issued
+            for registered_client_ref, registered_issued_ref in _ISSUED_SDK_CLIENTS)
+    if not registered:
+        raise _blocked("SDK client was not created by this Host-issued session")
+    return client
 
 
 def require_issued_session(issued: object, host: object, now_utc: datetime | None
@@ -399,7 +449,8 @@ class _VerifiedResponse:
 
 
 def _verify_sts_response(exchange: object, *, request_bytes: bytes, role_arn: str,
-                         session_name: str, now: datetime) -> _VerifiedResponse:
+                         session_name: str, request_now: datetime,
+                         response_now: datetime) -> _VerifiedResponse:
     if type(exchange) is not StsExchange or exchange.sent_request_bytes != request_bytes:
         raise _blocked("STS request actually sent differs from the protected request",
                        "AWS_WRITE_BLOCKED")
@@ -419,7 +470,8 @@ def _verify_sts_response(exchange: object, *, request_bytes: bytes, role_arn: st
         expiration = _parse_expiration(creds.get("Expiration"))
     except ValueError as error:
         raise _blocked("STS expiration invalid", "AWS_WRITE_BLOCKED") from error
-    if not now < expiration <= now + timedelta(seconds=STS_DURATION_SECONDS) + _STS_EXPIRY_SKEW:
+    if not response_now < expiration <= (
+            request_now + timedelta(seconds=STS_DURATION_SECONDS) + _STS_EXPIRY_SKEW):
         raise _blocked("STS expiration outside the bounded duration", "AWS_WRITE_BLOCKED")
     partition, account = role_arn.split(":")[1], role_arn.split(":")[4]
     role_name = role_arn.split("/")[-1]
@@ -474,7 +526,7 @@ class HostBatchCredentialIssuer:
     def issue(self, batch, subset, host: VerifiedHostContext, now_utc: datetime
               ) -> HostIssuedSession:
         from name_tag_batch_host_runtime import (
-            ISSUANCE_REFUSED, ISSUANCE_UNRESOLVED, ISSUED_VERIFIED, _current_owner_batch,
+            ISSUANCE_REFUSED, ISSUED_VERIFIED, _current_owner_batch,
             bound_journal, take_selection)
         from name_tag_batch_iam import (
             POLICY_PLAINTEXT_LIMIT, IAMPolicyBlocked, build_subset_session_policy,
@@ -535,10 +587,12 @@ class HostBatchCredentialIssuer:
         except Exception:  # noqa: BLE001 - uncertain network outcome stays unresolved
             self._unresolved(journal, pending, now)
             raise _blocked("STS outcome unresolved", "AWS_WRITE_BLOCKED") from None
+        response_now = require_aware_utc(_utc_now())
         # Phase 3 (post-STS, before Intent): verify the actual response binding.
         try:
             verified = _verify_sts_response(exchange, request_bytes=request_bytes,
-                                            role_arn=role_arn, session_name=session_name, now=now)
+                                            role_arn=role_arn, session_name=session_name,
+                                            request_now=now, response_now=response_now)
         except HostRuntimeBlocked:
             self._unresolved(journal, pending, now)
             raise
@@ -555,9 +609,9 @@ class HostBatchCredentialIssuer:
             partition=fresh.payload["partition"], expiration_utc=_iso_z(verified.expiration),
             credential_fingerprint=_credential_fingerprint(*verified.triplet),
             session_token_utilization=verified.utilization, attempt_id=attempt_id,
-            issued_at_utc=_iso_z(now))
+            issued_at_utc=_iso_z(response_now))
         _RECEIPT_MACS[receipt.receipt_sha256] = _receipt_mac(receipt)
-        journal.finalize(pending, status=ISSUED_VERIFIED, updated_at_utc=_iso_z(now),
+        journal.finalize(pending, status=ISSUED_VERIFIED, updated_at_utc=_iso_z(response_now),
                          receipt_sha256=receipt.receipt_sha256,
                          response_sha256=verified.response_sha256)
         _NAME_BINDINGS[session_name] = (nonce_sha256, fresh.batch_id)
@@ -567,7 +621,7 @@ class HostBatchCredentialIssuer:
             expiration=verified.expiration)
         _SESSIONS[session] = host
         try:
-            self._gate.check_issued(session, now_utc=now)  # independent IAM for actual identity
+            self._gate.check_issued(session, now_utc=response_now)  # actual identity at receipt time
         except BaseException:
             _SESSIONS.pop(session, None)
             raise
