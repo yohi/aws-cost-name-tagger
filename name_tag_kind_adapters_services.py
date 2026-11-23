@@ -10,7 +10,7 @@ import re
 from types import MappingProxyType
 
 from name_tag_kind_adapters import (
-    AdapterRejected, AdapterSpec, AdapterUnavailable, SingleNameAdapter, _Mismatch,
+    AdapterRejected, AdapterSpec, AdapterUnavailable, SingleNameAdapter,
     _Unknown, name_tag, one, pinned_operation_names, resource_part, same)
 
 _ARN = lambda t: t.resource_arn  # noqa: E731
@@ -76,7 +76,7 @@ def _apigw():
                 ("apigateway", "get_tags", {"resourceArn": _ARN(t)}))
 
     def extract(t, r):
-        api, stage = _apigw_ids(t)
+        _, stage = _apigw_ids(t)
         same(_need(r[0], "stageName"), stage)
         own, effective = _need(r[0], "tags"), _need(r[1], "tags")
         # A Name visible only through get_tags (or with another value) is inherited from
