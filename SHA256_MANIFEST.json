@@ -15,8 +15,8 @@
     },
     {
       "path": "aws_cost_name_tagger_v3.py",
-      "sha256": "e91967895a5d81fe97eb900f0964769ef8d3e13c1e9e48d0c5bca8dbeaa44ef1",
-      "bytes": 111968
+      "sha256": "9d6ad8570d2c8465a1d05178bb256ceed5893d244c61a3b07a982544691d1b9e",
+      "bytes": 114513
     },
     {
       "path": "example_report_FORMAT_ONLY.csv",
@@ -40,8 +40,8 @@
     },
     {
       "path": "test_aws_cost_name_tagger_v3.py",
-      "sha256": "30c7a8387900041b69b86af1adc6ece5cec4729f63cbd9061e7f57c09228b192",
-      "bytes": 200373
+      "sha256": "1edffd2b3a0ebd236b03c305bea2b11691c9f99a31f0f430d4df7c6f81400b43",
+      "bytes": 200389
     },
     {
       "path": "test_results.txt",
@@ -245,8 +245,8 @@
     },
     {
       "path": "name_tag_batch_population.py",
-      "sha256": "319214c668e83f0c14054382304b50b0a97ba791a1e020660c2a160fbcf0650d",
-      "bytes": 11116
+      "sha256": "fc842489d39e6f5867d27391fe8dbab1d564a41a3a608c19b39f8328253183ab",
+      "bytes": 14568
     },
     {
       "path": "name_tag_batch_report.py",
@@ -255,8 +255,8 @@
     },
     {
       "path": "name_tag_batch_state.py",
-      "sha256": "38b251793067c025d3460caa6ae9966ddadbca907a947f5274c8e88117cc43e0",
-      "bytes": 12302
+      "sha256": "68625d5e8e443dcf7ae34513d70132ba7ff76fc1cc53b384605735a90a1d239f",
+      "bytes": 14232
     },
     {
       "path": "name_tag_batch_runtime.py",
@@ -275,8 +275,8 @@
     },
     {
       "path": "test_name_tag_batch_approval.py",
-      "sha256": "02de2ffc3647c4ba51223aff9608bb8857f18b76cf47d9405122d6ec3e30dc2b",
-      "bytes": 9876
+      "sha256": "61b7d0d1e7f43759aba4921404d6361dfc2d98bb41d3b7fe55bf0cdcb13d0a2d",
+      "bytes": 13145
     },
     {
       "path": "test_name_tag_batch_cli.py",
@@ -315,8 +315,8 @@
     },
     {
       "path": "test_name_tag_batch_state.py",
-      "sha256": "6061ab7e6bacbf9ec026ec50a56f3bca5621b0aa41845ce019cefada47d724a4",
-      "bytes": 22471
+      "sha256": "a18033f4c6c15396ff56270c35ef7d685d890120bffd67a740b355c7517e4217",
+      "bytes": 26610
     },
     {
       "path": "test_name_tag_batch_trust.py",
