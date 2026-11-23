@@ -79,8 +79,9 @@ class OfflineApiPreservedTests(unittest.TestCase):
     def test_offline_runtime_never_accepted_by_live_api(self):
         from name_tag_batch_host_runtime import HostRuntimeBlocked
         import name_tag_batch_runtime as runtime
-        with self.assertRaises(HostRuntimeBlocked):
+        with self.assertRaises(HostRuntimeBlocked) as caught:
             runtime.execute_batch_live(SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+        self.assertEqual(caught.exception.code, "AWS_RUNTIME_NOT_AUTHORIZED")
 
 
 if __name__=='__main__':

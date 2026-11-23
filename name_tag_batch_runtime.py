@@ -363,13 +363,18 @@ class _SendTracker:
     by this command, or the Ledger already shows consumed sends for this Batch)."""
 
     def __init__(self) -> None:
-        self.possible_send = False
+        self.observed_send = False
+        self.attempt_pending = False
+
+    @property
+    def possible_send(self) -> bool:
+        return self.observed_send or self.attempt_pending
 
     def observe(self, state: BatchExecutionState) -> None:
         if state.send_attempts_consumed > 0 or any(
                 outcome in ("SEND_ATTEMPT_CONSUMED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN")
                 for outcome in state.outcomes):
-            self.possible_send = True
+            self.observed_send = True
 
 
 _TRACKER: ContextVar[_SendTracker | None] = ContextVar("aws_cnt_live_send_tracker",
@@ -379,7 +384,13 @@ _TRACKER: ContextVar[_SendTracker | None] = ContextVar("aws_cnt_live_send_tracke
 def _mark_possible_send() -> None:
     tracker = _TRACKER.get()
     if tracker is not None:
-        tracker.possible_send = True
+        tracker.attempt_pending = True
+
+
+def _clear_unsent_attempt() -> None:
+    tracker = _TRACKER.get()
+    if tracker is not None:
+        tracker.attempt_pending = False
 
 
 def _outcome_unknown(code: str, detail: str, **identity):
@@ -437,6 +448,8 @@ def _finalize_unsent_intent(ledger, batch, handle, code: str, scope_id: str):
         ledger._host_finalize_unsent_batch_intent(handle, reason_code=code, sdk_dispatches=0)
     except LedgerError:
         _durable_stop_and_hold(ledger, batch, code, scope_id)
+    else:
+        _clear_unsent_attempt()
     raise _LiveRefusal(code)
 
 

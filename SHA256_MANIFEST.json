@@ -260,8 +260,8 @@
     },
     {
       "path": "name_tag_batch_runtime.py",
-      "sha256": "c1d102e19fc38c89082300276c8e57ae56203bacdd32acb5bc35b30666ea7b98",
-      "bytes": 40154
+      "sha256": "a7cb7e93f16fee22bf50c02ef506023f9375619f003c3450a38e00bd2b9770cb",
+      "bytes": 40481
     },
     {
       "path": "name_tag_batch_trust.py",

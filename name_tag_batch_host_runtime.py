@@ -981,7 +981,8 @@ class ProtectedBatchHostEndpoint:
         except LedgerError as error:  # pre-send Ledger refusals keep their code
             raise HostRuntimeBlocked(error.code, "Ledger refused the command") from error
         finally:
-            clear_selections(host)
+            with host_execution_lock(host):
+                clear_selections(host)
 
 
 def production_host_endpoint() -> ProtectedBatchHostEndpoint:

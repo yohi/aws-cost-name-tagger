@@ -519,6 +519,29 @@ class LiveSelectionLedgerTests(LiveHarness):
         self.assertEqual(errors, [])
         self.assertTrue(second_selection_preserved.is_set())
 
+    def test_endpoint_selection_cleanup_uses_host_execution_lock(self):
+        batch = self.prepare(cap=1, records=[volume_record(0)])
+        endpoint = self.endpoint()
+        lock = host_runtime.host_execution_lock(self.host)
+        clear_lock_states = []
+        real_clear_selections = host_runtime.clear_selections
+
+        def clear_while_recording_lock(host):
+            self.assertIs(host, self.host)
+            clear_lock_states.append(lock.locked())
+            return real_clear_selections(host)
+
+        with self.trusted(), \
+                mock.patch("name_tag_batch_approval.verify_batch_approval",
+                           return_value=batch), \
+                mock.patch.object(host_runtime, "clear_selections",
+                                  side_effect=clear_while_recording_lock):
+            endpoint.execute_signed_batch(
+                plan_bytes=batch.plan_bytes, csv_bytes=batch.csv_bytes,
+                owner_envelope_bytes=b"{}", host=self.host)
+
+        self.assertEqual(clear_lock_states, [True, True])
+
     def _verified_scope(self, batch):
         record = batch.approved_rows[0]
         arn_parts = record["resource_arn"].split(":", 5)
@@ -780,6 +803,18 @@ class LiveRefusalWindowTests(LiveHarness):
         stored = self.report_file(batch.batch_id, blocked.report_sha256)
         self.assertEqual(stored["applied_verified_count"], 0)
         self.assertEqual(stored["row_ledger_outcomes"][0][1], "NOT_ATTEMPTED_BATCH_STOP")
+        self.assertEqual(self.cloud.writes, [])
+
+    def test_report_failure_after_proven_no_send_remains_blocked(self):
+        batch = self.prepare()
+        with mock.patch.object(
+                self.ledger, "consume_first_send",
+                side_effect=LedgerError("BLOCKED_SCOPE_STATE_UNKNOWN")), \
+                mock.patch.object(batch_runtime, "_persist_host_report", return_value=None):
+            blocked = self.run_blocked(batch)
+
+        self.assertNotIsInstance(blocked, HostOutcomeUnknown)
+        self.assertEqual(blocked.code, "BLOCKED_SCOPE_STATE_UNKNOWN")
         self.assertEqual(self.cloud.writes, [])
 
     def test_post_intent_uncertain_permit_stays_unresolved_and_blocks(self):
@@ -1150,6 +1185,7 @@ class CarriedObligationTests(unittest.TestCase):
 
     def test_map_endpoint_failure_after_run_is_unknown_not_escaped(self):
         from name_tag_batch_host_server import HOST_COMMAND_UNKNOWN
+        from name_tag_batch_fake import BatchRunResult
         server = ProtectedHostIPCServer(os_facade=UnavailableListenerOS(),
                                         peer_policy=PeerPolicy(frozenset(), frozenset()),
                                         host_check=lambda host: host)
@@ -1158,14 +1194,32 @@ class CarriedObligationTests(unittest.TestCase):
             def verify_process(self, *, now_utc):
                 return object()
 
+        class FailingOutcomes:
+            def __init__(self):
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                raise RuntimeError("mapping bug")
+
+        outcomes = FailingOutcomes()
+        result = BatchRunResult("COMPLETED", 0, 1, 1, outcomes, False,
+                                MappingProxyType({}))
+
         class Endpoint:
+            calls = 0
+
             def execute_signed_batch(self, **kwargs):
-                return "ran"
+                self.calls += 1
+                return result
+
+        endpoint = Endpoint()
         request = HostIPCRequest(1, "1" * 32, b"p", b"c", b"e")
-        with mock.patch("name_tag_batch_host_server.map_endpoint_result",
-                        side_effect=RuntimeError("mapping bug")):
-            response = server._run_accepted(request, Bootstrap(), Endpoint())
+        response = server._run_accepted(request, Bootstrap(), endpoint)
+
         self.assertEqual((response.status, response.code), ("UNKNOWN", HOST_COMMAND_UNKNOWN))
+        self.assertEqual(response.request_id, request.request_id)
+        self.assertEqual((endpoint.calls, outcomes.iterations), (1, 1))
 
 
 if __name__ == "__main__":
