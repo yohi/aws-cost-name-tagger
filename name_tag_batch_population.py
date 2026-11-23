@@ -50,10 +50,27 @@ def exact_add(values) -> Decimal:
     return Decimal((1 if total<0 else 0,digits,scale))
 
 
-def _decimal_coefficient(value):
+def _aggregate_add(values) -> Decimal:
+    """Sum already-validated aggregate amounts under aggregate, not CUR-input, bounds."""
+    items=[]
+    for value in values:
+        if len(items)>=MAX_CUR_ROWS:
+            raise CurBudgetExceeded('CUR aggregate row budget exceeded')
+        items.append(_decimal_coefficient(value,max_digits=MAX_AGGREGATE_DIGITS))
+    if not items:return Decimal(0)
+    scale=min(exp for _,exp in items)
+    total=sum(n*10**(exp-scale) for n,exp in items)
+    if total==0:return Decimal(0)
+    digits=tuple(int(c) for c in str(abs(total)))
+    if len(digits)>MAX_AGGREGATE_DIGITS or abs(scale)>MAX_COST_SCALE:
+        raise CurBudgetExceeded('CUR aggregate precision/scale budget exceeded')
+    return Decimal((1 if total<0 else 0,digits,scale))
+
+
+def _decimal_coefficient(value, *, max_digits=MAX_COST_DIGITS):
     if isinstance(value,float):
         raise ValueError('Float is not a valid exact monetary source')
-    if isinstance(value,str) and (len(value)>MAX_COST_DIGITS+2 or _PLAIN_DECIMAL.fullmatch(value) is None):
+    if isinstance(value,str) and (len(value)>max_digits+2 or _PLAIN_DECIMAL.fullmatch(value) is None):
         raise ValueError('CUR monetary source is not a bounded plain decimal string')
     try:
         amount=Decimal(value) if isinstance(value,(str,int,Decimal)) else None
@@ -62,7 +79,7 @@ def _decimal_coefficient(value):
     if amount is None or not amount.is_finite():
         raise ValueError('CUR monetary amount must be finite decimal')
     sign,digits,exp=amount.as_tuple()
-    if abs(exp)>MAX_COST_SCALE or len(digits)>MAX_COST_DIGITS:
+    if abs(exp)>MAX_COST_SCALE or len(digits)>max_digits:
         raise CurBudgetExceeded('CUR decimal scale/precision budget exceeded')
     coefficient=int(''.join(map(str,digits))) if digits else 0
     return (-coefficient if sign else coefficient,exp)
@@ -146,6 +163,20 @@ def _canonical_cost(value):
     except InvalidOperation as e:raise ValueError('Nondecimal cost') from e
     if not d.is_finite() or _canonical_decimal(d)!=value:
         raise ValueError('Noncanonical decimal cost')
+    return d
+
+
+def _canonical_aggregate_cost(value):
+    if (type(value) is not str or len(value)>MAX_AGGREGATE_DIGITS+2
+            or _PLAIN_DECIMAL.fullmatch(value) is None):
+        raise ValueError('Expected exact aggregate decimal text')
+    try:d=Decimal(value)
+    except InvalidOperation as e:raise ValueError('Nondecimal aggregate cost') from e
+    if not d.is_finite() or _canonical_decimal(d)!=value:
+        raise ValueError('Noncanonical aggregate decimal cost')
+    _,digits,exp=d.as_tuple()
+    if len(digits)>MAX_AGGREGATE_DIGITS or abs(exp)>MAX_COST_SCALE:
+        raise CurBudgetExceeded('CUR aggregate precision/scale budget exceeded')
     return d
 
 
@@ -238,7 +269,7 @@ def validate_kind_precap(plan:dict,population:dict)->None:
             if (type(entry) is not dict or set(entry)!={'count','cost_usd'} or type(entry['count']) is not int
                     or not 0<=entry['count']<=MAX_CUR_DISTINCT_RESOURCES):
                 raise ValueError('Invalid Kind pre-cap summary')
-            amount=_canonical_cost(entry['cost_usd'])
+            amount=_canonical_aggregate_cost(entry['cost_usd'])
             if entry['count']==0 and amount!=0:
                 raise ValueError('Empty Kind pre-cap stage has nonzero cost')
             parsed[stage]=(entry['count'],amount)
@@ -247,11 +278,23 @@ def validate_kind_precap(plan:dict,population:dict)->None:
         for whole,first,second in (('cur_recognized','below_min_cost','above_min_cost'),
                                    ('above_min_cost','lookup_selected','max_resources_not_inspected')):
             if (parsed[whole][0]!=parsed[first][0]+parsed[second][0]
-                    or parsed[whole][1]!=exact_add((parsed[first][1],parsed[second][1]))):
+                    or parsed[whole][1]!=_aggregate_add((parsed[first][1],parsed[second][1]))):
                 raise ValueError('Kind pre-cap identity violated')
     for stage in KIND_PRECAP_STAGES:
-        if totals[stage][0]!=population[stage]['count'] or exact_add(totals[stage][1])!=_canonical_cost(population[stage]['cost_usd']):
+        if totals[stage][0]!=population[stage]['count'] or _aggregate_add(totals[stage][1])!=_canonical_cost(population[stage]['cost_usd']):
             raise ValueError('Kind pre-cap does not reconcile with signed population')
+    selected_by_kind={kind:[0,[]] for kind in REGISTRY_KINDS}
+    for record in plan.get('records',[]):
+        kind=record.get('kind')
+        if kind not in selected_by_kind:
+            raise ValueError('Selected record has unknown Kind')
+        selected_by_kind[kind][0]+=1
+        selected_by_kind[kind][1].append(_canonical_aggregate_cost(record['effective_usage_cost_usd']))
+    for kind,selected in selected_by_kind.items():
+        declared=field['kinds'][kind]['lookup_selected']
+        if (selected[0]!=declared['count']
+                or _aggregate_add(selected[1])!=_canonical_aggregate_cost(declared['cost_usd'])):
+            raise ValueError('Kind selected records contradict signed population')
 
 
 def _validate_resource_summaries(population,names,cost):
